@@ -78,29 +78,30 @@ describe("buildRolePrompt", () => {
     expect(p).toMatch(/implement DIRECTLY/i);
     expect(p).toMatch(/no.*cli_\* tools|do NOT have/i);
   });
-  it("forbids touching the Linear issue for every role/phase", () => {
+  it("forbids moving the ticket (but not all Linear use) for every role/phase", () => {
     for (const role of Object.values(ROLES)) {
       for (const phase of ["plan", "implement", "review", "product"] as const) {
         const p = buildRolePrompt(role, { identifier: "CORE-4", phase });
-        expect(p).toMatch(/Do NOT modify the Linear issue/);
+        expect(p).toMatch(/Do NOT change the ticket's workflow state/);
+        expect(p).toMatch(/post a comment/); // Linear access is still allowed
       }
     }
   });
 });
 
 describe("roleToolsDeny", () => {
-  it("denies linear_issues for EVERY role (no agent moves the ticket)", () => {
+  it("does NOT deny linear_issues for any role (agents keep Linear access)", () => {
     for (const role of Object.values(ROLES)) {
-      expect(roleToolsDeny(role)).toContain("linear_issues");
+      expect(roleToolsDeny(role)).not.toContain("linear_issues");
     }
   });
-  it("also denies the code CLIs for read-only roles", () => {
+  it("denies the code CLIs for read-only roles (review can't rewrite code)", () => {
     expect(roleToolsDeny(ROLES.warden)).toEqual(
-      expect.arrayContaining(["linear_issues", "cli_codex", "cli_claude", "cli_gemini"]),
+      expect.arrayContaining(["cli_codex", "cli_claude", "cli_gemini"]),
     );
   });
-  it("does NOT deny the code CLIs for implementer (codex) roles", () => {
-    expect(roleToolsDeny(ROLES.spine)).toEqual(["linear_issues"]);
+  it("denies nothing for implementer (codex) roles", () => {
+    expect(roleToolsDeny(ROLES.spine)).toEqual([]);
   });
 });
 

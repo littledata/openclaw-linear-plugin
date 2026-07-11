@@ -189,19 +189,21 @@ export function loadSkillGuidance(role, pluginConfig) {
 // Tool policy — what a role agent may NOT use
 // ---------------------------------------------------------------------------
 /**
- * Tools denied to a specialist role's embedded run. `linear_issues` is denied
- * for EVERY role: moving the ticket is the orchestrator's job (deterministic,
- * config-driven, only on success) — no agent may change status/cycle/fields.
- * Read-only roles (reviewers/planner/product) additionally can't invoke the
- * code CLIs, so a "review" can't secretly mutate code or tests.
+ * Tools denied to a specialist role's embedded run.
+ *
+ * We do NOT deny `linear_issues` — agents keep full Linear access (read,
+ * comment, sub-issues). Ticket TRANSITIONS are kept out of their hands by the
+ * prompts (which never instruct a move) plus the pipeline owning every
+ * transition, not by blocking the tool.
+ *
+ * Read-only roles (reviewers/planner/product) still can't invoke the code CLIs,
+ * so a "review" phase can't silently rewrite code — that's about phase
+ * semantics, not Linear.
  * @param role - the role definition
  * @returns tool names/groups to deny for this role's embedded run
  */
 export function roleToolsDeny(role) {
-    const deny = ["linear_issues"];
-    if (role.readOnly)
-        deny.push("cli_codex", "cli_claude", "cli_gemini");
-    return deny;
+    return role.readOnly ? ["cli_codex", "cli_claude", "cli_gemini"] : [];
 }
 /**
  * Build the extra system prompt that binds a role + its skill to a run. Kept
@@ -224,12 +226,12 @@ export function buildRolePrompt(role, opts) {
         lines.push(`Use the \`${role.skill}\` skill and follow it strictly.`);
     }
     lines.push(`You are working on Linear issue ${opts.identifier}.`, 
-    // Hard guardrail: the pipeline owns all ticket-lifecycle changes. A role
-    // must never move the ticket itself — the orchestrator advances it (per
-    // config) ONLY when the phase succeeds.
-    "Do NOT modify the Linear issue in any way — no status/state change, no " +
-        "cycle change, no assignee, labels, estimate, or comments. The pipeline " +
-        "advances the ticket automatically when your phase succeeds.");
+    // The pipeline owns ticket TRANSITIONS — it advances the ticket (per config)
+    // only when a phase succeeds. Agents keep Linear access for reads/comments/
+    // sub-issues; they just must not move the ticket themselves.
+    "Do NOT change the ticket's workflow state, status, or cycle — the pipeline " +
+        "handles all ticket transitions. You may read the issue or post a comment " +
+        "if useful, but never move it yourself.");
     if (opts.phase === "implement") {
         lines.push("Implement ONLY the work assigned to you below, in the worktree provided.", "Read CLAUDE.md / AGENTS.md first, follow project conventions, run the tests,", "and commit your work with a clear message. Return a concise summary of what", "you changed and the test results. Do NOT touch the Linear issue.");
     }
