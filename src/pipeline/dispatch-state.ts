@@ -59,6 +59,7 @@ export interface ActiveDispatch {
   stuckReason?: string;         // only set when status === "stuck"
   issueTitle?: string;          // for artifact summaries and memory headings
   worktrees?: Array<{ repoName: string; path: string; branch: string }>;
+  grillGuidance?: string;       // implementation brief from the /grill-me interview
 
   // OpenClaw 2026.4 task-flow integration. Populated when the plugin
   // successfully calls `api.runtime.taskFlow.bindSession(...).createManaged`.

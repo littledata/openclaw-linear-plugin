@@ -10,6 +10,8 @@ import { assessTier } from "./tier-assess.js";
 import { createWorktree, createMultiWorktree, prepareWorkspace } from "../infra/codex-worktree.js";
 import { resolveRepos, isMultiRepo, getRepoEntries, resolveReposByNames } from "../infra/multi-repo.js";
 import { savePendingRepoSelection, getPendingRepoSelection, clearPendingRepoSelection, parseRepoSelection, } from "./repo-selection-state.js";
+import { getGrill, saveGrill, clearGrill } from "./grill-state.js";
+import { runGrillStep } from "./grill.js";
 import { ensureClawDir, writeManifest, writeDispatchMemory, resolveOrchestratorWorkspace } from "./artifacts.js";
 import { readPlanningState, isInPlanningMode, getPlanningSession, endPlanningSession } from "./planning-state.js";
 import { initiatePlanningSession, handlePlannerTurn, runPlanAudit } from "./planner.js";
@@ -639,6 +641,7 @@ export async function handleLinearWebhook(api, req, res) {
             }
             catch { /* best effort */ }
             clearPendingRepoSelection(issue.id);
+            clearGrill(issue.id);
             const stopApi = createLinearApi(api);
             if (stopApi) {
                 await stopApi.emitActivity(session.id, {
@@ -663,6 +666,26 @@ export async function handleLinearWebhook(api, req, res) {
         if (isOurFeedback) {
             api.logger.info(`AgentSession prompted: ${session.id} — feedback from own activity (${activityType ?? "hash-match"}), ignoring`);
             return true;
+        }
+        // ── /grill-me: the user answered an interview question ──
+        // Runs BEFORE the activeRuns "ignore feedback" gate because the interview
+        // intentionally holds activeRuns. Record the answer and resume the dispatch.
+        const grillPending = getGrill(issue.id);
+        if (grillPending?.pendingQuestion) {
+            const answer = typeof activityBody === "string" ? activityBody.trim() : "";
+            if (answer) {
+                grillPending.qa.push({ question: grillPending.pendingQuestion, answer });
+                grillPending.pendingQuestion = undefined;
+                saveGrill(grillPending);
+                activeRuns.delete(issue.id); // release the interview claim so the resume re-claims
+                const grillApi = createLinearApi(api);
+                if (grillApi) {
+                    api.logger.info(`AgentSession prompted: ${issue.identifier ?? issue.id} — grill answer #${grillPending.qa.length} recorded, resuming`);
+                    void handleDispatch(api, grillApi, issue, { existingSessionId: grillPending.agentSessionId ?? session.id })
+                        .catch((err) => api.logger.error(`grill resume failed: ${err}`));
+                }
+                return true;
+            }
         }
         // 2. If active dispatch with tmux session → route to steering orchestrator
         const tmuxSession = getActiveTmuxSession(issue.id);
@@ -1931,10 +1954,53 @@ async function handleDispatch(api, linearApi, issue, opts) {
     const labels = enrichedIssue.labels?.nodes?.map((l) => l.name) ?? [];
     const commentCount = enrichedIssue.comments?.nodes?.length ?? 0;
     const dispatchTeamKey = enrichedIssue?.team?.key;
-    // Resolve repos for this dispatch (explicit override → body markers → labels → team mapping → config default)
+    // Repo/guidance the grill interview (or an explicit override) may supply.
+    let repoOverride = opts?.repoOverride;
+    let grillGuidance = opts?.grillGuidance;
+    // ── /grill-me interview gate ──────────────────────────────────────────
+    // When grillMode is on, interview the user (one question at a time) BEFORE
+    // spawning the worker — first to establish WHICH repo(s) the work belongs in,
+    // then to clarify requirements. activeRuns stays claimed while parked so the
+    // created-handler still skips its conversational run (single session); the
+    // `prompted` handler records each answer and resumes this dispatch.
+    if ((pluginConfig?.grillMode ?? "off") === "on" && !opts?.grillDone) {
+        const grill = getGrill(issue.id);
+        const repoNames = Object.keys(getRepoEntries(pluginConfig));
+        const step = await runGrillStep(api, { identifier, title: enrichedIssue.title ?? identifier, description: enrichedIssue.description }, repoNames, grill?.qa ?? [], resolveAgentId(api));
+        if (!step.ready && step.question) {
+            let gsid = opts?.existingSessionId ?? linearSessionByIssue.get(issue.id);
+            if (!gsid) {
+                try {
+                    const sr = await linearApi.createSessionOnIssue(issue.id);
+                    gsid = sr.sessionId ?? undefined;
+                }
+                catch { /* best effort */ }
+            }
+            if (gsid)
+                await linearApi.emitActivity(gsid, { type: "elicitation", body: step.question }).catch(() => { });
+            saveGrill({
+                issueId: issue.id,
+                issueIdentifier: identifier,
+                agentSessionId: gsid,
+                qa: grill?.qa ?? [],
+                pendingQuestion: step.question,
+                createdAt: grill?.createdAt ?? new Date().toISOString(),
+            });
+            api.logger.info(`@dispatch: ${identifier} grill-me — asked question ${(grill?.qa.length ?? 0) + 1}, awaiting reply (activeRuns held)`);
+            return; // NOTE: activeRuns left set on purpose — released by the prompted resume
+        }
+        // Interview complete → carry the chosen repo(s) + implementation brief in.
+        clearGrill(issue.id);
+        if (step.repos?.length)
+            repoOverride = step.repos;
+        if (step.guidance)
+            grillGuidance = step.guidance;
+        api.logger.info(`@dispatch: ${identifier} grill-me complete — repos=${(step.repos ?? []).join(",") || "(default)"}, guidance=${grillGuidance ? "yes" : "none"}`);
+    }
+    // Resolve repos for this dispatch (grill/explicit override → body markers → labels → team mapping → config default)
     let repoResolution;
-    if (opts?.repoOverride?.length) {
-        repoResolution = resolveReposByNames(opts.repoOverride, pluginConfig);
+    if (repoOverride?.length) {
+        repoResolution = resolveReposByNames(repoOverride, pluginConfig);
         api.logger.info(`@dispatch: ${identifier} repos=${repoResolution.repos.map(r => r.name).join(",")} source=repo_selection`);
     }
     else {
@@ -2091,6 +2157,7 @@ async function handleDispatch(api, linearApi, issue, opts) {
         attempt: 0,
         project: enrichedIssue?.project?.id,
         worktrees,
+        grillGuidance,
     };
     const dispatchWithFlow = createManagedFlowForDispatch(api, initialDispatch);
     await registerDispatch(identifier, dispatchWithFlow, statePath);
