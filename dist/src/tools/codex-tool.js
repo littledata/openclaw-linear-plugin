@@ -92,9 +92,13 @@ export async function runCodex(api, params, pluginConfig, onUpdate) {
         }).catch(() => { });
     }
     // Build codex command
+    const reasoningEffort = pluginConfig?.codexReasoningEffort;
     const args = ["exec", "--full-auto", "--json", "--ephemeral"];
     if (model ?? pluginConfig?.codexModel) {
         args.push("--model", (model ?? pluginConfig?.codexModel));
+    }
+    if (reasoningEffort) {
+        args.push("-c", `model_reasoning_effort=${reasoningEffort}`);
     }
     args.push("-C", workingDir);
     args.push(prompt);
@@ -109,9 +113,13 @@ export async function runCodex(api, params, pluginConfig, onUpdate) {
         const modelArgs = (model ?? pluginConfig?.codexModel)
             ? `--model ${shellEscape((model ?? pluginConfig?.codexModel))}`
             : "";
+        const effortArgs = reasoningEffort
+            ? `-c model_reasoning_effort=${shellEscape(reasoningEffort)}`
+            : "";
         const cmdStr = [
             CODEX_BIN, "exec", "--full-auto", "--json", "--ephemeral",
             modelArgs,
+            effortArgs,
             "-C", shellEscape(workingDir),
             shellEscape(prompt),
         ].filter(Boolean).join(" ");

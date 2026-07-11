@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { TIER_MODELS, assessTier, type IssueContext } from "./tier-assess.js";
+import { TIER_MODELS, resolveTierModels, assessTier, type IssueContext } from "./tier-assess.js";
 
 // ---------------------------------------------------------------------------
 // Mock runAgent
@@ -260,5 +260,29 @@ describe("assessTier", () => {
 
     const callArgs = mockRunAgent.mock.calls[0][0];
     expect(callArgs.timeoutMs).toBe(30_000);
+  });
+});
+
+describe("resolveTierModels", () => {
+  it("returns built-in defaults when no config is given", () => {
+    expect(resolveTierModels(undefined)).toEqual(TIER_MODELS);
+    expect(resolveTierModels({})).toEqual(TIER_MODELS);
+  });
+
+  it("applies per-tier overrides from config", () => {
+    const resolved = resolveTierModels({
+      tierModels: { small: "openai/gpt-5.5", high: "openai/gpt-5.6-sol" },
+    });
+    expect(resolved.small).toBe("openai/gpt-5.5");
+    expect(resolved.high).toBe("openai/gpt-5.6-sol");
+    // Unset tier falls back to the built-in default
+    expect(resolved.medium).toBe(TIER_MODELS.medium);
+  });
+
+  it("overrides all three tiers", () => {
+    const resolved = resolveTierModels({
+      tierModels: { small: "a", medium: "b", high: "c" },
+    });
+    expect(resolved).toEqual({ small: "a", medium: "b", high: "c" });
   });
 });

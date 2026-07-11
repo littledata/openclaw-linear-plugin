@@ -7,6 +7,20 @@ export const TIER_MODELS = {
     medium: "anthropic/claude-sonnet-4-6",
     high: "anthropic/claude-opus-4-6",
 };
+/**
+ * Resolve the tier→model map, letting plugin config `tierModels` override the
+ * built-in defaults per tier. Unset tiers fall back to TIER_MODELS.
+ * @param pluginConfig - the plugin config object (api.pluginConfig)
+ * @returns a complete tier→model map with config overrides applied
+ */
+export function resolveTierModels(pluginConfig) {
+    const override = (pluginConfig?.tierModels ?? {});
+    return {
+        small: override.small ?? TIER_MODELS.small,
+        medium: override.medium ?? TIER_MODELS.medium,
+        high: override.high ?? TIER_MODELS.high,
+    };
+}
 // ---------------------------------------------------------------------------
 // Assessment
 // ---------------------------------------------------------------------------
@@ -37,6 +51,7 @@ export async function assessTier(api, issue, agentId) {
         issue.commentCount != null ? `Comments: ${issue.commentCount}` : "",
     ].filter(Boolean).join("\n");
     const message = `${ASSESS_PROMPT}\n\n${issueText}`;
+    const tierModels = resolveTierModels(api.pluginConfig);
     try {
         const { runAgent } = await import("../agent/agent.js");
         const result = await runAgent({
@@ -51,7 +66,7 @@ export async function assessTier(api, issue, agentId) {
         // the agent produced valid JSON output — e.g. agent exited with
         // signal but wrote the response before terminating.
         if (result.output) {
-            const parsed = parseAssessment(result.output);
+            const parsed = parseAssessment(result.output, tierModels);
             if (parsed) {
                 api.logger.info(`Tier assessment for ${issue.identifier}: ${parsed.tier} — ${parsed.reasoning} (agent success=${result.success})`);
                 return parsed;
@@ -70,7 +85,7 @@ export async function assessTier(api, issue, agentId) {
     // Fallback: medium is the safest default
     const fallback = {
         tier: "medium",
-        model: TIER_MODELS.medium,
+        model: tierModels.medium,
         reasoning: "Assessment failed — defaulting to medium",
     };
     api.logger.info(`Tier assessment fallback for ${issue.identifier}: medium`);
@@ -79,7 +94,7 @@ export async function assessTier(api, issue, agentId) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-function parseAssessment(raw) {
+function parseAssessment(raw, models) {
     // Extract JSON from the response (may have markdown wrapping)
     const jsonMatch = raw.match(/\{[^}]+\}/);
     if (!jsonMatch)
@@ -91,7 +106,7 @@ function parseAssessment(raw) {
             return null;
         return {
             tier: tier,
-            model: TIER_MODELS[tier],
+            model: models[tier],
             reasoning: parsed.reasoning ?? "no reasoning provided",
         };
     }

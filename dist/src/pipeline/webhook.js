@@ -8,7 +8,8 @@ import { createManagedFlowForDispatch } from "./taskflow-bridge.js";
 import { createNotifierFromConfig } from "../infra/notify.js";
 import { assessTier } from "./tier-assess.js";
 import { createWorktree, createMultiWorktree, prepareWorkspace } from "../infra/codex-worktree.js";
-import { resolveRepos, isMultiRepo } from "../infra/multi-repo.js";
+import { resolveRepos, isMultiRepo, getRepoEntries, resolveReposByNames } from "../infra/multi-repo.js";
+import { savePendingRepoSelection, getPendingRepoSelection, clearPendingRepoSelection, parseRepoSelection, } from "./repo-selection-state.js";
 import { ensureClawDir, writeManifest, writeDispatchMemory, resolveOrchestratorWorkspace } from "./artifacts.js";
 import { readPlanningState, isInPlanningMode, getPlanningSession, endPlanningSession } from "./planning-state.js";
 import { initiatePlanningSession, handlePlannerTurn, runPlanAudit } from "./planner.js";
@@ -653,6 +654,27 @@ export async function handleLinearWebhook(api, req, res) {
         const linearApi = createLinearApi(api);
         if (!linearApi) {
             api.logger.error("No Linear access token configured");
+            return true;
+        }
+        // ── Interactive repo selection: resume a parked dispatch on the user's reply ──
+        const pendingRepoSel = getPendingRepoSelection(issue.id);
+        if (pendingRepoSel) {
+            const selected = parseRepoSelection(userMessage, pendingRepoSel.candidates);
+            if (selected.length === 0) {
+                const listText = pendingRepoSel.candidates.map((c, i) => `${i + 1}. ${c}`).join("\n");
+                await linearApi.emitActivity(session.id, {
+                    type: "elicitation",
+                    body: `I didn't recognize that selection. Reply with the repo number(s) or name(s), or "all":\n\n${listText}`,
+                }).catch(() => { });
+                return true;
+            }
+            clearPendingRepoSelection(issue.id);
+            api.logger.info(`AgentSession prompted: ${issue.identifier ?? issue.id} repo selection → ${selected.join(", ")}`);
+            await linearApi.emitActivity(session.id, { type: "thought", body: `Working on: ${selected.join(", ")}` }).catch(() => { });
+            void handleDispatch(api, linearApi, issue, {
+                repoOverride: selected,
+                existingSessionId: pendingRepoSel.agentSessionId ?? session.id,
+            }).catch((err) => api.logger.error(`repo-selection resume failed: ${err}`));
             return true;
         }
         // Validate agent profiles before doing any work
@@ -1739,7 +1761,60 @@ async function handleCloseIssue(api, linearApi, profiles, agentId, issue, commen
 // Triggered by `@dispatch` in a Linear comment. Assesses issue complexity,
 // creates a persistent worktree, registers the dispatch in state, and
 // launches the pipeline (plan → implement → audit).
-async function handleDispatch(api, linearApi, issue) {
+/**
+ * Build a Title-Case slug from an issue title: first ≤6 alphanumeric words,
+ * each capitalized (acronyms preserved), joined with hyphens.
+ * @param title - the raw issue title
+ * @returns a filesystem/branch-safe slug (falls back to "Work")
+ */
+function titleSlug(title) {
+    return (title ?? "work")
+        .normalize("NFKD")
+        .replace(/[^A-Za-z0-9\s-]/g, " ")
+        .split(/[\s-]+/)
+        .filter(Boolean)
+        .slice(0, 6)
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join("-") || "Work";
+}
+/**
+ * Resolve the git branch name for a dispatch from the `branchTemplate` plugin
+ * config. Supported placeholders: {identifier}, {slug}, {title}. Defaults to the
+ * upstream `codex/{identifier}` scheme when no template is configured.
+ * @param identifier - the Linear issue identifier (e.g. CORE-123)
+ * @param title - the issue title (used for {slug}/{title})
+ * @param pluginConfig - the plugin config object
+ * @returns the resolved branch name (may contain slashes)
+ */
+function resolveBranchName(identifier, title, pluginConfig) {
+    const template = pluginConfig?.branchTemplate ?? "codex/{identifier}";
+    const slug = titleSlug(title);
+    return template
+        .replace(/\{identifier\}/g, identifier)
+        .replace(/\{slug\}/g, slug)
+        .replace(/\{title\}/g, slug);
+}
+/**
+ * Decide whether to interactively ask the user which repo(s) to work on,
+ * based on the `repoSelectionMode` config and how the repo was resolved.
+ * @param resolution - the repo resolution result
+ * @param pluginConfig - the plugin config object
+ * @returns true when an interactive selection prompt should be shown
+ */
+function shouldAskRepoSelection(resolution, pluginConfig) {
+    const mode = pluginConfig?.repoSelectionMode ?? "off";
+    if (mode === "off")
+        return false;
+    // Nothing to choose from unless at least two repos are configured.
+    const candidateCount = Object.keys(getRepoEntries(pluginConfig)).length;
+    if (candidateCount < 2)
+        return false;
+    if (mode === "always")
+        return true;
+    // "ambiguous": only when the repo wasn't explicitly specified.
+    return resolution.source === "config_default";
+}
+async function handleDispatch(api, linearApi, issue, opts) {
     const pluginConfig = api.pluginConfig;
     const statePath = pluginConfig?.dispatchStatePath;
     const worktreeBaseDir = pluginConfig?.worktreeBaseDir;
@@ -1800,9 +1875,48 @@ async function handleDispatch(api, linearApi, issue) {
     const labels = enrichedIssue.labels?.nodes?.map((l) => l.name) ?? [];
     const commentCount = enrichedIssue.comments?.nodes?.length ?? 0;
     const dispatchTeamKey = enrichedIssue?.team?.key;
-    // Resolve repos for this dispatch (issue body markers → labels → team mapping → config default)
-    const repoResolution = resolveRepos(enrichedIssue.description, labels, pluginConfig, dispatchTeamKey);
-    api.logger.info(`@dispatch: ${identifier} team=${dispatchTeamKey ?? "none"} repos=${repoResolution.repos.map(r => r.name).join(",")} source=${repoResolution.source}`);
+    // Resolve repos for this dispatch (explicit override → body markers → labels → team mapping → config default)
+    let repoResolution;
+    if (opts?.repoOverride?.length) {
+        repoResolution = resolveReposByNames(opts.repoOverride, pluginConfig);
+        api.logger.info(`@dispatch: ${identifier} repos=${repoResolution.repos.map(r => r.name).join(",")} source=repo_selection`);
+    }
+    else {
+        repoResolution = resolveRepos(enrichedIssue.description, labels, pluginConfig, dispatchTeamKey);
+        api.logger.info(`@dispatch: ${identifier} team=${dispatchTeamKey ?? "none"} repos=${repoResolution.repos.map(r => r.name).join(",")} source=${repoResolution.source}`);
+        // Interactive repo selection: if enabled and the repo is ambiguous, ask the
+        // user which repo(s) to use and park the dispatch until they reply.
+        if (shouldAskRepoSelection(repoResolution, pluginConfig)) {
+            const candidates = Object.keys(getRepoEntries(pluginConfig));
+            let selectionSessionId = opts?.existingSessionId;
+            if (!selectionSessionId) {
+                try {
+                    const sr = await linearApi.createSessionOnIssue(issue.id);
+                    selectionSessionId = sr.sessionId ?? undefined;
+                }
+                catch (err) {
+                    api.logger.warn(`@dispatch: could not create session for repo selection: ${err}`);
+                }
+            }
+            const listText = candidates.map((c, i) => `${i + 1}. ${c}`).join("\n");
+            const promptBody = `Which repository should I work on for **${identifier}**? Reply with the number(s) or name(s) (comma-separated), or "all".\n\n${listText}`;
+            if (selectionSessionId) {
+                await linearApi.emitActivity(selectionSessionId, { type: "elicitation", body: promptBody }).catch(() => { });
+            }
+            else {
+                await createCommentWithDedup(linearApi, issue.id, promptBody).catch(() => { });
+            }
+            savePendingRepoSelection({
+                issueId: issue.id,
+                issueIdentifier: identifier,
+                candidates,
+                agentSessionId: selectionSessionId,
+                createdAt: new Date().toISOString(),
+            });
+            api.logger.info(`@dispatch: ${identifier} awaiting repo selection (${candidates.length} candidates)`);
+            return;
+        }
+    }
     // 4. Assess complexity tier
     const assessment = await assessTier(api, {
         identifier,
@@ -1824,17 +1938,19 @@ async function handleDispatch(api, linearApi, issue) {
     let worktreeBranch;
     let worktreeResumed;
     let worktrees;
+    // Branch name from the configurable `branchTemplate` (default: codex/{identifier}).
+    const dispatchBranch = resolveBranchName(identifier, enrichedIssue.title, pluginConfig);
     try {
         if (isMultiRepo(repoResolution)) {
-            const multi = createMultiWorktree(identifier, repoResolution.repos, { baseDir: worktreeBaseDir });
+            const multi = createMultiWorktree(identifier, repoResolution.repos, { baseDir: worktreeBaseDir, branch: dispatchBranch });
             worktreePath = multi.parentPath;
-            worktreeBranch = `codex/${identifier}`;
+            worktreeBranch = dispatchBranch;
             worktreeResumed = multi.worktrees.some(w => w.resumed);
             worktrees = multi.worktrees.map(w => ({ repoName: w.repoName, path: w.path, branch: w.branch }));
             api.logger.info(`@dispatch: multi-repo worktrees ${worktreeResumed ? "resumed" : "created"} at ${worktreePath} (${repoResolution.repos.map(r => r.name).join(", ")})`);
         }
         else {
-            const single = createWorktree(identifier, { baseRepo, baseDir: worktreeBaseDir });
+            const single = createWorktree(identifier, { baseRepo, baseDir: worktreeBaseDir, branch: dispatchBranch });
             worktreePath = single.path;
             worktreeBranch = single.branch;
             worktreeResumed = single.resumed;
@@ -1868,13 +1984,15 @@ async function handleDispatch(api, linearApi, issue) {
     // Mark active BEFORE session creation so that any AgentSessionEvent.created
     // webhook arriving from this call is blocked by the activeRuns guard.
     activeRuns.add(issue.id);
-    let agentSessionId;
-    try {
-        const sessionResult = await linearApi.createSessionOnIssue(issue.id);
-        agentSessionId = sessionResult.sessionId ?? undefined;
-    }
-    catch (err) {
-        api.logger.warn(`@dispatch: could not create agent session: ${err}`);
+    let agentSessionId = opts?.existingSessionId;
+    if (!agentSessionId) {
+        try {
+            const sessionResult = await linearApi.createSessionOnIssue(issue.id);
+            agentSessionId = sessionResult.sessionId ?? undefined;
+        }
+        catch (err) {
+            api.logger.warn(`@dispatch: could not create agent session: ${err}`);
+        }
     }
     // 6b. Initialize .claw/ artifact directory
     try {
