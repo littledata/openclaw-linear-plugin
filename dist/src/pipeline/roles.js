@@ -185,6 +185,24 @@ export function loadSkillGuidance(role, pluginConfig) {
         return null;
     }
 }
+// ---------------------------------------------------------------------------
+// Tool policy — what a role agent may NOT use
+// ---------------------------------------------------------------------------
+/**
+ * Tools denied to a specialist role's embedded run. `linear_issues` is denied
+ * for EVERY role: moving the ticket is the orchestrator's job (deterministic,
+ * config-driven, only on success) — no agent may change status/cycle/fields.
+ * Read-only roles (reviewers/planner/product) additionally can't invoke the
+ * code CLIs, so a "review" can't secretly mutate code or tests.
+ * @param role - the role definition
+ * @returns tool names/groups to deny for this role's embedded run
+ */
+export function roleToolsDeny(role) {
+    const deny = ["linear_issues"];
+    if (role.readOnly)
+        deny.push("cli_codex", "cli_claude", "cli_gemini");
+    return deny;
+}
 /**
  * Build the extra system prompt that binds a role + its skill to a run. Kept
  * lean — the behavioural detail lives in the role's SKILL.md, which OpenClaw
@@ -198,6 +216,12 @@ export function buildRolePrompt(role, opts) {
         `You are ${role.label}, ${role.summary}`,
         `Use the \`${role.skill}\` skill and follow it strictly.`,
         `You are working on Linear issue ${opts.identifier}.`,
+        // Hard guardrail: the pipeline owns all ticket-lifecycle changes. A role
+        // must never move the ticket itself — the orchestrator advances it (per
+        // config) ONLY when the phase succeeds.
+        "Do NOT modify the Linear issue in any way — no status/state change, no " +
+            "cycle change, no assignee, labels, estimate, or comments. The pipeline " +
+            "advances the ticket automatically when your phase succeeds.",
     ];
     if (opts.phase === "implement") {
         lines.push("Implement ONLY the work assigned to you below, in the worktree provided.", "Read CLAUDE.md / AGENTS.md first, follow project conventions, run the tests,", "and commit your work with a clear message. Return a concise summary of what", "you changed and the test results. Do NOT touch the Linear issue.");

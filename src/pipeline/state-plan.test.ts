@@ -102,6 +102,25 @@ describe("resolveTargetState", () => {
     expect(resolveTargetState({ names: ["In Review"] }, states)).toEqual({ id: "s2", name: "In Review" });
   });
 
+  it("contains-matches a longer board state name (Review → Design Review)", () => {
+    const board = [
+      { id: "a", name: "In Progress", type: "started" },
+      { id: "b", name: "Design Review", type: "started" },
+    ];
+    expect(resolveTargetState({ names: ["In Review", "Code Review", "Review"] }, board)).toEqual({
+      id: "b",
+      name: "Design Review",
+    });
+  });
+
+  it("prefers an exact match over a contains match", () => {
+    const board = [
+      { id: "a", name: "Design Review", type: "started" },
+      { id: "b", name: "Review", type: "started" },
+    ];
+    expect(resolveTargetState({ names: ["Review"] }, board)).toEqual({ id: "b", name: "Review" });
+  });
+
   it("falls back to type when no name matches", () => {
     expect(resolveTargetState({ names: ["Nope"], type: "completed" }, states)).toEqual({
       id: "s3",

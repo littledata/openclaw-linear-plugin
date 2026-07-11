@@ -235,6 +235,25 @@ export function loadSkillGuidance(
 }
 
 // ---------------------------------------------------------------------------
+// Tool policy — what a role agent may NOT use
+// ---------------------------------------------------------------------------
+
+/**
+ * Tools denied to a specialist role's embedded run. `linear_issues` is denied
+ * for EVERY role: moving the ticket is the orchestrator's job (deterministic,
+ * config-driven, only on success) — no agent may change status/cycle/fields.
+ * Read-only roles (reviewers/planner/product) additionally can't invoke the
+ * code CLIs, so a "review" can't secretly mutate code or tests.
+ * @param role - the role definition
+ * @returns tool names/groups to deny for this role's embedded run
+ */
+export function roleToolsDeny(role: RoleDef): string[] {
+  const deny = ["linear_issues"];
+  if (role.readOnly) deny.push("cli_codex", "cli_claude", "cli_gemini");
+  return deny;
+}
+
+// ---------------------------------------------------------------------------
 // System-prompt builder
 // ---------------------------------------------------------------------------
 
@@ -263,6 +282,12 @@ export function buildRolePrompt(role: RoleDef, opts: RolePromptOpts): string {
     `You are ${role.label}, ${role.summary}`,
     `Use the \`${role.skill}\` skill and follow it strictly.`,
     `You are working on Linear issue ${opts.identifier}.`,
+    // Hard guardrail: the pipeline owns all ticket-lifecycle changes. A role
+    // must never move the ticket itself — the orchestrator advances it (per
+    // config) ONLY when the phase succeeds.
+    "Do NOT modify the Linear issue in any way — no status/state change, no " +
+      "cycle change, no assignee, labels, estimate, or comments. The pipeline " +
+      "advances the ticket automatically when your phase succeeds.",
   ];
 
   if (opts.phase === "implement") {

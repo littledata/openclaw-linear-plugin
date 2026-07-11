@@ -21,7 +21,7 @@
 import { runAgent } from "../agent/agent.js";
 import { runCodex } from "../tools/codex-tool.js";
 import { createPullRequest, getWorktreeStatus } from "../infra/codex-worktree.js";
-import { ROLES, resolveRole, implementerRoles, buildRolePrompt, parseReviewVerdict, resolveRoleModel, resolveRoleBackend, loadSkillGuidance, } from "./roles.js";
+import { ROLES, resolveRole, implementerRoles, buildRolePrompt, parseReviewVerdict, resolveRoleModel, resolveRoleBackend, loadSkillGuidance, roleToolsDeny, } from "./roles.js";
 import { resolveTargetState } from "./state-plan.js";
 /** Max bounded rework attempts (config `maxReworkAttempts`, default 2). */
 function maxRework(pluginConfig) {
@@ -103,6 +103,9 @@ async function runRole(ctx, dispatch, role, phase, extra, issue) {
         message: task,
         extraSystemPrompt: system,
         readOnly: role.readOnly,
+        // No role agent may touch the Linear issue — all ticket-lifecycle changes
+        // are the orchestrator's job (deterministic, config-driven, on success only).
+        toolsDeny: roleToolsDeny(role),
         streaming: dispatch.agentSessionId
             ? { linearApi: ctx.linearApi, agentSessionId: dispatch.agentSessionId }
             : undefined,

@@ -7,6 +7,7 @@ import {
   parseReviewVerdict,
   resolveRoleBackend,
   resolveRoleModel,
+  roleToolsDeny,
 } from "./roles.js";
 
 describe("resolveRole", () => {
@@ -65,6 +66,30 @@ describe("buildRolePrompt", () => {
   it("appends extra instructions", () => {
     const p = buildRolePrompt(ROLES.apex, { identifier: "CORE-3", phase: "plan", extra: "ROUTING-BLOB" });
     expect(p).toContain("ROUTING-BLOB");
+  });
+  it("forbids touching the Linear issue for every role/phase", () => {
+    for (const role of Object.values(ROLES)) {
+      for (const phase of ["plan", "implement", "review", "product"] as const) {
+        const p = buildRolePrompt(role, { identifier: "CORE-4", phase });
+        expect(p).toMatch(/Do NOT modify the Linear issue/);
+      }
+    }
+  });
+});
+
+describe("roleToolsDeny", () => {
+  it("denies linear_issues for EVERY role (no agent moves the ticket)", () => {
+    for (const role of Object.values(ROLES)) {
+      expect(roleToolsDeny(role)).toContain("linear_issues");
+    }
+  });
+  it("also denies the code CLIs for read-only roles", () => {
+    expect(roleToolsDeny(ROLES.warden)).toEqual(
+      expect.arrayContaining(["linear_issues", "cli_codex", "cli_claude", "cli_gemini"]),
+    );
+  });
+  it("does NOT deny the code CLIs for implementer (codex) roles", () => {
+    expect(roleToolsDeny(ROLES.spine)).toEqual(["linear_issues"]);
   });
 });
 

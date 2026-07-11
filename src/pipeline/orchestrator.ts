@@ -34,6 +34,7 @@ import {
   resolveRoleModel,
   resolveRoleBackend,
   loadSkillGuidance,
+  roleToolsDeny,
   type RoleDef,
   type RoleKind,
 } from "./roles.js";
@@ -158,6 +159,9 @@ async function runRole(
     message: task,
     extraSystemPrompt: system,
     readOnly: role.readOnly,
+    // No role agent may touch the Linear issue — all ticket-lifecycle changes
+    // are the orchestrator's job (deterministic, config-driven, on success only).
+    toolsDeny: roleToolsDeny(role),
     streaming: dispatch.agentSessionId
       ? { linearApi: ctx.linearApi, agentSessionId: dispatch.agentSessionId }
       : undefined,

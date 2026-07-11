@@ -213,10 +213,21 @@ export function resolveTargetState(
   teamStates: Array<{ id: string; name: string; type: string }>,
 ): { id: string; name: string } | null {
   if (!target) return null;
+  // 1. Exact name match (case-insensitive).
   for (const candidate of target.names) {
     const hit = teamStates.find((s) => s.name.toLowerCase() === candidate.toLowerCase());
     if (hit) return { id: hit.id, name: hit.name };
   }
+  // 2. Contains match either direction — handles boards that name the state
+  //    "Design Review" / "In QA" while our candidate is "Review" / "QA".
+  for (const candidate of target.names) {
+    const c = candidate.toLowerCase();
+    const hit = teamStates.find(
+      (s) => s.name.toLowerCase().includes(c) || c.includes(s.name.toLowerCase()),
+    );
+    if (hit) return { id: hit.id, name: hit.name };
+  }
+  // 3. Type fallback (e.g. any "started" / "completed" state).
   if (target.type) {
     const hit = teamStates.find((s) => s.type === target.type);
     if (hit) return { id: hit.id, name: hit.name };
