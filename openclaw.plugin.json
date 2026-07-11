@@ -29,104 +29,47 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "enabled": {
-        "type": "boolean"
+      "enabled": { "type": "boolean" },
+      "clientId": { "type": "string", "description": "Linear OAuth Client ID" },
+      "clientSecret": { "type": "string", "description": "Linear OAuth Client Secret", "sensitive": true },
+      "redirectUri": { "type": "string", "description": "Linear OAuth Redirect URI (optional, defaults to gateway URL)" },
+      "accessToken": { "type": "string", "description": "Linear API access token for agent activities", "sensitive": true },
+      "defaultAgentId": { "type": "string", "description": "OpenClaw agent ID to use for pipeline stages" },
+      "enableAudit": { "type": "boolean", "description": "Run auditor stage after implementation", "default": true },
+      "codexBaseRepo": { "type": "string", "description": "Path to git repo for Codex worktrees", "default": "/home/claw/ai-workspace" },
+      "executionMode": { "type": "string", "enum": ["worktree", "container"], "description": "Worker isolation mode. 'worktree' (default): git worktree off a shared local clone. 'container': a per-session Docker container that clones the repo fresh (removes shared git state → safe for concurrent dispatches on the same repo).", "default": "worktree" },
+      "workerImage": { "type": "string", "description": "Docker image for container execution mode (built from docker/worker.Dockerfile).", "default": "openclaw-linear-worker:latest" },
+      "codexModel": { "type": "string", "description": "Model passed to the Codex worker CLI (codex exec --model). If unset, Codex uses its own ~/.codex/config.toml default." },
+      "codexReasoningEffort": { "type": "string", "description": "Codex reasoning effort injected as '-c model_reasoning_effort' for the worker (e.g. low, medium, high, xhigh, max, ultra). If unset, Codex uses its config.toml default." },
+      "tierModels": {
+        "type": "object",
+        "description": "Override the tier→model map used for complexity-based dispatch. Values are provider/model strings; unset tiers fall back to built-in defaults.",
+        "properties": {
+          "small": { "type": "string" },
+          "medium": { "type": "string" },
+          "high": { "type": "string" }
+        }
       },
-      "clientId": {
-        "type": "string",
-        "description": "Linear OAuth Client ID"
-      },
-      "clientSecret": {
-        "type": "string",
-        "description": "Linear OAuth Client Secret",
-        "sensitive": true
-      },
-      "redirectUri": {
-        "type": "string",
-        "description": "Linear OAuth Redirect URI (optional, defaults to gateway URL)"
-      },
-      "accessToken": {
-        "type": "string",
-        "description": "Linear API access token for agent activities",
-        "sensitive": true
-      },
-      "defaultAgentId": {
-        "type": "string",
-        "description": "OpenClaw agent ID to use for pipeline stages"
-      },
-      "enableAudit": {
-        "type": "boolean",
-        "description": "Run auditor stage after implementation",
-        "default": true
-      },
-      "codexBaseRepo": {
-        "type": "string",
-        "description": "Path to git repo for Codex worktrees",
-        "default": "/home/claw/ai-workspace"
-      },
-      "executionMode": {
-        "type": "string",
-        "enum": [
-          "worktree",
-          "container"
-        ],
-        "description": "Worker isolation mode. 'worktree' (default): git worktree off a shared local clone. 'container': a per-session Docker container that clones the repo fresh (removes shared git state \u2192 safe for concurrent dispatches on the same repo).",
-        "default": "worktree"
-      },
-      "workerImage": {
-        "type": "string",
-        "description": "Docker image for container execution mode (built from docker/worker.Dockerfile).",
-        "default": "openclaw-linear-worker:latest"
-      },
-      "codexBin": {
-        "type": "string",
-        "description": "Path to the Codex CLI binary used by codex_run diagnostics and tools"
-      },
-      "claudeBin": {
-        "type": "string",
-        "description": "Path to the Claude CLI binary used by claude_run diagnostics and tools"
-      },
-      "geminiBin": {
-        "type": "string",
-        "description": "Path to the Gemini CLI binary used by gemini_run diagnostics and tools"
-      },
-      "enableOrchestration": {
-        "type": "boolean",
-        "description": "Allow agents to spawn sub-agents via spawn_agent/ask_agent tools",
-        "default": true
-      },
-      "worktreeBaseDir": {
-        "type": "string",
-        "description": "Base directory for persistent git worktrees (default: ~/.openclaw/worktrees)"
-      },
+      "branchTemplate": { "type": "string", "description": "Template for the dispatch git branch name. Placeholders: {identifier}, {slug} (Title-Case issue title), {title}. Default: codex/{identifier}", "default": "codex/{identifier}" },
+      "repoSelectionMode": { "type": "string", "enum": ["off", "ambiguous", "always"], "description": "When to interactively ask the user which repo(s) to work on: off (never), ambiguous (only when no repo is specified and multiple are configured), always. Default: off.", "default": "off" },
+      "codexBin": { "type": "string", "description": "Path to the Codex CLI binary used by codex_run diagnostics and tools" },
+      "claudeBin": { "type": "string", "description": "Path to the Claude CLI binary used by claude_run diagnostics and tools" },
+      "geminiBin": { "type": "string", "description": "Path to the Gemini CLI binary used by gemini_run diagnostics and tools" },
+      "enableOrchestration": { "type": "boolean", "description": "Allow agents to spawn sub-agents via spawn_agent/ask_agent tools", "default": true },
+      "worktreeBaseDir": { "type": "string", "description": "Base directory for persistent git worktrees (default: ~/.openclaw/worktrees)" },
       "repos": {
         "type": "object",
-        "description": "Multi-repo map \u2014 each key is a repo name, value is a path string or object with path + GitHub identity",
+        "description": "Multi-repo map — each key is a repo name, value is a path string or object with path + GitHub identity",
         "additionalProperties": {
           "oneOf": [
-            {
-              "type": "string",
-              "description": "Filesystem path (backward compat)"
-            },
+            { "type": "string", "description": "Filesystem path (backward compat)" },
             {
               "type": "object",
-              "required": [
-                "path"
-              ],
+              "required": ["path"],
               "properties": {
-                "path": {
-                  "type": "string",
-                  "description": "Absolute filesystem path to git repo"
-                },
-                "github": {
-                  "type": "string",
-                  "description": "GitHub owner/repo (e.g. 'calltelemetry/cisco-cdr')"
-                },
-                "hostname": {
-                  "type": "string",
-                  "description": "Git host (default: 'github.com')",
-                  "default": "github.com"
-                }
+                "path": { "type": "string", "description": "Absolute filesystem path to git repo" },
+                "github": { "type": "string", "description": "GitHub owner/repo (e.g. 'calltelemetry/cisco-cdr')" },
+                "hostname": { "type": "string", "description": "Git host (default: 'github.com')", "default": "github.com" }
               }
             }
           ]
@@ -140,9 +83,7 @@
           "properties": {
             "repos": {
               "type": "array",
-              "items": {
-                "type": "string"
-              },
+              "items": { "type": "string" },
               "description": "Repo names (keys in 'repos' config) for this team"
             },
             "defaultAgent": {
@@ -156,40 +97,22 @@
           }
         }
       },
-      "dispatchStatePath": {
-        "type": "string",
-        "description": "Path to dispatch state JSON file (default: ~/.openclaw/linear-dispatch-state.json)"
-      },
-      "planningStatePath": {
-        "type": "string",
-        "description": "Path to planning state JSON file (default: ~/.openclaw/linear-planning-state.json)"
-      },
+      "dispatchStatePath": { "type": "string", "description": "Path to dispatch state JSON file (default: ~/.openclaw/linear-dispatch-state.json)" },
+      "planningStatePath": { "type": "string", "description": "Path to planning state JSON file (default: ~/.openclaw/linear-planning-state.json)" },
       "notifications": {
         "type": "object",
-        "description": "Dispatch lifecycle notification config \u2014 fan-out to any combination of channels",
+        "description": "Dispatch lifecycle notification config — fan-out to any combination of channels",
         "properties": {
           "targets": {
             "type": "array",
-            "description": "Notification targets \u2014 each routes to an OpenClaw channel",
+            "description": "Notification targets — each routes to an OpenClaw channel",
             "items": {
               "type": "object",
-              "required": [
-                "channel",
-                "target"
-              ],
+              "required": ["channel", "target"],
               "properties": {
-                "channel": {
-                  "type": "string",
-                  "description": "OpenClaw channel name: discord, slack, telegram, signal, etc."
-                },
-                "target": {
-                  "type": "string",
-                  "description": "Channel/group/user ID to send to"
-                },
-                "accountId": {
-                  "type": "string",
-                  "description": "Account ID for multi-account channel setups (optional)"
-                }
+                "channel": { "type": "string", "description": "OpenClaw channel name: discord, slack, telegram, signal, etc." },
+                "target": { "type": "string", "description": "Channel/group/user ID to send to" },
+                "accountId": { "type": "string", "description": "Account ID for multi-account channel setups (optional)" }
               }
             }
           },
@@ -197,94 +120,30 @@
             "type": "object",
             "description": "Per-event-type toggles (all default true, set false to suppress)",
             "properties": {
-              "dispatch": {
-                "type": "boolean"
-              },
-              "working": {
-                "type": "boolean"
-              },
-              "auditing": {
-                "type": "boolean"
-              },
-              "audit_pass": {
-                "type": "boolean"
-              },
-              "audit_fail": {
-                "type": "boolean"
-              },
-              "escalation": {
-                "type": "boolean"
-              },
-              "stuck": {
-                "type": "boolean"
-              },
-              "watchdog_kill": {
-                "type": "boolean"
-              }
+              "dispatch": { "type": "boolean" },
+              "working": { "type": "boolean" },
+              "auditing": { "type": "boolean" },
+              "audit_pass": { "type": "boolean" },
+              "audit_fail": { "type": "boolean" },
+              "escalation": { "type": "boolean" },
+              "stuck": { "type": "boolean" },
+              "watchdog_kill": { "type": "boolean" }
             }
           },
-          "richFormat": {
-            "type": "boolean",
-            "description": "Send rich embeds (Discord) and HTML (Telegram) instead of plain text",
-            "default": false
-          }
+          "richFormat": { "type": "boolean", "description": "Send rich embeds (Discord) and HTML (Telegram) instead of plain text", "default": false }
         }
       },
-      "promptsPath": {
-        "type": "string",
-        "description": "Override path for prompts.yaml (default: ships with plugin)"
-      },
-      "maxReworkAttempts": {
-        "type": "number",
-        "description": "Max audit failures before escalation",
-        "default": 2
-      },
-      "inactivitySec": {
-        "type": "number",
-        "description": "Kill sessions with no I/O for this many seconds (default: 120)",
-        "default": 120
-      },
-      "maxTotalSec": {
-        "type": "number",
-        "description": "Max total runtime for agent sessions in seconds (default: 7200)",
-        "default": 7200
-      },
-      "toolTimeoutSec": {
-        "type": "number",
-        "description": "Max runtime for a single code_run CLI invocation in seconds (default: 600)",
-        "default": 600
-      },
-      "claudeApiKey": {
-        "type": "string",
-        "description": "Anthropic API key for Claude CLI backend (passed as ANTHROPIC_API_KEY env var)",
-        "sensitive": true
-      },
-      "enableGuidance": {
-        "type": "boolean",
-        "description": "Inject Linear workspace/team guidance into agent prompts (default: true)",
-        "default": true
-      },
-      "teamGuidanceOverrides": {
-        "type": "object",
-        "description": "Per-team guidance toggle. Key = Linear team ID, value = boolean. Unset teams inherit enableGuidance.",
-        "additionalProperties": {
-          "type": "boolean"
-        }
-      },
-      "enableTmux": {
-        "type": "boolean",
-        "default": true,
-        "description": "Enable tmux wrapping for code_run CLI backends (enables steering)"
-      },
-      "enableRetro": {
-        "type": "boolean",
-        "default": true,
-        "description": "Enable post-task retrospective analysis"
-      },
-      "retroDir": {
-        "type": "string",
-        "description": "Override path for coding retrospective files (default: {stateDir}/shared/coding)"
-      }
+      "promptsPath": { "type": "string", "description": "Override path for prompts.yaml (default: ships with plugin)" },
+      "maxReworkAttempts": { "type": "number", "description": "Max audit failures before escalation", "default": 2 },
+      "inactivitySec": { "type": "number", "description": "Kill sessions with no I/O for this many seconds (default: 120)", "default": 120 },
+      "maxTotalSec": { "type": "number", "description": "Max total runtime for agent sessions in seconds (default: 7200)", "default": 7200 },
+      "toolTimeoutSec": { "type": "number", "description": "Max runtime for a single code_run CLI invocation in seconds (default: 600)", "default": 600 },
+      "claudeApiKey": { "type": "string", "description": "Anthropic API key for Claude CLI backend (passed as ANTHROPIC_API_KEY env var)", "sensitive": true },
+      "enableGuidance": { "type": "boolean", "description": "Inject Linear workspace/team guidance into agent prompts (default: true)", "default": true },
+      "teamGuidanceOverrides": { "type": "object", "description": "Per-team guidance toggle. Key = Linear team ID, value = boolean. Unset teams inherit enableGuidance.", "additionalProperties": { "type": "boolean" } },
+      "enableTmux": { "type": "boolean", "default": true, "description": "Enable tmux wrapping for code_run CLI backends (enables steering)" },
+      "enableRetro": { "type": "boolean", "default": true, "description": "Enable post-task retrospective analysis" },
+      "retroDir": { "type": "string", "description": "Override path for coding retrospective files (default: {stateDir}/shared/coding)" }
     }
   }
 }

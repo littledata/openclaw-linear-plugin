@@ -46,8 +46,10 @@ export function createWorktree(issueIdentifier, opts) {
     if (!existsSync(baseDir)) {
         mkdirSync(baseDir, { recursive: true });
     }
-    const branch = `codex/${issueIdentifier}`;
-    const worktreePath = path.join(baseDir, issueIdentifier);
+    const branch = opts?.branch ?? `codex/${issueIdentifier}`;
+    const worktreePath = path.join(baseDir, opts?.branch ?? issueIdentifier);
+    // Branch may contain slashes (e.g. "CORE-123/Fix-Foo") → ensure the parent dir exists.
+    mkdirSync(path.dirname(worktreePath), { recursive: true });
     // Fetch latest from origin (best effort) — do this early so both
     // resume and fresh paths have up-to-date refs.
     try {
@@ -96,12 +98,12 @@ export function createWorktree(issueIdentifier, opts) {
  */
 export function createMultiWorktree(identifier, repos, opts) {
     const baseDir = resolveBaseDir(opts?.baseDir);
-    const parentPath = path.join(baseDir, identifier);
-    // Ensure parent directory exists
+    const parentPath = path.join(baseDir, opts?.branch ?? identifier);
+    // Ensure parent directory exists (branch may contain slashes → recursive).
     if (!existsSync(parentPath)) {
         mkdirSync(parentPath, { recursive: true });
     }
-    const branch = `codex/${identifier}`;
+    const branch = opts?.branch ?? `codex/${identifier}`;
     const worktrees = [];
     for (const repo of repos) {
         if (!existsSync(repo.path)) {
@@ -193,15 +195,25 @@ export function getWorktreeStatus(worktreePath) {
  */
 export function removeWorktree(worktreePath, opts) {
     const repo = opts?.baseRepo ?? DEFAULT_BASE_REPO;
+    // Resolve the branch to delete BEFORE removing the worktree. Prefer an
+    // explicit branch, else read it live from the worktree (robust to any
+    // branchTemplate), else fall back to the legacy codex/{dirName} scheme.
+    let branch = opts?.branch;
+    if (opts?.deleteBranch && !branch && existsSync(worktreePath)) {
+        try {
+            branch = git(["rev-parse", "--abbrev-ref", "HEAD"], worktreePath);
+        }
+        catch {
+            // Not a valid worktree — fall through to legacy reconstruction
+        }
+    }
     if (existsSync(worktreePath)) {
         git(["worktree", "remove", "--force", worktreePath], repo);
     }
     if (opts?.deleteBranch) {
-        // Extract issue identifier from worktree path to find matching branch
-        const dirName = path.basename(worktreePath);
-        const branch = `codex/${dirName}`;
+        const target = branch ?? `codex/${path.basename(worktreePath)}`;
         try {
-            git(["branch", "-D", branch], repo);
+            git(["branch", "-D", target], repo);
         }
         catch {
             // Branch doesn't exist or already deleted
@@ -350,7 +362,7 @@ export function pruneStaleWorktrees(maxAgeMs = 24 * 60 * 60_000, opts) {
             continue;
         }
         try {
-            removeWorktree(wt.path, { deleteBranch: true, baseRepo: repo });
+            removeWorktree(wt.path, { deleteBranch: true, baseRepo: repo, branch: wt.branch });
             removed.push(wt.path);
         }
         catch (err) {
