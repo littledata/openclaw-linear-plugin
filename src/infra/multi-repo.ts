@@ -150,6 +150,25 @@ function resolveRepoPath(name: string, pluginConfig?: Record<string, unknown>): 
   return path.join(parentDir, name);
 }
 
+/**
+ * Resolve an explicit list of repo names into a RepoResolution.
+ * Used by interactive repo selection once the user has chosen.
+ * @param names - repo names (keys in the `repos` config)
+ * @param pluginConfig - the plugin config object
+ * @returns a RepoResolution over the named repos
+ */
+export function resolveReposByNames(
+  names: string[],
+  pluginConfig?: Record<string, unknown>,
+): RepoResolution {
+  const repoMap = getRepoMap(pluginConfig);
+  const repos = names.map((name) => ({
+    name,
+    path: repoMap[name] ?? resolveRepoPath(name, pluginConfig),
+  }));
+  return { repos, source: "issue_body" };
+}
+
 export function isMultiRepo(resolution: RepoResolution): boolean {
   return resolution.repos.length > 1;
 }

@@ -37,6 +37,19 @@
       "defaultAgentId": { "type": "string", "description": "OpenClaw agent ID to use for pipeline stages" },
       "enableAudit": { "type": "boolean", "description": "Run auditor stage after implementation", "default": true },
       "codexBaseRepo": { "type": "string", "description": "Path to git repo for Codex worktrees", "default": "/home/claw/ai-workspace" },
+      "codexModel": { "type": "string", "description": "Model passed to the Codex worker CLI (codex exec --model). If unset, Codex uses its own ~/.codex/config.toml default." },
+      "codexReasoningEffort": { "type": "string", "description": "Codex reasoning effort injected as '-c model_reasoning_effort' for the worker (e.g. low, medium, high, xhigh, max, ultra). If unset, Codex uses its config.toml default." },
+      "tierModels": {
+        "type": "object",
+        "description": "Override the tier→model map used for complexity-based dispatch. Values are provider/model strings; unset tiers fall back to built-in defaults.",
+        "properties": {
+          "small": { "type": "string" },
+          "medium": { "type": "string" },
+          "high": { "type": "string" }
+        }
+      },
+      "branchTemplate": { "type": "string", "description": "Template for the dispatch git branch name. Placeholders: {identifier}, {slug} (Title-Case issue title), {title}. Default: codex/{identifier}", "default": "codex/{identifier}" },
+      "repoSelectionMode": { "type": "string", "enum": ["off", "ambiguous", "always"], "description": "When to interactively ask the user which repo(s) to work on: off (never), ambiguous (only when no repo is specified and multiple are configured), always. Default: off.", "default": "off" },
       "codexBin": { "type": "string", "description": "Path to the Codex CLI binary used by codex_run diagnostics and tools" },
       "claudeBin": { "type": "string", "description": "Path to the Claude CLI binary used by claude_run diagnostics and tools" },
       "geminiBin": { "type": "string", "description": "Path to the Gemini CLI binary used by gemini_run diagnostics and tools" },

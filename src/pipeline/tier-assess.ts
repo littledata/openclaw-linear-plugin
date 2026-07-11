@@ -21,6 +21,21 @@ export const TIER_MODELS: Record<Tier, string> = {
   high: "anthropic/claude-opus-4-6",
 };
 
+/**
+ * Resolve the tier→model map, letting plugin config `tierModels` override the
+ * built-in defaults per tier. Unset tiers fall back to TIER_MODELS.
+ * @param pluginConfig - the plugin config object (api.pluginConfig)
+ * @returns a complete tier→model map with config overrides applied
+ */
+export function resolveTierModels(pluginConfig?: Record<string, unknown>): Record<Tier, string> {
+  const override = (pluginConfig?.tierModels ?? {}) as Partial<Record<Tier, string>>;
+  return {
+    small: override.small ?? TIER_MODELS.small,
+    medium: override.medium ?? TIER_MODELS.medium,
+    high: override.high ?? TIER_MODELS.high,
+  };
+}
+
 export interface TierAssessment {
   tier: Tier;
   model: string;
@@ -72,6 +87,7 @@ export async function assessTier(
   ].filter(Boolean).join("\n");
 
   const message = `${ASSESS_PROMPT}\n\n${issueText}`;
+  const tierModels = resolveTierModels(api.pluginConfig as Record<string, unknown> | undefined);
 
   try {
     const { runAgent } = await import("../agent/agent.js");
@@ -88,7 +104,7 @@ export async function assessTier(
     // the agent produced valid JSON output — e.g. agent exited with
     // signal but wrote the response before terminating.
     if (result.output) {
-      const parsed = parseAssessment(result.output);
+      const parsed = parseAssessment(result.output, tierModels);
       if (parsed) {
         api.logger.info(`Tier assessment for ${issue.identifier}: ${parsed.tier} — ${parsed.reasoning} (agent success=${result.success})`);
         return parsed;
@@ -107,7 +123,7 @@ export async function assessTier(
   // Fallback: medium is the safest default
   const fallback: TierAssessment = {
     tier: "medium",
-    model: TIER_MODELS.medium,
+    model: tierModels.medium,
     reasoning: "Assessment failed — defaulting to medium",
   };
   api.logger.info(`Tier assessment fallback for ${issue.identifier}: medium`);
@@ -118,7 +134,7 @@ export async function assessTier(
 // Helpers
 // ---------------------------------------------------------------------------
 
-function parseAssessment(raw: string): TierAssessment | null {
+function parseAssessment(raw: string, models: Record<Tier, string>): TierAssessment | null {
   // Extract JSON from the response (may have markdown wrapping)
   const jsonMatch = raw.match(/\{[^}]+\}/);
   if (!jsonMatch) return null;
@@ -130,7 +146,7 @@ function parseAssessment(raw: string): TierAssessment | null {
 
     return {
       tier: tier as Tier,
-      model: TIER_MODELS[tier as Tier],
+      model: models[tier as Tier],
       reasoning: parsed.reasoning ?? "no reasoning provided",
     };
   } catch {
