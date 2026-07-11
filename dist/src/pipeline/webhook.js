@@ -8,7 +8,7 @@ import { createManagedFlowForDispatch } from "./taskflow-bridge.js";
 import { createNotifierFromConfig } from "../infra/notify.js";
 import { assessTier } from "./tier-assess.js";
 import { createWorktree, createMultiWorktree, prepareWorkspace } from "../infra/codex-worktree.js";
-import { resolveRepos, isMultiRepo, getRepoEntries, resolveReposByNames, buildCandidateRepositories } from "../infra/multi-repo.js";
+import { resolveRepos, isMultiRepo, getRepoEntries, resolveReposByNames, buildCandidateRepositories, detectMentionedRepos } from "../infra/multi-repo.js";
 import { repoSelectSignal, optionsSignal, RESUME_SELECT } from "./select-signal.js";
 import { savePendingRepoSelection, getPendingRepoSelection, clearPendingRepoSelection, parseRepoSelection, } from "./repo-selection-state.js";
 import { getGrill, saveGrill, clearGrill } from "./grill-state.js";
@@ -639,6 +639,10 @@ export async function handleLinearWebhook(api, req, res) {
             // any tmux-based (codex exec) session. A tmux-only kill misses embedded runs.
             const { abortRunsFor } = await import("../agent/agent.js");
             const abortedRuns = abortRunsFor(issue.id);
+            // Flag the state-driven orchestrator to stop advancing between phases —
+            // killing the current sub-run alone lets its loop spawn the next one.
+            const { requestCancel } = await import("./cancellation.js");
+            requestCancel(issue.id);
             const killed = killActiveSession(issue.id);
             const halted = abortedRuns > 0 || killed;
             activeRuns.delete(issue.id);
@@ -2120,6 +2124,30 @@ async function handleDispatch(api, linearApi, issue, opts) {
     else {
         repoResolution = resolveRepos(enrichedIssue.description, labels, pluginConfig, dispatchTeamKey);
         api.logger.info(`@dispatch: ${identifier} team=${dispatchTeamKey ?? "none"} repos=${repoResolution.repos.map(r => r.name).join(",")} source=${repoResolution.source}`);
+        // Rescue the silent config-default: markers/labels/team-mapping gave us
+        // nothing, so we'd fall back to codexBaseRepo (e.g. TMv2). But the issue
+        // body + comments often NAME the right repo ("the bug is in ld-shopify").
+        // If exactly one configured repo is explicitly mentioned, use it instead of
+        // blindly defaulting. Ambiguous (>1) or none → leave the default / ask.
+        if (repoResolution.source === "config_default") {
+            try {
+                const repoNames = Object.keys(getRepoEntries(pluginConfig));
+                const commentText = (await linearApi.getRecentComments(issue.id, 40).catch(() => []))
+                    .map((c) => c.body)
+                    .join("\n");
+                const mentioned = detectMentionedRepos(`${enrichedIssue.description ?? ""}\n${commentText}`, repoNames);
+                if (mentioned.length === 1) {
+                    repoResolution = resolveReposByNames(mentioned, pluginConfig);
+                    api.logger.info(`@dispatch: ${identifier} repos=${mentioned[0]} source=text_mention (rescued from config_default)`);
+                }
+                else if (mentioned.length > 1) {
+                    api.logger.info(`@dispatch: ${identifier} text mentions multiple repos (${mentioned.join(",")}) — keeping config_default/ask`);
+                }
+            }
+            catch (err) {
+                api.logger.warn(`@dispatch: ${identifier} repo mention-detection failed: ${err}`);
+            }
+        }
         // Interactive repo selection: if enabled and the repo is ambiguous, ask the
         // user which repo(s) to use and park the dispatch until they reply.
         if (shouldAskRepoSelection(repoResolution, pluginConfig)) {

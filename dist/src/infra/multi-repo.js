@@ -47,6 +47,32 @@ export function buildCandidateRepositories(pluginConfig) {
     }));
 }
 /**
+ * Find configured repo names explicitly mentioned in free text (issue body,
+ * comments, prior-work context). Whole-token, case-insensitive, and hyphen-aware
+ * so "ld-shopify" does NOT match inside "ld-shopify-admin" — each is detected
+ * only by its own full name. Used to rescue repo resolution from silently
+ * defaulting to codexBaseRepo when the issue text names a repo (e.g. a comment
+ * saying "the bug is in ld-shopify").
+ * @param text - the text to scan
+ * @param repoNames - the configured repo names
+ * @returns distinct configured repo names mentioned, in config order
+ */
+export function detectMentionedRepos(text, repoNames) {
+    if (!text)
+        return [];
+    const found = [];
+    for (const name of repoNames) {
+        if (!name)
+            continue;
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        // No word/hyphen char immediately around the name → exact-token match.
+        const re = new RegExp(`(?<![\\w-])${escaped}(?![\\w-])`, "i");
+        if (re.test(text))
+            found.push(name);
+    }
+    return [...new Set(found)];
+}
+/**
  * Resolve which repos a dispatch should work with.
  */
 export function resolveRepos(description, labels, pluginConfig, teamKey) {

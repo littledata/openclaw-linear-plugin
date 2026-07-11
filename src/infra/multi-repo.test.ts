@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { homedir } from "node:os";
 import path from "node:path";
-import { resolveRepos, isMultiRepo, validateRepoPath, getRepoEntries, buildCandidateRepositories, type RepoResolution } from "./multi-repo.ts";
+import { resolveRepos, isMultiRepo, validateRepoPath, getRepoEntries, buildCandidateRepositories, detectMentionedRepos, type RepoResolution } from "./multi-repo.ts";
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
@@ -254,6 +254,38 @@ describe("resolveRepos with team mapping", () => {
   it("falls back to config_default when no teamKey provided", () => {
     const result = resolveRepos("Plain description", [], config);
     expect(result.source).toBe("config_default");
+  });
+});
+
+describe("detectMentionedRepos", () => {
+  const repos = ["ld-shopify", "ld-shopify-admin", "transaction-monitor-2", "shopify-tracker"];
+
+  it("finds a repo named in a comment", () => {
+    expect(detectMentionedRepos("the bug is in ld-shopify, per George", repos)).toEqual(["ld-shopify"]);
+  });
+
+  it("does NOT match a shorter name inside a longer repo name", () => {
+    // "ld-shopify-admin" must not also register "ld-shopify"
+    expect(detectMentionedRepos("fix the ld-shopify-admin settings page", repos)).toEqual(["ld-shopify-admin"]);
+  });
+
+  it("ignores near-mentions that are not the exact repo name (e.g. TMv2)", () => {
+    expect(detectMentionedRepos("honored server-side in TMv2 but not the browser", repos)).toEqual([]);
+  });
+
+  it("is case-insensitive and de-duplicates", () => {
+    expect(detectMentionedRepos("LD-Shopify here, and ld-shopify again", repos)).toEqual(["ld-shopify"]);
+  });
+
+  it("returns multiple when several distinct repos are named", () => {
+    expect(detectMentionedRepos("touches ld-shopify and shopify-tracker", repos).sort()).toEqual(
+      ["ld-shopify", "shopify-tracker"],
+    );
+  });
+
+  it("returns [] for empty text or no match", () => {
+    expect(detectMentionedRepos("", repos)).toEqual([]);
+    expect(detectMentionedRepos("nothing relevant here", repos)).toEqual([]);
   });
 });
 

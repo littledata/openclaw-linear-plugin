@@ -17,6 +17,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type { LinearAgentApi } from "../api/linear-api.js";
 import { buildSummaryFromArtifacts } from "./artifacts.js";
 import { resolveDefaultAgent } from "../infra/shared-profiles.js";
+import { detectMentionedRepos } from "../infra/multi-repo.js";
 
 export interface PriorWork {
   hasPriorWork: boolean;
@@ -249,7 +250,19 @@ export async function analyzeResume(
       timeoutMs: 90_000,
     });
     const parsed = result.output ? parseResumeAnalysis(result.output, repoNames) : null;
-    if (parsed) return parsed;
+    if (parsed) {
+      // If the model didn't commit to a repo, don't leave it undecided (which
+      // silently defaults to codexBaseRepo): rescue from an explicit mention in
+      // the prior context (comments/plans naming e.g. "ld-shopify").
+      if (!parsed.repos.length) {
+        const mentioned = detectMentionedRepos(fullContext, repoNames);
+        if (mentioned.length === 1) {
+          api.logger.info(`resume analysis for ${issue.identifier}: repo from text mention → ${mentioned[0]}`);
+          return { repos: mentioned, brief: parsed.brief };
+        }
+      }
+      return parsed;
+    }
     api.logger.warn(`resume analysis for ${issue.identifier}: unparseable — continuing with no repo override`);
   } catch (err) {
     api.logger.warn(`resume analysis error for ${issue.identifier}: ${err}`);

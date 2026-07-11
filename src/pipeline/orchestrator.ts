@@ -40,6 +40,7 @@ import {
   type RoleKind,
 } from "./roles.js";
 import { resolveTargetState, type StatePlan, type PlanPhase } from "./state-plan.js";
+import { isCancelled, clearCancel } from "./cancellation.js";
 
 interface OrchIssue {
   id: string;
@@ -281,10 +282,12 @@ async function runImplementPhase(
   let lastReason = "";
 
   for (let attempt = 0; attempt <= limit; attempt++) {
+    if (isCancelled(dispatch.issueId)) return { success: false, reason: "halted" };
     setStatus(dispatch, attempt === 0 ? "implementing" : `reworking (attempt ${attempt + 1})`);
     // Implementers run sequentially — they share one worktree.
     const attemptOutputs: string[] = [];
     for (const a of assignments) {
+      if (isCancelled(dispatch.issueId)) return { success: false, reason: "halted" };
       const role = resolveRole(a.role) ?? ROLES.spine;
       const { success, output } = await runRole(ctx, dispatch, role, "implement", a.task, issue);
       attemptOutputs.push(`## ${role.label}\n${output}`);
@@ -298,6 +301,7 @@ async function runImplementPhase(
     try { appendLog(dispatch.worktreePath, { ts: new Date().toISOString(), phase: "worker", attempt, agent: assignments.map((a) => a.role).join("+"), prompt: "", outputPreview: attemptOutputs.join("\n\n").slice(0, 500), success: !lastReason, durationMs: 0 }); } catch { /* best effort */ }
 
     // Apex self-review — read-only, gates the phase.
+    if (isCancelled(dispatch.issueId)) return { success: false, reason: "halted" };
     setStatus(dispatch, "reviewing");
     const review = await runRole(
       ctx,
@@ -315,11 +319,10 @@ async function runImplementPhase(
     }
 
     lastReason = verdict.reason;
-    await comment(
-      ctx,
-      dispatch,
-      `## 🔁 Apex self-review failed (attempt ${attempt + 1}/${limit + 1})\n\n${verdict.reason}`,
-    );
+    emit(ctx, dispatch, {
+      type: "thought",
+      body: `🔁 Apex self-review failed (attempt ${attempt + 1}/${limit + 1}): ${verdict.reason}`,
+    });
     if (attempt < limit) {
       // Rework: re-run each implementer focused on the reviewer's findings.
       assignments = assignments.map((a) => ({
@@ -369,6 +372,15 @@ function reviewFocus(role: RoleDef): string {
   }
 }
 
+/**
+ * Run a single review role for a code-review / QA state. REVIEW-ONLY: reviewers
+ * read the change and emit a pass/fail verdict — they NEVER trigger an
+ * implementer. In a code-review state only review agents run; a fail GATES (the
+ * ticket stays put and the findings are reported) so a human can bounce it back
+ * to implementation, where fixing actually belongs. The verdict streams into the
+ * agent session rather than the issue comments.
+ * @param gate - true when the phase blocks on failure; false = annotate-only
+ */
 async function runReviewPhase(
   ctx: HookContext,
   dispatch: ActiveDispatch,
@@ -376,47 +388,17 @@ async function runReviewPhase(
   role: RoleDef,
   gate: boolean,
 ): Promise<{ success: boolean; reason?: string }> {
-  const limit = gate ? maxRework(ctx.pluginConfig) : 0;
   const tag = role.verdictTag ?? "REVIEW";
-  let lastReason = "";
+  const { output } = await runRole(ctx, dispatch, role, "review", reviewFocus(role), issue);
+  const verdict = parseReviewVerdict(output, tag);
+  emit(ctx, dispatch, {
+    type: "thought",
+    body: `${verdict.pass ? "✅" : "❌"} ${role.label} review — ${verdict.pass ? "pass" : "fail"}: ${verdict.reason}`,
+  });
 
-  for (let attempt = 0; attempt <= limit; attempt++) {
-    const { output } = await runRole(ctx, dispatch, role, "review", reviewFocus(role), issue);
-    const verdict = parseReviewVerdict(output, tag);
-    await comment(
-      ctx,
-      dispatch,
-      `## ${verdict.pass ? "✅" : "❌"} ${role.label} review — ${verdict.pass ? "pass" : "fail"}\n\n${verdict.reason}`,
-    );
-
-    if (verdict.pass) return { success: true };
-    lastReason = verdict.reason;
-    if (!gate) return { success: true }; // annotate-only reviewers never block
-
-    if (attempt < limit) {
-      // Bounded rework: send the finding back to a codex fix in the worktree.
-      await runFix(ctx, dispatch, issue, `${role.label} found: ${verdict.reason}`);
-    }
-  }
-
-  return { success: false, reason: lastReason || `${role.label} review failed` };
-}
-
-/** Re-open the worktree and have a codex implementer address a review finding. */
-async function runFix(
-  ctx: HookContext,
-  dispatch: ActiveDispatch,
-  issue: OrchIssue,
-  finding: string,
-): Promise<void> {
-  await runRole(
-    ctx,
-    dispatch,
-    ROLES.spine,
-    "implement",
-    `A reviewer blocked this change. Fix it, preserving working code:\n${finding}`,
-    issue,
-  );
+  if (verdict.pass) return { success: true };
+  if (!gate) return { success: true }; // annotate-only reviewers never block
+  return { success: false, reason: `${role.label}: ${verdict.reason}` };
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +455,8 @@ export async function runStatePlan(
     teamId: details?.team?.id,
   };
 
+  // Fresh run — drop any stale halt flag from a prior (stopped) dispatch.
+  clearCancel(dispatch.issueId);
   ensureManifest(dispatch);
   setStatus(dispatch, "orchestrating");
   emit(ctx, dispatch, {
@@ -485,7 +469,18 @@ export async function runStatePlan(
 
   try {
     for (const phase of plan.phases) {
+      // Honor a STOP requested between phases — bail cleanly, don't advance.
+      if (isCancelled(dispatch.issueId)) {
+        setStatus(dispatch, "cancelled");
+        endSession(ctx, dispatch, "response", "🛑 Halted — stopped before completing the pipeline. Re-assign or comment to start again.");
+        return;
+      }
       const result = await runPhase(ctx, dispatch, issue, phase);
+      if (result.reason === "halted") {
+        setStatus(dispatch, "cancelled");
+        endSession(ctx, dispatch, "response", "🛑 Halted mid-phase — stopped the running work. Re-assign or comment to start again.");
+        return;
+      }
       if (!result.success) {
         const label = phase.role ? `${phase.type}:${phase.role}` : phase.type;
         const reason = result.reason ?? "phase failed";
