@@ -234,3 +234,23 @@ export async function runInTmux(opts) {
         };
     }
 }
+/**
+ * Kill the active tmux coding session for an issue, if one is running.
+ * @param issueId - the Linear issue id
+ * @returns the killed tmux session name, or null if none was active
+ */
+export function killActiveSession(issueId) {
+    const session = getActiveTmuxSession(issueId);
+    if (!session)
+        return null;
+    try {
+        execSync(`tmux kill-session -t ${shellEscape(session.sessionName)}`, {
+            stdio: "ignore",
+            timeout: 5_000,
+        });
+    }
+    catch {
+        // best effort — session may already be gone
+    }
+    return session.sessionName;
+}

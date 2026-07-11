@@ -25,7 +25,7 @@ import { emitDiagnostic } from "../infra/observability.js";
 import { classifyIntent, type Intent } from "./intent-classify.js";
 import { extractGuidance, formatGuidanceAppendix, cacheGuidanceForTeam, getCachedGuidanceForTeam, isGuidanceEnabled, _resetGuidanceCacheForTesting } from "./guidance.js";
 import { loadAgentProfiles, buildMentionPattern, resolveAgentFromAlias, validateProfiles, _resetProfilesCacheForTesting, type AgentProfile } from "../infra/shared-profiles.js";
-import { getActiveTmuxSession } from "../infra/tmux-runner.js";
+import { getActiveTmuxSession, killActiveSession } from "../infra/tmux-runner.js";
 import { capturePane } from "../infra/tmux.js";
 import { loadCodingConfig, resolveToolName } from "../tools/code-tool.js";
 
@@ -681,6 +681,33 @@ export async function handleLinearWebhook(
 
     if (!session?.id || !issue?.id) {
       api.logger.info(`AgentSession prompted: missing session or issue — ignoring`);
+      return true;
+    }
+
+    // ── Stop signal ──────────────────────────────────────────────────────
+    // Linear delivers a user "stop" as a `prompted` event carrying
+    // agentActivity.signal="stop" — NOT a dedicated event. It MUST be checked
+    // before the message is treated as a follow-up, and the user needs real
+    // feedback (the prior behaviour swallowed it silently).
+    const stopSignal = payload.agentActivity?.signal ?? payload.agentActivity?.content?.signal;
+    if (stopSignal === "stop") {
+      const stopIdentifier = issue.identifier ?? issue.id;
+      api.logger.info(`AgentSession prompted: STOP signal for ${stopIdentifier}`);
+      const killed = killActiveSession(issue.id);
+      activeRuns.delete(issue.id);
+      try {
+        await removeActiveDispatch(stopIdentifier, pluginConfig?.dispatchStatePath as string | undefined);
+      } catch { /* best effort */ }
+      clearPendingRepoSelection(issue.id);
+      const stopApi = createLinearApi(api);
+      if (stopApi) {
+        await stopApi.emitActivity(session.id, {
+          type: "response",
+          body: killed
+            ? `🛑 Stopped — halted the running worker and cleared the dispatch for ${stopIdentifier}. Re-assign or comment to start again.`
+            : `🛑 Stop received for ${stopIdentifier} — no active worker was running; cleared any pending dispatch state.`,
+        }).catch(() => {});
+      }
       return true;
     }
 
@@ -2337,33 +2364,14 @@ async function handleDispatch(
     startedAt: Date.now(),
   });
 
-  // 9. Post dispatch confirmation comment
-  const worktreeDesc = worktrees
-    ? worktrees.map(wt => `\`${wt.repoName}\`: \`${wt.path}\``).join("\n")
-    : `\`${worktreePath}\``;
-  const statusComment = [
-    `**Dispatched** as **${assessment.tier}** (${assessment.model})`,
-    `> ${assessment.reasoning}`,
-    ``,
-    worktrees
-      ? `Worktrees ${worktreeResumed ? "(resumed)" : "(fresh)"}:\n${worktreeDesc}`
-      : `Worktree: ${worktreeDesc} ${worktreeResumed ? "(resumed)" : "(fresh)"}`,
-    `Branch: \`${worktreeBranch}\``,
-    ``,
-    `**Status:** Worker is starting now. An independent audit runs automatically after implementation.`,
-    ``,
-    `**While you wait:**`,
-    `- Check progress: \`/dispatch status ${identifier}\``,
-    `- Cancel: \`/dispatch escalate ${identifier} "reason"\``,
-    `- All dispatches: \`/dispatch list\``,
-  ].join("\n");
-
-  await createCommentWithDedup(linearApi, issue.id, statusComment);
-
+  // 9. Announce start in the Agent Session only. We deliberately do NOT post an
+  // issue comment here — the old "Dispatched as …" comment carried non-working
+  // /dispatch slash-commands and added noise. The Agent Session activity feed is
+  // the single source of live status.
   if (agentSessionId) {
     await linearApi.emitActivity(agentSessionId, {
       type: "thought",
-      body: `Dispatching ${identifier} as ${assessment.tier}...`,
+      body: `Starting work on ${identifier} (${assessment.tier} complexity) on branch \`${worktreeBranch}\`.`,
     }).catch(() => {});
   }
 
