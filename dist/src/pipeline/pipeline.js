@@ -784,11 +784,16 @@ export async function spawnWorker(hookCtx, dispatch, opts) {
     const workerTeamContext = workerTeamMapping?.context
         ? `\n## Team Context (${workerTeamKey})\n${workerTeamMapping.context}\n`
         : "";
+    // Fold the /grill-me implementation brief into the worker guidance so codex
+    // gets the clarified requirements + target repo decided during the interview.
+    const combinedGuidance = [workerGuidance, dispatch.grillGuidance]
+        .filter(Boolean)
+        .join("\n\n") || undefined;
     const workerPrompt = buildWorkerTask(issue, effectiveWorkerPath, {
         attempt: dispatch.attempt,
         gaps: opts?.gaps,
         pluginConfig,
-        guidance: workerGuidance,
+        guidance: combinedGuidance,
         teamContext: workerTeamContext,
     });
     const workerSessionId = `linear-worker-${dispatch.issueIdentifier}-${dispatch.attempt}`;
