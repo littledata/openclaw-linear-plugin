@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, statSync, readdirSync, mkdirSync } from "node:fs";
+import { existsSync, statSync, readdirSync, mkdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { ensureGitignore } from "../pipeline/artifacts.js";
@@ -61,17 +61,50 @@ export function createWorktree(issueIdentifier, opts) {
     // Idempotent: if worktree already exists, return it
     if (existsSync(worktreePath)) {
         try {
-            // Verify it's a valid git worktree
+            // Verify it's a valid git worktree...
             git(["rev-parse", "--git-dir"], worktreePath);
-            ensureGitignore(worktreePath);
-            return { path: worktreePath, branch, resumed: true };
+            // ...AND that it belongs to the requested base repo. A stale worktree
+            // from a PRIOR dispatch (created against a different repo before
+            // repo-selection chose this one) must NOT be silently reused, or the
+            // agent works in the wrong repo (observed: ld-shopify work reusing a
+            // transaction-monitor-2 worktree).
+            const commonDir = git(["rev-parse", "--git-common-dir"], worktreePath).trim();
+            const absCommon = path.isAbsolute(commonDir) ? commonDir : path.resolve(worktreePath, commonDir);
+            if (path.resolve(absCommon) === path.resolve(repo, ".git")) {
+                ensureGitignore(worktreePath);
+                return { path: worktreePath, branch, resumed: true };
+            }
+            // Different repo → remove from its owning repo, then fall through to recreate.
+            const ownerRepo = path.dirname(path.resolve(absCommon));
+            try {
+                git(["worktree", "remove", "--force", worktreePath], ownerRepo);
+            }
+            catch {
+                try {
+                    rmSync(worktreePath, { recursive: true, force: true });
+                }
+                catch { /* best effort */ }
+            }
+            try {
+                git(["worktree", "prune"], ownerRepo);
+            }
+            catch { /* best effort */ }
+            try {
+                git(["worktree", "prune"], repo);
+            }
+            catch { /* best effort */ }
         }
         catch {
             // Directory exists but isn't a valid worktree — remove and recreate
             try {
                 git(["worktree", "remove", "--force", worktreePath], repo);
             }
-            catch { /* best effort */ }
+            catch {
+                try {
+                    rmSync(worktreePath, { recursive: true, force: true });
+                }
+                catch { /* best effort */ }
+            }
         }
     }
     // Check if branch already exists (resume scenario)

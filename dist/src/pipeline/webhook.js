@@ -2163,14 +2163,25 @@ async function handleDispatch(api, linearApi, issue, opts) {
     };
     const dispatchWithFlow = createManagedFlowForDispatch(api, initialDispatch);
     await registerDispatch(identifier, dispatchWithFlow, statePath);
-    // 7b. Linear state transition: set issue to "In Progress" (best-effort)
-    if (enrichedIssue?.team?.id) {
+    // 7b. Linear state transition: set issue to "In Progress" (best-effort).
+    // In stateplan mode the orchestrator OWNS all state transitions (it advances
+    // the ticket per config, only on success), so we do NOT auto-move here —
+    // doing so previously landed on the first "started" state (e.g. "Design
+    // Review"), which is exactly the spurious move we want to avoid.
+    if (orchestrationMode(pluginConfig) === "stateplan") {
+        api.logger.info(`@dispatch: ${identifier} — stateplan mode, leaving state to the orchestrator`);
+    }
+    else if (enrichedIssue?.team?.id) {
         try {
             const teamStates = await linearApi.getTeamStates(enrichedIssue.team.id);
-            const inProgress = teamStates.find((s) => s.type === "started");
+            // Prefer a state literally named "In Progress"; only then fall back to
+            // the first "started" state so we don't accidentally pick "Design Review".
+            const inProgress = teamStates.find((s) => s.name.toLowerCase() === "in progress") ??
+                teamStates.find((s) => /in progress|in-progress|doing/i.test(s.name)) ??
+                teamStates.find((s) => s.type === "started");
             if (inProgress) {
                 await linearApi.updateIssue(issue.id, { stateId: inProgress.id });
-                api.logger.info(`@dispatch: ${identifier} → ${inProgress.name} (In Progress)`);
+                api.logger.info(`@dispatch: ${identifier} → ${inProgress.name}`);
             }
         }
         catch (err) {

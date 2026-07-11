@@ -119,7 +119,7 @@ async function runRole(
   issue: OrchIssue,
 ): Promise<RoleRunResult> {
   const backend = resolveRoleBackend(role, ctx.pluginConfig);
-  const system = buildRolePrompt(role, { identifier: dispatch.issueIdentifier, phase, extra });
+  const system = buildRolePrompt(role, { identifier: dispatch.issueIdentifier, phase, backend, extra });
   const task = buildRoleTask(issue, dispatch, extra);
 
   emit(ctx, dispatch, { type: "thought", body: `[${role.label}] starting ${phase} (${backend})` });
@@ -446,33 +446,63 @@ export async function runStatePlan(
     `[orchestrator] ${issue.identifier} plan=${plan.stateLabel} phases=${plan.phases.map((p) => p.role ?? p.type).join(",")}`,
   );
 
-  for (const phase of plan.phases) {
-    const result = await runPhase(ctx, dispatch, issue, phase);
-    if (!result.success) {
-      const label = phase.role ? `${phase.type}:${phase.role}` : phase.type;
-      await comment(
-        ctx,
-        dispatch,
-        `## ⛔ Blocked at ${label}\n\n${result.reason ?? "phase failed"}\n\nThe ticket stays in its current state until this is resolved.`,
-      );
-      await ctx.notify("stuck", {
-        identifier: dispatch.issueIdentifier,
-        title: issue.title,
-        status: "stuck",
-        attempt: dispatch.attempt,
-        reason: result.reason,
-      }).catch(() => {});
-      return;
+  try {
+    for (const phase of plan.phases) {
+      const result = await runPhase(ctx, dispatch, issue, phase);
+      if (!result.success) {
+        const label = phase.role ? `${phase.type}:${phase.role}` : phase.type;
+        const reason = result.reason ?? "phase failed";
+        await comment(
+          ctx,
+          dispatch,
+          `## ⛔ Blocked at ${label}\n\n${reason}\n\nThe ticket stays in its current state until this is resolved.`,
+        );
+        await ctx.notify("stuck", {
+          identifier: dispatch.issueIdentifier,
+          title: issue.title,
+          status: "stuck",
+          attempt: dispatch.attempt,
+          reason: result.reason,
+        }).catch(() => {});
+        // Terminal activity — ends the Linear agent turn (otherwise it hangs "active").
+        endSession(ctx, dispatch, "response", `⛔ Blocked at ${label}: ${reason}\n\nThe ticket was left in its current state. Reply with guidance to retry.`);
+        return;
+      }
     }
-  }
 
-  await transitionOnSuccess(ctx, dispatch, plan, issue);
-  await ctx.notify("audit_pass", {
-    identifier: dispatch.issueIdentifier,
-    title: issue.title,
-    status: "done",
-    attempt: dispatch.attempt,
-  }).catch(() => {});
+    await transitionOnSuccess(ctx, dispatch, plan, issue);
+    await ctx.notify("audit_pass", {
+      identifier: dispatch.issueIdentifier,
+      title: issue.title,
+      status: "done",
+      attempt: dispatch.attempt,
+    }).catch(() => {});
+    endSession(ctx, dispatch, "response", `✅ Completed "${plan.stateLabel}" — all phases passed.`);
+  } catch (err) {
+    ctx.api.logger.error(`[orchestrator] ${issue.identifier} unexpected error: ${err}`);
+    endSession(ctx, dispatch, "error", `The pipeline hit an unexpected error: ${String(err).slice(0, 400)}`);
+  }
+}
+
+/**
+ * Emit the terminal Linear activity that ENDS the agent turn. Without this the
+ * session shows "active" forever. `response` closes a normal turn (success or a
+ * clean block); `error` marks a failed turn.
+ * @param ctx - hook context
+ * @param dispatch - the active dispatch (for the agent session id)
+ * @param type - "response" for a normal end, "error" for a failure
+ * @param body - the closing message shown in the session
+ */
+function endSession(
+  ctx: HookContext,
+  dispatch: ActiveDispatch,
+  type: "response" | "error",
+  body: string,
+): void {
+  if (!dispatch.agentSessionId) return;
+  ctx.linearApi.emitActivity(dispatch.agentSessionId, { type, body }).catch((err) => {
+    ctx.api.logger.warn(`[orchestrator] terminal ${type} emit failed for ${dispatch.issueIdentifier}: ${err}`);
+  });
 }
 
 /** Dispatch a single plan phase to its handler. */

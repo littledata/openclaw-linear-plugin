@@ -67,6 +67,17 @@ describe("buildRolePrompt", () => {
     const p = buildRolePrompt(ROLES.apex, { identifier: "CORE-3", phase: "plan", extra: "ROUTING-BLOB" });
     expect(p).toContain("ROUTING-BLOB");
   });
+  it("embedded backend references the skill by name", () => {
+    const p = buildRolePrompt(ROLES.warden, { identifier: "CORE-5", phase: "review", backend: "embedded" });
+    expect(p).toContain("warden-security");
+    expect(p).toMatch(/Use the .* skill/);
+  });
+  it("codex backend does NOT tell it to use a skill or cli_ tool", () => {
+    const p = buildRolePrompt(ROLES.spine, { identifier: "CORE-6", phase: "implement", backend: "codex" });
+    expect(p).not.toMatch(/Use the `spine-backend` skill/);
+    expect(p).toMatch(/implement DIRECTLY/i);
+    expect(p).toMatch(/no.*cli_\* tools|do NOT have/i);
+  });
   it("forbids touching the Linear issue for every role/phase", () => {
     for (const role of Object.values(ROLES)) {
       for (const phase of ["plan", "implement", "review", "product"] as const) {

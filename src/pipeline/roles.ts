@@ -263,6 +263,13 @@ export interface RolePromptOpts {
   /** The phase the role is running in (may differ from role.kind for Apex). */
   phase: RoleKind;
   /**
+   * The execution backend. Determines how the skill is referenced: the embedded
+   * runner has OpenClaw's native skill system, but codex does NOT — so for codex
+   * we say the playbook is inlined and it implements directly (no skill/cli_*
+   * tools), instead of the misleading "use the `foo` skill".
+   */
+  backend?: RoleBackend;
+  /**
    * Extra instructions specific to this invocation (e.g. Apex's plan for the
    * implementer, or the reviewer's focus). Appended verbatim.
    */
@@ -278,9 +285,19 @@ export interface RolePromptOpts {
  * @returns the system-prompt fragment to pass as `extraSystemPrompt`
  */
 export function buildRolePrompt(role: RoleDef, opts: RolePromptOpts): string {
-  const lines: string[] = [
-    `You are ${role.label}, ${role.summary}`,
-    `Use the \`${role.skill}\` skill and follow it strictly.`,
+  const lines: string[] = [`You are ${role.label}, ${role.summary}`];
+  if (opts.backend === "codex") {
+    // codex has no OpenClaw skill system or cli_* tools — the skill body is
+    // inlined by the caller; it implements directly with file + shell access.
+    lines.push(
+      "Your specialist playbook is included below — follow it. You do NOT have " +
+        "an OpenClaw skill system or any cli_* tools; implement DIRECTLY by " +
+        "reading/editing files and running shell commands in the worktree.",
+    );
+  } else {
+    lines.push(`Use the \`${role.skill}\` skill and follow it strictly.`);
+  }
+  lines.push(
     `You are working on Linear issue ${opts.identifier}.`,
     // Hard guardrail: the pipeline owns all ticket-lifecycle changes. A role
     // must never move the ticket itself — the orchestrator advances it (per
@@ -288,7 +305,7 @@ export function buildRolePrompt(role: RoleDef, opts: RolePromptOpts): string {
     "Do NOT modify the Linear issue in any way — no status/state change, no " +
       "cycle change, no assignee, labels, estimate, or comments. The pipeline " +
       "advances the ticket automatically when your phase succeeds.",
-  ];
+  );
 
   if (opts.phase === "implement") {
     lines.push(

@@ -212,17 +212,24 @@ export function roleToolsDeny(role) {
  * @returns the system-prompt fragment to pass as `extraSystemPrompt`
  */
 export function buildRolePrompt(role, opts) {
-    const lines = [
-        `You are ${role.label}, ${role.summary}`,
-        `Use the \`${role.skill}\` skill and follow it strictly.`,
-        `You are working on Linear issue ${opts.identifier}.`,
-        // Hard guardrail: the pipeline owns all ticket-lifecycle changes. A role
-        // must never move the ticket itself — the orchestrator advances it (per
-        // config) ONLY when the phase succeeds.
-        "Do NOT modify the Linear issue in any way — no status/state change, no " +
-            "cycle change, no assignee, labels, estimate, or comments. The pipeline " +
-            "advances the ticket automatically when your phase succeeds.",
-    ];
+    const lines = [`You are ${role.label}, ${role.summary}`];
+    if (opts.backend === "codex") {
+        // codex has no OpenClaw skill system or cli_* tools — the skill body is
+        // inlined by the caller; it implements directly with file + shell access.
+        lines.push("Your specialist playbook is included below — follow it. You do NOT have " +
+            "an OpenClaw skill system or any cli_* tools; implement DIRECTLY by " +
+            "reading/editing files and running shell commands in the worktree.");
+    }
+    else {
+        lines.push(`Use the \`${role.skill}\` skill and follow it strictly.`);
+    }
+    lines.push(`You are working on Linear issue ${opts.identifier}.`, 
+    // Hard guardrail: the pipeline owns all ticket-lifecycle changes. A role
+    // must never move the ticket itself — the orchestrator advances it (per
+    // config) ONLY when the phase succeeds.
+    "Do NOT modify the Linear issue in any way — no status/state change, no " +
+        "cycle change, no assignee, labels, estimate, or comments. The pipeline " +
+        "advances the ticket automatically when your phase succeeds.");
     if (opts.phase === "implement") {
         lines.push("Implement ONLY the work assigned to you below, in the worktree provided.", "Read CLAUDE.md / AGENTS.md first, follow project conventions, run the tests,", "and commit your work with a clear message. Return a concise summary of what", "you changed and the test results. Do NOT touch the Linear issue.");
     }
