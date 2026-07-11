@@ -31,4 +31,15 @@ describe("parseGrillStep", () => {
     expect(parseGrillStep('{"question":""}')).toBeNull();
     expect(parseGrillStep('{"foo":"bar"}')).toBeNull();
   });
+
+  it("parses a question with discrete options", () => {
+    expect(parseGrillStep('{"question":"Which repo? (rec: ld-shopify)","options":["ld-shopify","tmv2"]}'))
+      .toEqual({ ready: false, question: "Which repo? (rec: ld-shopify)", options: ["ld-shopify", "tmv2"] });
+  });
+
+  it("omits options when the array is absent or has no usable entries", () => {
+    expect(parseGrillStep('{"question":"open?"}')).toEqual({ ready: false, question: "open?" });
+    expect(parseGrillStep('{"question":"open?","options":[" ",3,null]}'))
+      .toEqual({ ready: false, question: "open?" });
+  });
 });

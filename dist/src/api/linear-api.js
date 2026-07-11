@@ -160,12 +160,39 @@ export class LinearAgentApi {
         }
         return payload.data;
     }
-    async emitActivity(agentSessionId, content) {
-        await this.gql(`mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
+    /**
+     * Emit an agent activity into a session. Optionally attach a Linear signal
+     * (e.g. `select`) with metadata so an elicitation renders clickable options.
+     * If the server rejects the signal fields (Agent APIs are a Developer Preview
+     * and may drift), retries once with content only so the prompt still reaches
+     * the user as free text.
+     * @param agentSessionId - the target agent session id
+     * @param content - the activity content (thought/action/response/elicitation/error)
+     * @param opts - optional signal + signalMetadata (siblings of content in the API)
+     */
+    async emitActivity(agentSessionId, content, opts) {
+        const mutation = `mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
         agentActivityCreate(input: $input) {
           success
         }
-      }`, { input: { agentSessionId, content } });
+      }`;
+        const input = { agentSessionId, content };
+        if (opts?.signal)
+            input.signal = opts.signal;
+        if (opts?.signalMetadata)
+            input.signalMetadata = opts.signalMetadata;
+        if (input.signal || input.signalMetadata) {
+            try {
+                await this.gql(mutation, { input });
+                return;
+            }
+            catch {
+                // Signal fields fell over — retry with a plain activity below.
+            }
+            await this.gql(mutation, { input: { agentSessionId, content } });
+            return;
+        }
+        await this.gql(mutation, { input });
     }
     async updateSession(agentSessionId, input) {
         await this.gql(`mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {

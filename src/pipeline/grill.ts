@@ -16,6 +16,12 @@ export interface GrillStep {
   ready: boolean;
   /** The next question (when not ready). Includes a recommended answer. */
   question?: string;
+  /**
+   * Discrete answer choices for the current question, rendered as clickable
+   * options (a `select` signal). Present only for closed questions (which repo,
+   * yes/no, an enumeration); omitted for open-ended ones.
+   */
+  options?: string[];
   /** Chosen repo name(s) when ready (keys in the `repos` config). */
   repos?: string[];
   /** Implementation brief capturing the decisions (injected into the worker). */
@@ -37,10 +43,15 @@ function grillSystemPrompt(repoNames: string[]): string {
     "  " + repoNames.join(", "),
     "- Then clarify scope, acceptance criteria, and edge cases that materially change the build.",
     "- Skip anything the issue text already answers. Stop once the plan is clear (usually 2-5 questions).",
+    "- When a question has a DISCRETE set of answers (which repo, yes/no, or an enumerated",
+    "  choice), ALSO return an `options` array of the allowed answer strings so the user can",
+    "  tap one instead of typing. For the repo question, the options ARE the repo names above.",
+    "  Omit `options` entirely for open-ended questions.",
     "",
     "Respond with ONLY a single JSON object, no prose:",
-    '  to ask:      {"question":"<question incl. your recommended answer>"}',
-    '  when ready:  {"ready":true,"repos":["<repo name>"],"guidance":"<concise implementation brief: target repo(s)/paths, decisions, acceptance criteria>"}',
+    '  to ask (open):    {"question":"<question incl. your recommended answer>"}',
+    '  to ask (choices): {"question":"<question incl. your recommended answer>","options":["<choice>","<choice>"]}',
+    '  when ready:       {"ready":true,"repos":["<repo name>"],"guidance":"<concise implementation brief: target repo(s)/paths, decisions, acceptance criteria>"}',
   ].join("\n");
 }
 
@@ -107,7 +118,16 @@ export function parseGrillStep(raw: string): GrillStep | null {
       };
     }
     if (typeof o.question === "string" && o.question.trim()) {
-      return { ready: false, question: o.question };
+      const options = Array.isArray(o.options)
+        ? o.options
+            .filter((x: unknown): x is string => typeof x === "string" && x.trim().length > 0)
+            .map((x: string) => x.trim())
+        : undefined;
+      return {
+        ready: false,
+        question: o.question,
+        ...(options && options.length ? { options } : {}),
+      };
     }
     return null;
   } catch {

@@ -18,6 +18,18 @@ export type ActivityContent =
   | { type: "elicitation"; body: string }
   | { type: "error"; body: string };
 
+/**
+ * Optional Linear agent "signal" attached to an activity. Siblings of `content`
+ * in AgentActivityCreateInput. A `select` signal renders the elicitation body
+ * with clickable options; the chosen option's `value` comes back as a regular
+ * `prompt` activity (the same webhook path a typed reply uses).
+ * See https://linear.app/developers/agent-signals
+ */
+export interface ActivityEmitOptions {
+  signal?: "select" | "stop" | "auth";
+  signalMetadata?: { options?: Array<{ label?: string; value: string }> };
+}
+
 export interface ExternalUrl {
   label: string;
   url: string;
@@ -215,15 +227,41 @@ export class LinearAgentApi {
     return payload.data as T;
   }
 
-  async emitActivity(agentSessionId: string, content: ActivityContent): Promise<void> {
-    await this.gql(
-      `mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
+  /**
+   * Emit an agent activity into a session. Optionally attach a Linear signal
+   * (e.g. `select`) with metadata so an elicitation renders clickable options.
+   * If the server rejects the signal fields (Agent APIs are a Developer Preview
+   * and may drift), retries once with content only so the prompt still reaches
+   * the user as free text.
+   * @param agentSessionId - the target agent session id
+   * @param content - the activity content (thought/action/response/elicitation/error)
+   * @param opts - optional signal + signalMetadata (siblings of content in the API)
+   */
+  async emitActivity(
+    agentSessionId: string,
+    content: ActivityContent,
+    opts?: ActivityEmitOptions,
+  ): Promise<void> {
+    const mutation = `mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
         agentActivityCreate(input: $input) {
           success
         }
-      }`,
-      { input: { agentSessionId, content } },
-    );
+      }`;
+    const input: Record<string, unknown> = { agentSessionId, content };
+    if (opts?.signal) input.signal = opts.signal;
+    if (opts?.signalMetadata) input.signalMetadata = opts.signalMetadata;
+
+    if (input.signal || input.signalMetadata) {
+      try {
+        await this.gql(mutation, { input });
+        return;
+      } catch {
+        // Signal fields fell over — retry with a plain activity below.
+      }
+      await this.gql(mutation, { input: { agentSessionId, content } });
+      return;
+    }
+    await this.gql(mutation, { input });
   }
 
   async updateSession(

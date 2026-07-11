@@ -10,7 +10,8 @@ import { createManagedFlowForDispatch } from "./taskflow-bridge.js";
 import { createNotifierFromConfig, type NotifyFn } from "../infra/notify.js";
 import { assessTier } from "./tier-assess.js";
 import { createWorktree, createMultiWorktree, prepareWorkspace } from "../infra/codex-worktree.js";
-import { resolveRepos, isMultiRepo, getRepoEntries, resolveReposByNames, type RepoResolution } from "../infra/multi-repo.js";
+import { resolveRepos, isMultiRepo, getRepoEntries, resolveReposByNames, buildCandidateRepositories, type RepoResolution } from "../infra/multi-repo.js";
+import { repoSelectSignal, optionsSignal, RESUME_SELECT } from "./select-signal.js";
 import {
   savePendingRepoSelection,
   getPendingRepoSelection,
@@ -792,7 +793,7 @@ export async function handleLinearWebhook(
         const decision = parseResumeDecision(reply);
         const rApi = createLinearApi(api);
         if (!decision) {
-          if (rApi) await rApi.emitActivity(session.id, { type: "elicitation", body: 'Reply **resume** to continue the prior work, or **fresh** to start over.' }).catch(() => {});
+          if (rApi) await rApi.emitActivity(session.id, { type: "elicitation", body: 'Reply **resume** to continue the prior work, or **fresh** to start over.' }, RESUME_SELECT).catch(() => {});
           return true;
         }
         clearResume(issue.id);
@@ -908,7 +909,7 @@ export async function handleLinearWebhook(
         await linearApi.emitActivity(session.id, {
           type: "elicitation",
           body: `I didn't recognize that selection. Reply with the repo number(s) or name(s), or "all":\n\n${listText}`,
-        }).catch(() => {});
+        }, repoSelectSignal(pendingRepoSel.candidates)).catch(() => {});
         return true;
       }
       clearPendingRepoSelection(issue.id);
@@ -2320,7 +2321,7 @@ async function handleDispatch(
         try { const sr = await linearApi.createSessionOnIssue(issue.id); rsid = sr.sessionId ?? undefined; } catch { /* best effort */ }
       }
       const ask = `I found prior work on **${identifier}** (${prior.sessionCount} previous session(s)).\n\n${prior.summary}\n\nReply **resume** to continue from the prior plan, or **fresh** to start over.`;
-      if (rsid) await linearApi.emitActivity(rsid, { type: "elicitation", body: ask }).catch(() => {});
+      if (rsid) await linearApi.emitActivity(rsid, { type: "elicitation", body: ask }, RESUME_SELECT).catch(() => {});
       saveResume({
         issueId: issue.id,
         issueIdentifier: identifier,
@@ -2354,7 +2355,7 @@ async function handleDispatch(
       if (!gsid) {
         try { const sr = await linearApi.createSessionOnIssue(issue.id); gsid = sr.sessionId ?? undefined; } catch { /* best effort */ }
       }
-      if (gsid) await linearApi.emitActivity(gsid, { type: "elicitation", body: step.question }).catch(() => {});
+      if (gsid) await linearApi.emitActivity(gsid, { type: "elicitation", body: step.question }, optionsSignal(step.options ?? [])).catch(() => {});
       saveGrill({
         issueId: issue.id,
         issueIdentifier: identifier,
@@ -2385,7 +2386,7 @@ async function handleDispatch(
     // Interactive repo selection: if enabled and the repo is ambiguous, ask the
     // user which repo(s) to use and park the dispatch until they reply.
     if (shouldAskRepoSelection(repoResolution, pluginConfig)) {
-      const candidates = Object.keys(getRepoEntries(pluginConfig));
+      let candidates = Object.keys(getRepoEntries(pluginConfig));
       let selectionSessionId = opts?.existingSessionId;
       if (!selectionSessionId) {
         try {
@@ -2395,10 +2396,40 @@ async function handleDispatch(
           api.logger.warn(`@dispatch: could not create session for repo selection: ${err}`);
         }
       }
-      const listText = candidates.map((c, i) => `${i + 1}. ${c}`).join("\n");
-      const promptBody = `Which repository should I work on for **${identifier}**? Reply with the number(s) or name(s) (comma-separated), or "all".\n\n${listText}`;
+      // Rank candidates by Linear's ML repository suggestions (best-effort): repos
+      // with a configured GitHub identity get ordered most-relevant-first and the
+      // top pick is flagged as recommended. Degrades to config order when no repos
+      // have `github` set or the API is unavailable. We still ASK — this only
+      // sharpens the options, it never auto-selects.
+      let recommended: string | undefined;
+      try {
+        const candRepos = buildCandidateRepositories(pluginConfig);
+        if (selectionSessionId && candRepos.length) {
+          const suggestions = await linearApi.getRepositorySuggestions(issue.id, selectionSessionId, candRepos);
+          if (suggestions.length) {
+            const nameByGithub = new Map<string, string>();
+            for (const [name, e] of Object.entries(getRepoEntries(pluginConfig))) {
+              if (e.github) nameByGithub.set(e.github, name);
+            }
+            const ranked = suggestions
+              .map((s) => nameByGithub.get(s.repositoryFullName))
+              .filter((n): n is string => typeof n === "string" && candidates.includes(n));
+            if (ranked.length) {
+              recommended = ranked[0];
+              candidates = [...ranked, ...candidates.filter((c) => !ranked.includes(c))];
+              api.logger.info(`@dispatch: ${identifier} repo suggestions → recommended=${recommended}`);
+            }
+          }
+        }
+      } catch (err) {
+        api.logger.warn(`@dispatch: ${identifier} repo suggestions failed: ${err}`);
+      }
+      const listText = candidates
+        .map((c, i) => `${i + 1}. ${c}${c === recommended ? " _(recommended)_" : ""}`)
+        .join("\n");
+      const promptBody = `Which repository should I work on for **${identifier}**? Tap an option below, or reply with the number(s)/name(s) (comma-separated), or "all".\n\n${listText}`;
       if (selectionSessionId) {
-        await linearApi.emitActivity(selectionSessionId, { type: "elicitation", body: promptBody }).catch(() => {});
+        await linearApi.emitActivity(selectionSessionId, { type: "elicitation", body: promptBody }, repoSelectSignal(candidates)).catch(() => {});
       } else {
         await createCommentWithDedup(linearApi, issue.id, promptBody).catch(() => {});
       }

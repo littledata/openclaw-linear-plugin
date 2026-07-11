@@ -21,10 +21,15 @@ function grillSystemPrompt(repoNames) {
         "  " + repoNames.join(", "),
         "- Then clarify scope, acceptance criteria, and edge cases that materially change the build.",
         "- Skip anything the issue text already answers. Stop once the plan is clear (usually 2-5 questions).",
+        "- When a question has a DISCRETE set of answers (which repo, yes/no, or an enumerated",
+        "  choice), ALSO return an `options` array of the allowed answer strings so the user can",
+        "  tap one instead of typing. For the repo question, the options ARE the repo names above.",
+        "  Omit `options` entirely for open-ended questions.",
         "",
         "Respond with ONLY a single JSON object, no prose:",
-        '  to ask:      {"question":"<question incl. your recommended answer>"}',
-        '  when ready:  {"ready":true,"repos":["<repo name>"],"guidance":"<concise implementation brief: target repo(s)/paths, decisions, acceptance criteria>"}',
+        '  to ask (open):    {"question":"<question incl. your recommended answer>"}',
+        '  to ask (choices): {"question":"<question incl. your recommended answer>","options":["<choice>","<choice>"]}',
+        '  when ready:       {"ready":true,"repos":["<repo name>"],"guidance":"<concise implementation brief: target repo(s)/paths, decisions, acceptance criteria>"}',
     ].join("\n");
 }
 /**
@@ -85,7 +90,16 @@ export function parseGrillStep(raw) {
             };
         }
         if (typeof o.question === "string" && o.question.trim()) {
-            return { ready: false, question: o.question };
+            const options = Array.isArray(o.options)
+                ? o.options
+                    .filter((x) => typeof x === "string" && x.trim().length > 0)
+                    .map((x) => x.trim())
+                : undefined;
+            return {
+                ready: false,
+                question: o.question,
+                ...(options && options.length ? { options } : {}),
+            };
         }
         return null;
     }
