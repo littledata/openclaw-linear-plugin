@@ -69,6 +69,13 @@ function shouldBlockWorkRequest(
 
 // Track issues with active agent runs to prevent concurrent duplicate runs.
 const activeRuns = new Set<string>();
+/**
+ * issue id → the Linear AgentSession id that Linear auto-created when the agent
+ * was delegated the issue. The dispatch reuses it (instead of creating its own)
+ * so the whole pipeline runs in ONE Linear session. Populated by the
+ * AgentSessionEvent.created handler when it defers to an in-flight dispatch.
+ */
+const linearSessionByIssue = new Map<string, string>();
 
 // Dedup: track recently processed keys to avoid double-handling.
 // Periodic sweep instead of O(n) scan on every call.
@@ -369,7 +376,11 @@ export async function handleLinearWebhook(
     // createSessionOnIssue(). Checking this first prevents the race condition
     // where the webhook arrives before wasRecentlyProcessed is registered.
     if (activeRuns.has(issue.id)) {
-      api.logger.info(`Agent already running for ${issue?.identifier ?? issue?.id} — skipping session ${session.id}`);
+      // A dispatch is already handling this issue. Capture the session Linear
+      // just created so the dispatch emits into it (one unified session) rather
+      // than creating its own, and skip the parallel conversational run.
+      linearSessionByIssue.set(issue.id, session.id);
+      api.logger.info(`Agent already running for ${issue?.identifier ?? issue?.id} — reusing session ${session.id} for the dispatch`);
       return true;
     }
 
@@ -590,6 +601,15 @@ export async function handleLinearWebhook(
       ``,
       `Respond within the scope defined above. Be concise and action-oriented.`,
     ].filter(Boolean).join("\n");
+
+    // Re-check: the Issue.update dispatch may have claimed this issue during the
+    // (multi-second) intent classification above. If so, reuse THIS session for
+    // the dispatch and skip the conversational run — avoids a duplicate session.
+    if (activeRuns.has(issue.id)) {
+      linearSessionByIssue.set(issue.id, session.id);
+      api.logger.info(`AgentSession ${session.id}: dispatch active for ${issue.identifier ?? issue.id} — reusing this session, skipping conversational run`);
+      return true;
+    }
 
     // Run agent directly (non-blocking)
     activeRuns.add(issue.id);
@@ -2162,6 +2182,11 @@ async function handleDispatch(
     api.logger.info(`@dispatch: ${identifier} has active agent run — skipping`);
     return;
   }
+  // Claim the issue NOW (not at step 6). Linear fires AgentSessionEvent.created
+  // on delegation, racing this dispatch; claiming here blocks that handler from
+  // spawning a second, conversational agent during the multi-second assessment.
+  // Cleaned up on any early-return failure path below.
+  activeRuns.add(issue.id);
 
   // 3. Fetch full issue details for tier assessment
   let enrichedIssue: any;
@@ -2213,6 +2238,7 @@ async function handleDispatch(
         createdAt: new Date().toISOString(),
       });
       api.logger.info(`@dispatch: ${identifier} awaiting repo selection (${candidates.length} candidates)`);
+      activeRuns.delete(issue.id); // release the claim while parked for the user's reply
       return;
     }
   }
@@ -2261,6 +2287,7 @@ async function handleDispatch(
     }
   } catch (err) {
     api.logger.error(`@dispatch: worktree creation failed: ${err}`);
+    activeRuns.delete(issue.id); // release the early claim on failure
     await createCommentWithDedup(linearApi,
       issue.id,
       `**Dispatch failed** — couldn't create the worktree.\n\n> ${String(err).slice(0, 200)}\n\n**What to try:**\n- Check that the base repo exists\n- Re-assign this issue to try again\n- Check logs: \`journalctl --user -u openclaw-gateway --since "5 min ago"\``,
@@ -2285,11 +2312,11 @@ async function handleDispatch(
     }
   }
 
-  // 6. Create agent session on Linear
-  // Mark active BEFORE session creation so that any AgentSessionEvent.created
-  // webhook arriving from this call is blocked by the activeRuns guard.
+  // 6. Reuse the Linear session — an explicit opt, or the one Linear auto-created
+  // on delegation that the created-handler captured — so the whole pipeline runs
+  // in ONE session. Only create a fresh session as a last resort.
   activeRuns.add(issue.id);
-  let agentSessionId: string | undefined = opts?.existingSessionId;
+  let agentSessionId: string | undefined = opts?.existingSessionId ?? linearSessionByIssue.get(issue.id);
   if (!agentSessionId) {
     try {
       const sessionResult = await linearApi.createSessionOnIssue(issue.id);
@@ -2298,6 +2325,7 @@ async function handleDispatch(
       api.logger.warn(`@dispatch: could not create agent session: ${err}`);
     }
   }
+  linearSessionByIssue.delete(issue.id);
 
   // 6b. Initialize .claw/ artifact directory
   try {

@@ -705,9 +705,9 @@ describe("dedup test helpers", () => {
     });
 
     expect(result.status).toBe(200);
-    // Should log that it skipped due to active run
+    // Should log that it is reusing the session for the in-flight dispatch
     const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
-    expect(infoCalls.some((msg: string) => msg.includes("skipping session"))).toBe(true);
+    expect(infoCalls.some((msg: string) => msg.includes("reusing session"))).toBe(true);
   });
 
   it("_markAsProcessedForTesting causes dedup to trigger on session", async () => {
@@ -1889,7 +1889,10 @@ describe("Issue.update dispatch flow", () => {
     });
     expect(result2.status).toBe(200);
     const infoCalls = (result2.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
-    expect(infoCalls.some((msg: string) => msg.includes("already processed"))).toBe(true);
+    // Duplicate is blocked either by the content dedup ("already processed") or,
+    // when the first dispatch has already claimed the issue, by the early
+    // activeRuns guard ("active run — skipping"). Both prevent a second dispatch.
+    expect(infoCalls.some((msg: string) => msg.includes("already processed") || msg.includes("active run"))).toBe(true);
   });
 });
 

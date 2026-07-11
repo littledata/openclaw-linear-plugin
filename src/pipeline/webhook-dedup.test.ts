@@ -281,9 +281,10 @@ describe("webhook deduplication", () => {
     await postWebhook(api2, payload);
 
     const secondLogs = infoLogs(api2);
-    // Should be skipped — either "already processed" or "no assignment change" on repeat
+    // Should be skipped — content dedup ("already processed"/"no assignment"/"not us")
+    // or the early activeRuns guard ("active run") once the first dispatch claims it.
     const skipped = secondLogs.some(
-      (l) => l.includes("already processed") || l.includes("no assignment") || l.includes("not us"),
+      (l) => l.includes("already processed") || l.includes("no assignment") || l.includes("not us") || l.includes("active run"),
     );
     expect(skipped).toBe(true);
   });
