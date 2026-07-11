@@ -22,6 +22,7 @@
 import { runAgent } from "../agent/agent.js";
 import { runCodex } from "../tools/codex-tool.js";
 import { createPullRequest, getWorktreeStatus } from "../infra/codex-worktree.js";
+import { readManifest, writeManifest, updateManifest, savePlan, saveWorkerOutput, appendLog } from "./artifacts.js";
 import type { ActiveDispatch } from "./dispatch-state.js";
 import type { HookContext } from "./pipeline.js";
 import type { ActivityContent } from "../api/linear-api.js";
@@ -62,6 +63,34 @@ interface RoleRunResult {
 function maxRework(pluginConfig?: Record<string, unknown>): number {
   const v = pluginConfig?.maxReworkAttempts;
   return typeof v === "number" && v >= 0 ? v : 2;
+}
+
+/**
+ * Ensure a `.claw/manifest.json` exists so updateManifest / buildSummaryFromArtifacts
+ * work and a future session can read this run's status. Best-effort.
+ */
+function ensureManifest(dispatch: ActiveDispatch): void {
+  try {
+    if (readManifest(dispatch.worktreePath)) return;
+    writeManifest(dispatch.worktreePath, {
+      issueIdentifier: dispatch.issueIdentifier,
+      issueTitle: dispatch.issueTitle ?? dispatch.issueIdentifier,
+      issueId: dispatch.issueId,
+      tier: dispatch.tier,
+      model: dispatch.model,
+      dispatchedAt: dispatch.dispatchedAt,
+      worktreePath: dispatch.worktreePath,
+      branch: dispatch.branch,
+      attempts: dispatch.attempt,
+      status: "orchestrating",
+      plugin: "openclaw-linear",
+    });
+  } catch { /* best effort */ }
+}
+
+/** Update the manifest status (best-effort). */
+function setStatus(dispatch: ActiveDispatch, status: string): void {
+  try { updateManifest(dispatch.worktreePath, { status }); } catch { /* best effort */ }
 }
 
 /** Stream an activity line to the ticket's Linear agent session (best-effort). */
@@ -229,13 +258,12 @@ async function runApexPlan(
   const { output } = await runRole(ctx, dispatch, ROLES.apex, "plan", extra, issue);
   const assignments = parseAssignments(output, issue);
 
-  await comment(
-    ctx,
-    dispatch,
-    `## 🧭 Apex plan\n\n${assignments
-      .map((a) => `- **${ROLES[a.role]?.label ?? a.role}** — ${a.task}`)
-      .join("\n")}`,
-  );
+  const planText = assignments
+    .map((a) => `- **${ROLES[a.role]?.label ?? a.role}** — ${a.task}`)
+    .join("\n");
+  await comment(ctx, dispatch, `## 🧭 Apex plan\n\n${planText}`);
+  // Persist the plan so a future session can read it back on resume.
+  try { savePlan(dispatch.worktreePath, `# Plan for ${dispatch.issueIdentifier}\n\n${planText}`); } catch { /* best effort */ }
   return assignments;
 }
 
@@ -253,17 +281,24 @@ async function runImplementPhase(
   let lastReason = "";
 
   for (let attempt = 0; attempt <= limit; attempt++) {
+    setStatus(dispatch, attempt === 0 ? "implementing" : `reworking (attempt ${attempt + 1})`);
     // Implementers run sequentially — they share one worktree.
+    const attemptOutputs: string[] = [];
     for (const a of assignments) {
       const role = resolveRole(a.role) ?? ROLES.spine;
       const { success, output } = await runRole(ctx, dispatch, role, "implement", a.task, issue);
+      attemptOutputs.push(`## ${role.label}\n${output}`);
       if (!success) {
         lastReason = `${role.label} implementation failed: ${output.slice(-300)}`;
         // Keep going to self-review — codex may have partially applied changes.
       }
     }
+    // Persist this attempt's implementer output for future-session recall.
+    try { saveWorkerOutput(dispatch.worktreePath, attempt, attemptOutputs.join("\n\n")); } catch { /* best effort */ }
+    try { appendLog(dispatch.worktreePath, { ts: new Date().toISOString(), phase: "worker", attempt, agent: assignments.map((a) => a.role).join("+"), prompt: "", outputPreview: attemptOutputs.join("\n\n").slice(0, 500), success: !lastReason, durationMs: 0 }); } catch { /* best effort */ }
 
     // Apex self-review — read-only, gates the phase.
+    setStatus(dispatch, "reviewing");
     const review = await runRole(
       ctx,
       dispatch,
@@ -438,6 +473,8 @@ export async function runStatePlan(
     teamId: details?.team?.id,
   };
 
+  ensureManifest(dispatch);
+  setStatus(dispatch, "orchestrating");
   emit(ctx, dispatch, {
     type: "thought",
     body: `Orchestrating "${plan.stateLabel}" — ${plan.phases.length} phase(s)`,
@@ -464,6 +501,7 @@ export async function runStatePlan(
           attempt: dispatch.attempt,
           reason: result.reason,
         }).catch(() => {});
+        setStatus(dispatch, `blocked: ${label}`);
         // Terminal activity — ends the Linear agent turn (otherwise it hangs "active").
         endSession(ctx, dispatch, "response", `⛔ Blocked at ${label}: ${reason}\n\nThe ticket was left in its current state. Reply with guidance to retry.`);
         return;
@@ -471,6 +509,7 @@ export async function runStatePlan(
     }
 
     await transitionOnSuccess(ctx, dispatch, plan, issue);
+    setStatus(dispatch, "done");
     await ctx.notify("audit_pass", {
       identifier: dispatch.issueIdentifier,
       title: issue.title,
@@ -480,6 +519,7 @@ export async function runStatePlan(
     endSession(ctx, dispatch, "response", `✅ Completed "${plan.stateLabel}" — all phases passed.`);
   } catch (err) {
     ctx.api.logger.error(`[orchestrator] ${issue.identifier} unexpected error: ${err}`);
+    setStatus(dispatch, "error");
     endSession(ctx, dispatch, "error", `The pipeline hit an unexpected error: ${String(err).slice(0, 400)}`);
   }
 }

@@ -121,6 +121,34 @@ export function createWorktree(issueIdentifier, opts) {
     return { path: worktreePath, branch, resumed: false };
 }
 /**
+ * Wipe an issue's workspace for a "start fresh" resume decision: remove the
+ * worktree directory and (best-effort) delete the dispatch branch from every
+ * candidate repo so the next dispatch starts from a clean HEAD. Never throws.
+ * @param issueIdentifier - the Linear issue identifier (worktree dir key)
+ * @param opts - baseDir (worktree root), branch (to delete), repos (repo paths to prune/branch-delete)
+ */
+export function wipeIssueWorkspace(issueIdentifier, opts) {
+    const baseDir = resolveBaseDir(opts?.baseDir);
+    const issueDir = path.join(baseDir, issueIdentifier);
+    try {
+        if (existsSync(issueDir))
+            rmSync(issueDir, { recursive: true, force: true });
+    }
+    catch { /* best effort */ }
+    for (const repo of opts?.repos ?? []) {
+        try {
+            git(["worktree", "prune"], repo);
+        }
+        catch { /* best effort */ }
+        if (opts?.branch) {
+            try {
+                git(["branch", "-D", opts.branch], repo);
+            }
+            catch { /* branch may not exist here */ }
+        }
+    }
+}
+/**
  * Create worktrees for multiple repos.
  *
  * Layout: {baseDir}/{issueIdentifier}/{repoName}/

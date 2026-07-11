@@ -528,6 +528,84 @@ export class LinearAgentApi {
     return data.project.issues.nodes as any;
   }
 
+  /**
+   * List prior agent sessions on an issue, newest first, with their per-session
+   * plan/summary, PR links, and full activity feed. Used by the resume gate so a
+   * new session can read everything previous runs did. Best-effort — returns []
+   * if the query fails (schema drift / permissions).
+   * @param issueId - the Linear issue id
+   * @param opts - optional { activityLimit } cap on activities per session (default 60)
+   * @returns prior sessions, newest first
+   */
+  async listAgentSessions(
+    issueId: string,
+    opts?: { activityLimit?: number },
+  ): Promise<Array<{
+    id: string;
+    createdAt: string;
+    status: string | null;
+    summary: string | null;
+    plan: string | null;
+    url: string | null;
+    pullRequests: Array<{ url: string; title?: string | null }>;
+    activities: Array<{ createdAt: string; content: unknown; signal: string | null }>;
+  }>> {
+    const activityLimit = opts?.activityLimit ?? 60;
+    try {
+      const data = await this.gql<{
+        issue: {
+          agentSessions: {
+            nodes: Array<{
+              id: string;
+              createdAt: string;
+              status: string | null;
+              summary: string | null;
+              plan: string | null;
+              url: string | null;
+              pullRequests?: { nodes: Array<{ url: string; title?: string | null }> };
+              activities: { nodes: Array<{ createdAt: string; content: unknown; signal: string | null }> };
+            }>;
+          };
+        };
+      }>(
+        `query IssueAgentSessions($id: String!, $activityLimit: Int!) {
+          issue(id: $id) {
+            agentSessions {
+              nodes {
+                id
+                createdAt
+                status
+                summary
+                plan
+                url
+                pullRequests { nodes { url title } }
+                activities(first: $activityLimit) {
+                  nodes { createdAt content signal }
+                }
+              }
+            }
+          }
+        }`,
+        { id: issueId, activityLimit },
+      );
+      const nodes = data.issue?.agentSessions?.nodes ?? [];
+      return nodes
+        .map((s) => ({
+          id: s.id,
+          createdAt: s.createdAt,
+          status: s.status ?? null,
+          summary: s.summary ?? null,
+          plan: s.plan ?? null,
+          url: s.url ?? null,
+          pullRequests: s.pullRequests?.nodes ?? [],
+          activities: s.activities?.nodes ?? [],
+        }))
+        .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)); // newest first
+    } catch (err) {
+      return [];
+    }
+  }
+
   async getTeamStates(teamId: string): Promise<Array<{
     id: string;
     name: string;

@@ -20,6 +20,9 @@ import {
 import { getGrill, saveGrill, clearGrill } from "./grill-state.js";
 import { runStatePlan } from "./orchestrator.js";
 import { resolveStatePlan, orchestrationMode } from "./state-plan.js";
+import { gatherPriorWork, analyzeResume } from "./prior-work.js";
+import { getResume, saveResume, clearResume, parseResumeDecision } from "./resume-state.js";
+import { wipeIssueWorkspace } from "../infra/codex-worktree.js";
 import { runGrillStep } from "./grill.js";
 import { ensureClawDir, writeManifest, writeDispatchMemory, resolveOrchestratorWorkspace } from "./artifacts.js";
 import { readPlanningState, isInPlanningMode, getPlanningSession, endPlanningSession } from "./planning-state.js";
@@ -729,6 +732,7 @@ export async function handleLinearWebhook(
       } catch { /* best effort */ }
       clearPendingRepoSelection(issue.id);
       clearGrill(issue.id);
+      clearResume(issue.id);
       const stopApi = createLinearApi(api);
       if (stopApi) {
         await stopApi.emitActivity(session.id, {
@@ -774,6 +778,72 @@ export async function handleLinearWebhook(
           void handleDispatch(api, grillApi, issue, { existingSessionId: grillPending.agentSessionId ?? session.id })
             .catch((err) => api.logger.error(`grill resume failed: ${err}`));
         }
+        return true;
+      }
+    }
+
+    // ── Resume-or-fresh: the user answered the resume gate ──
+    // Runs BEFORE the activeRuns "ignore feedback" gate — the gate holds
+    // activeRuns while parked, same as /grill-me.
+    const resumePending = getResume(issue.id);
+    if (resumePending) {
+      const reply = typeof activityBody === "string" ? activityBody.trim() : "";
+      if (reply) {
+        const decision = parseResumeDecision(reply);
+        const rApi = createLinearApi(api);
+        if (!decision) {
+          if (rApi) await rApi.emitActivity(session.id, { type: "elicitation", body: 'Reply **resume** to continue the prior work, or **fresh** to start over.' }).catch(() => {});
+          return true;
+        }
+        clearResume(issue.id);
+        activeRuns.delete(issue.id); // release the gate claim so the resume re-claims
+        if (!rApi) return true;
+
+        if (decision === "fresh") {
+          api.logger.info(`AgentSession prompted: ${issue.identifier ?? issue.id} resume-gate → FRESH`);
+          await rApi.emitActivity(session.id, { type: "thought", body: "Starting fresh — clearing the prior worktree and re-planning." }).catch(() => {});
+          try {
+            const branch = resolveBranchName(issue.identifier ?? issue.id, issue.title, pluginConfig);
+            const repoPaths = Object.values((pluginConfig?.repos as Record<string, any>) ?? {})
+              .map((v) => (typeof v === "string" ? v : v?.path))
+              .filter((p): p is string => typeof p === "string");
+            wipeIssueWorkspace(issue.identifier ?? issue.id, {
+              baseDir: pluginConfig?.worktreeBaseDir as string | undefined,
+              branch,
+              repos: repoPaths,
+            });
+          } catch (err) {
+            api.logger.warn(`resume-fresh wipe failed: ${err}`);
+          }
+          void handleDispatch(api, rApi, issue, {
+            existingSessionId: resumePending.agentSessionId ?? session.id,
+            resumeResolved: true,
+          }).catch((err) => api.logger.error(`resume-fresh dispatch failed: ${err}`));
+          return true;
+        }
+
+        // decision === "resume": re-derive the correct repo(s) + a continuation
+        // brief from the prior context, then dispatch straight into the pipeline.
+        api.logger.info(`AgentSession prompted: ${issue.identifier ?? issue.id} resume-gate → RESUME`);
+        await rApi.emitActivity(session.id, { type: "thought", body: "Resuming — reviewing prior work to confirm the right repo and continue the plan." }).catch(() => {});
+        const repoNames = Object.keys(getRepoEntries(pluginConfig));
+        const analysis = await analyzeResume(
+          api,
+          { identifier: issue.identifier ?? issue.id, title: issue.title ?? issue.identifier ?? issue.id, description: issue.description },
+          repoNames,
+          resumePending.fullContext,
+          resolveAgentId(api),
+        );
+        if (analysis.repos.length) {
+          await rApi.emitActivity(session.id, { type: "thought", body: `Resuming in: ${analysis.repos.join(", ")}` }).catch(() => {});
+        }
+        void handleDispatch(api, rApi, issue, {
+          existingSessionId: resumePending.agentSessionId ?? session.id,
+          resumeResolved: true,
+          grillDone: true, // skip grill — we have the repo + continuation brief
+          repoOverride: analysis.repos.length ? analysis.repos : undefined,
+          grillGuidance: analysis.brief || undefined,
+        }).catch((err) => api.logger.error(`resume dispatch failed: ${err}`));
         return true;
       }
     }
@@ -2150,7 +2220,7 @@ async function handleDispatch(
   api: OpenClawPluginApi,
   linearApi: LinearAgentApi,
   issue: any,
-  opts?: { repoOverride?: string[]; existingSessionId?: string; grillGuidance?: string; grillDone?: boolean },
+  opts?: { repoOverride?: string[]; existingSessionId?: string; grillGuidance?: string; grillDone?: boolean; resumeResolved?: boolean },
 ): Promise<void> {
   const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
   const statePath = pluginConfig?.dispatchStatePath as string | undefined;
@@ -2235,6 +2305,33 @@ async function handleDispatch(
   // Repo/guidance the grill interview (or an explicit override) may supply.
   let repoOverride = opts?.repoOverride;
   let grillGuidance = opts?.grillGuidance;
+
+  // ── Resume-or-fresh gate ──────────────────────────────────────────────
+  // If this issue already has prior agent work (previous sessions/comments),
+  // recap it and ask the user to RESUME (continue the prior plan) or start
+  // FRESH — BEFORE grilling or building a worktree. Runs only in stateplan mode
+  // and only once per dispatch chain (opts.resumeResolved guards re-entry).
+  if (orchestrationMode(pluginConfig) === "stateplan" && !opts?.resumeResolved && !opts?.grillDone && !getResume(issue.id)) {
+    const excludeSessionId = opts?.existingSessionId ?? linearSessionByIssue.get(issue.id);
+    const prior = await gatherPriorWork(linearApi, issue.id, { excludeSessionId });
+    if (prior.hasPriorWork) {
+      let rsid = excludeSessionId;
+      if (!rsid) {
+        try { const sr = await linearApi.createSessionOnIssue(issue.id); rsid = sr.sessionId ?? undefined; } catch { /* best effort */ }
+      }
+      const ask = `I found prior work on **${identifier}** (${prior.sessionCount} previous session(s)).\n\n${prior.summary}\n\nReply **resume** to continue from the prior plan, or **fresh** to start over.`;
+      if (rsid) await linearApi.emitActivity(rsid, { type: "elicitation", body: ask }).catch(() => {});
+      saveResume({
+        issueId: issue.id,
+        issueIdentifier: identifier,
+        agentSessionId: rsid,
+        fullContext: prior.fullContext,
+        createdAt: new Date().toISOString(),
+      });
+      api.logger.info(`@dispatch: ${identifier} resume-gate — ${prior.sessionCount} prior session(s), awaiting resume/fresh reply (activeRuns held)`);
+      return; // activeRuns left set on purpose — released by the prompted resume
+    }
+  }
 
   // ── /grill-me interview gate ──────────────────────────────────────────
   // When grillMode is on, interview the user (one question at a time) BEFORE
