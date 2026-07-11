@@ -23,6 +23,32 @@ function resolveAgentDirs(agentId, config) {
  * Tries embedded runner first (if streaming callbacks provided), falls back
  * to subprocess. If the inactivity watchdog kills the run, retries once.
  */
+/**
+ * Registry of in-flight embedded runs, keyed by an abort group (typically the
+ * Linear issue id). Lets an external caller — e.g. the STOP-signal handler —
+ * abort a running worker, which a tmux-only kill cannot reach.
+ */
+const runsByAbortKey = new Map();
+/**
+ * Abort every in-flight embedded agent run registered under `abortKey`.
+ * @param abortKey - the group the runs were registered under (issue id)
+ * @returns the number of runs that were aborted
+ */
+export function abortRunsFor(abortKey) {
+    const set = runsByAbortKey.get(abortKey);
+    if (!set)
+        return 0;
+    let n = 0;
+    for (const controller of set) {
+        try {
+            controller.abort();
+            n++;
+        }
+        catch { /* already settled */ }
+    }
+    runsByAbortKey.delete(abortKey);
+    return n;
+}
 export async function runAgent(params) {
     const maxAttempts = 2;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -65,7 +91,7 @@ function buildDateContext() {
  * Single attempt to run an agent (no retry logic).
  */
 async function runAgentOnce(params) {
-    const { api, agentId, sessionId, streaming, readOnly, toolsDeny } = params;
+    const { api, agentId, sessionId, streaming, readOnly, toolsDeny, abortKey } = params;
     // Inject current timestamp into every LLM request
     const message = `${buildDateContext()}\n\n${params.message}`;
     const pluginConfig = api.pluginConfig;
@@ -75,7 +101,7 @@ async function runAgentOnce(params) {
     // Try embedded runner first (has streaming callbacks)
     if (streaming) {
         try {
-            return await runEmbedded(api, agentId, sessionId, message, timeoutMs, streaming, wdConfig.inactivityMs, readOnly, toolsDeny);
+            return await runEmbedded(api, agentId, sessionId, message, timeoutMs, streaming, wdConfig.inactivityMs, readOnly, toolsDeny, abortKey);
         }
         catch (err) {
             // Read-only mode MUST NOT fall back to subprocess — subprocess runs a
@@ -122,7 +148,7 @@ const READ_ONLY_DENY = [
     "tts", // audio file generation
     "image", // image file generation
 ];
-async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streaming, inactivityMs, readOnly, toolsDeny) {
+async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streaming, inactivityMs, readOnly, toolsDeny, abortKey) {
     // Load config so we can resolve agent dirs and providers correctly.
     const origConfig = await api.runtime.config.loadConfig();
     let config = origConfig;
@@ -181,6 +207,15 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
     };
     // --- Inactivity watchdog ---
     const controller = new AbortController();
+    // Register so an external STOP (Linear stop signal) can abort this run.
+    if (abortKey) {
+        let set = runsByAbortKey.get(abortKey);
+        if (!set) {
+            set = new Set();
+            runsByAbortKey.set(abortKey, set);
+        }
+        set.add(controller);
+    }
     const watchdog = new InactivityWatchdog({
         inactivityMs,
         label: `embedded:${agentId}:${sessionId}`,
@@ -303,6 +338,14 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
         },
     });
     watchdog.stop();
+    if (abortKey) {
+        const set = runsByAbortKey.get(abortKey);
+        if (set) {
+            set.delete(controller);
+            if (set.size === 0)
+                runsByAbortKey.delete(abortKey);
+        }
+    }
     // Extract output text from payloads
     const payloads = result.payloads ?? [];
     const outputText = payloads

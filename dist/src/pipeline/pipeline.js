@@ -411,6 +411,7 @@ export async function triggerAudit(hookCtx, dispatch, event, sessionKey) {
         streaming: dispatch.agentSessionId
             ? { linearApi, agentSessionId: dispatch.agentSessionId }
             : undefined,
+        abortKey: dispatch.issueId, // lets a Linear STOP abort an in-flight audit
     });
     // runAgent returns inline (embedded runner) — process verdict directly.
     // The agent_end hook in index.ts serves as safety net for sessions_spawn.
@@ -418,6 +419,7 @@ export async function triggerAudit(hookCtx, dispatch, event, sessionKey) {
     await processVerdict(hookCtx, dispatch, {
         success: result.success,
         output: result.output,
+        inline: true,
     }, auditSessionId);
 }
 /**
@@ -430,6 +432,17 @@ export async function processVerdict(hookCtx, dispatch, event, sessionKey) {
     const { api, linearApi, notify, pluginConfig, configPath } = hookCtx;
     const TAG = `[${dispatch.issueIdentifier}]`;
     const maxAttempts = pluginConfig?.maxReworkAttempts ?? 2;
+    // The inline audit path (triggerAudit) carries the real audit output; the
+    // agent_end safety-net hook often fires FIRST with an empty event. If this
+    // call has no output and no messages, bail WITHOUT consuming the dedup so the
+    // path that actually has the audit text wins — otherwise the empty call
+    // produced a false "no parseable verdict" and an unnecessary rework loop.
+    const hasOutput = !!(event.output && event.output.length > 0);
+    const hasMessages = Array.isArray(event.messages) && event.messages.length > 0;
+    if (!event.inline && !hasOutput && !hasMessages) {
+        api.logger.info(`${TAG} audit verdict: empty safety-net event (0 chars) — deferring to the inline path that has the audit output`);
+        return;
+    }
     // Dedup check
     const eventKey = `audit-end:${sessionKey}`;
     const isNew = await markEventProcessed(eventKey, configPath);
@@ -814,6 +827,7 @@ export async function spawnWorker(hookCtx, dispatch, opts) {
         streaming: dispatch.agentSessionId
             ? { linearApi, agentSessionId: dispatch.agentSessionId }
             : undefined,
+        abortKey: dispatch.issueId, // lets a Linear STOP abort this in-flight worker
     });
     // Save worker output to .claw/
     const workerElapsed = Date.now() - workerStartTime;
