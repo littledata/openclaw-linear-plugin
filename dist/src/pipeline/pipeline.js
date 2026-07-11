@@ -16,6 +16,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { runAgent } from "../agent/agent.js";
+import { runCodex } from "../tools/codex-tool.js";
 import { clearActiveSession } from "./active-session.js";
 import { getCachedGuidanceForTeam, isGuidanceEnabled } from "./guidance.js";
 import { transitionDispatch, registerSessionMapping, markEventProcessed, completeDispatch, TransitionError, readDispatchState, getActiveDispatch, updateDispatchTaskFlowRevision, } from "./dispatch-state.js";
@@ -819,16 +820,39 @@ export async function spawnWorker(hookCtx, dispatch, opts) {
     // when the runtime surface or flow state is missing.
     recordPhaseTask(api, dispatch, "worker", workerAgentId, workerSessionId);
     const workerStartTime = Date.now();
-    const result = await runAgent({
-        api,
-        agentId: workerAgentId,
-        sessionId: workerSessionId,
-        message: `${workerPrompt.system}\n\n${workerPrompt.task}`,
-        streaming: dispatch.agentSessionId
-            ? { linearApi, agentSessionId: dispatch.agentSessionId }
-            : undefined,
-        abortKey: dispatch.issueId, // lets a Linear STOP abort this in-flight worker
-    });
+    // Worker execution backend (config `workerBackend`, default "embedded"):
+    //  - "codex": delegate ALL implementation to `codex exec`. It runs in its own
+    //    --full-auto sandbox (so it is NOT subject to OpenClaw's default-deny exec
+    //    approval gate that blocked the embedded runner's writes) on the codex model
+    //    (gpt-5.6-sol via codexModel / ~/.codex/config.toml), in the isolated
+    //    worktree — reads, edits, tests, commits — streaming activity to the Linear
+    //    session. codex runs inside tmux, so the STOP handler's killActiveSession
+    //    can abort it. `workerAgentId` still drives phase/task-flow bookkeeping above.
+    //  - "embedded" (default, upstream behavior): the in-process OpenClaw agent,
+    //    subject to OpenClaw's tool/exec policy.
+    const workerBackend = pluginConfig?.workerBackend ?? "embedded";
+    let result;
+    if (workerBackend === "codex") {
+        result = await runCodex(api, {
+            prompt: `${workerPrompt.system}\n\n${workerPrompt.task}`,
+            workingDir: dispatch.worktreePath,
+            agentSessionId: dispatch.agentSessionId,
+            issueId: dispatch.issueId,
+            issueIdentifier: dispatch.issueIdentifier,
+        }, pluginConfig);
+    }
+    else {
+        result = await runAgent({
+            api,
+            agentId: workerAgentId,
+            sessionId: workerSessionId,
+            message: `${workerPrompt.system}\n\n${workerPrompt.task}`,
+            streaming: dispatch.agentSessionId
+                ? { linearApi, agentSessionId: dispatch.agentSessionId }
+                : undefined,
+            abortKey: dispatch.issueId, // embedded-run abort via STOP
+        });
+    }
     // Save worker output to .claw/
     const workerElapsed = Date.now() - workerStartTime;
     const agentId = workerAgentId;
@@ -846,8 +870,8 @@ export async function spawnWorker(hookCtx, dispatch, opts) {
         });
     }
     catch { }
-    // Handle watchdog kill (runAgent already retried once — both attempts failed)
-    if (result.watchdogKilled) {
+    // Handle inactivity-watchdog kill (embedded reports watchdogKilled; codex reports error "inactivity_timeout")
+    if (result.watchdogKilled || result.error === "inactivity_timeout") {
         const wdConfig = resolveWatchdogConfig(agentId, pluginConfig ?? undefined);
         const thresholdSec = Math.round(wdConfig.inactivityMs / 1000);
         api.logger.warn(`${TAG} worker killed by inactivity watchdog 2x — escalating to stuck`);

@@ -39,6 +39,7 @@
       "codexBaseRepo": { "type": "string", "description": "Path to git repo for Codex worktrees", "default": "/home/claw/ai-workspace" },
       "executionMode": { "type": "string", "enum": ["worktree", "container"], "description": "Worker isolation mode. 'worktree' (default): git worktree off a shared local clone. 'container': a per-session Docker container that clones the repo fresh (removes shared git state → safe for concurrent dispatches on the same repo).", "default": "worktree" },
       "workerImage": { "type": "string", "description": "Docker image for container execution mode (built from docker/worker.Dockerfile).", "default": "openclaw-linear-worker:latest" },
+      "workerBackend": { "type": "string", "enum": ["embedded", "codex"], "description": "Worker execution backend. 'embedded' (default): the in-process OpenClaw agent (subject to OpenClaw's exec/tool policy). 'codex': delegate all implementation to `codex exec` in its own --full-auto sandbox (no OpenClaw exec-approval gate) on the codex model — recommended when the embedded runner's writes are blocked by the exec policy.", "default": "embedded" },
       "codexModel": { "type": "string", "description": "Model passed to the Codex worker CLI (codex exec --model). If unset, Codex uses its own ~/.codex/config.toml default." },
       "codexReasoningEffort": { "type": "string", "description": "Codex reasoning effort injected as '-c model_reasoning_effort' for the worker (e.g. low, medium, high, xhigh, max, ultra). If unset, Codex uses its config.toml default." },
       "tierModels": {
