@@ -14,6 +14,42 @@
  */
 import { buildSummaryFromArtifacts } from "./artifacts.js";
 import { resolveDefaultAgent } from "../infra/shared-profiles.js";
+/**
+ * Is a comment substantive prior work worth recapping — as opposed to the bot's
+ * own gate prompts, system thread markers, and stop/error chatter? Keeps Apex
+ * plans, review verdicts, and the user's steering; drops the noise the resume
+ * gate itself (and prior runs) generate.
+ * @param c - the comment to classify
+ * @returns true when the comment is worth showing in a resume recap
+ */
+export function isSubstantiveComment(c) {
+    const b = (c.body ?? "").trim();
+    if (!b)
+        return false;
+    const noise = [
+        /^This thread is for an agent session/i, // Linear system marker (author null)
+        /^Please reply with an option/i, // our own select-signal mirror comment
+        /^Which repo(sitory)? should/i, // grill repo question (recommendation, not a decision)
+        /^🛑\s*Stop received/i, // stop acknowledgements
+        /Something went wrong while processing/i, // transient failure notices
+        /`command -v /i, // codex capability-probe failures
+    ];
+    if (noise.some((re) => re.test(b)))
+        return false;
+    // Pure one-word gate replies carry no standalone context.
+    if (/^(resume|fresh|yes|no|all|both)\.?$/i.test(b))
+        return false;
+    return true;
+}
+/** Collapse a comment body to a single recap line (drop markdown headers/blank lines). */
+function oneLine(body) {
+    return body
+        .replace(/^#+\s*/gm, "")
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .join(" ");
+}
 /** Render one Linear agent-activity's content object to a compact line. */
 function activityText(content) {
     if (typeof content === "string")
@@ -53,13 +89,18 @@ export async function gatherPriorWork(linearApi, issueId, opts) {
                 prUrls.add(pr.url);
     // Issue comments carry the durable record — the Apex plan / verdicts the
     // orchestrator posts, plus the user's own steering — independent of any
-    // worktree that may have been wiped.
-    const details = await linearApi.getIssueDetails(issueId).catch(() => null);
-    const comments = (details?.comments?.nodes ?? []).map((c) => ({
-        author: c.user?.name ?? "?",
-        body: c.body ?? "",
-        createdAt: c.createdAt ?? "",
-    }));
+    // worktree that may have been wiped (and, on this workspace, more reliable
+    // than the agent-session API). Fetch a wide window and keep only substantive
+    // comments, de-duplicating identical bodies (the same steering often repeats).
+    const rawComments = await linearApi.getRecentComments(issueId, 60).catch(() => []);
+    const seen = new Set();
+    const comments = rawComments.filter(isSubstantiveComment).filter((c) => {
+        const key = c.body.trim();
+        if (seen.has(key))
+            return false;
+        seen.add(key);
+        return true;
+    });
     const clawSummary = opts?.worktreePath ? buildSummaryFromArtifacts(opts.worktreePath) : null;
     const hasPriorWork = sessions.length > 0 || comments.length > 0 || !!clawSummary;
     // ---- Concise summary (elicitation) ----
@@ -81,6 +122,15 @@ export async function gatherPriorWork(linearApi, issueId, opts) {
             lines.push(`  PR: ${s.pullRequests.map((p) => p.url).join(", ")}`);
         summaryParts.push(lines.join("\n"));
     });
+    // Comment recap — the primary signal when there are no live sessions. Show the
+    // most recent substantive comments (plans + steering), newest last.
+    if (comments.length) {
+        const lines = comments.slice(-6).map((c) => {
+            const who = c.author ? `**${c.author}**` : "note";
+            return `- ${who}: ${oneLine(c.body).slice(0, 220)}`;
+        });
+        summaryParts.push(`**Prior planning & steering:**\n${lines.join("\n")}`);
+    }
     if (prUrls.size)
         summaryParts.push(`\n**PRs:** ${[...prUrls].join(", ")}`);
     // ---- Full context (resume-analysis agent) ----
@@ -105,7 +155,7 @@ export async function gatherPriorWork(linearApi, issueId, opts) {
     if (comments.length) {
         ctxParts.push("## Issue comments (plan, verdicts, and user steering)");
         for (const c of comments.slice(-15)) {
-            ctxParts.push(`[${c.author}] ${c.body.slice(0, 800)}`);
+            ctxParts.push(`[${c.author ?? "note"}] ${c.body.slice(0, 800)}`);
         }
         ctxParts.push("");
     }
@@ -114,6 +164,7 @@ export async function gatherPriorWork(linearApi, issueId, opts) {
     return {
         hasPriorWork,
         sessionCount: sessions.length,
+        commentCount: comments.length,
         summary: summaryParts.join("\n\n") || "(no readable prior activity)",
         fullContext: ctxParts.join("\n").slice(0, 12000),
         pullRequestUrls: [...prUrls],

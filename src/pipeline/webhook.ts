@@ -2320,7 +2320,11 @@ async function handleDispatch(
       if (!rsid) {
         try { const sr = await linearApi.createSessionOnIssue(issue.id); rsid = sr.sessionId ?? undefined; } catch { /* best effort */ }
       }
-      const ask = `I found prior work on **${identifier}** (${prior.sessionCount} previous session(s)).\n\n${prior.summary}\n\nReply **resume** to continue from the prior plan, or **fresh** to start over.`;
+      const counts = [
+        prior.sessionCount ? `${prior.sessionCount} prior session(s)` : "",
+        prior.commentCount ? `${prior.commentCount} planning/steering note(s)` : "",
+      ].filter(Boolean).join(", ");
+      const ask = `I found prior work on **${identifier}**${counts ? ` (${counts})` : ""}.\n\n${prior.summary}\n\nReply **resume** to continue from the prior plan, or **fresh** to start over.`;
       if (rsid) await linearApi.emitActivity(rsid, { type: "elicitation", body: ask }, RESUME_SELECT).catch(() => {});
       saveResume({
         issueId: issue.id,

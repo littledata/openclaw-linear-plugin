@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { parseResumeDecision } from "./resume-state.js";
-import { parseResumeAnalysis } from "./prior-work.js";
+import { parseResumeAnalysis, isSubstantiveComment } from "./prior-work.js";
 
 describe("parseResumeDecision", () => {
   it("recognizes resume phrasings", () => {
@@ -52,5 +52,33 @@ describe("parseResumeAnalysis", () => {
       repos: [],
       brief: "continue in the same place",
     });
+  });
+});
+
+describe("isSubstantiveComment", () => {
+  const c = (body: string, author: string | null = "George Lazu") => ({ body, author, createdAt: "" });
+
+  it("keeps the Apex plan, verdicts, and user steering", () => {
+    expect(isSubstantiveComment(c("## 🧭 Apex plan\n\n- **Prism** — Fix the events settings UI…", "Vasile"))).toBe(true);
+    expect(isSubstantiveComment(c("this is not a segment specific issue, but a disabledEvents setting issue - it's not modified correctly at the UI level"))).toBe(true);
+    expect(isSubstantiveComment(c("i think the bug is in ld-shopify, and it's likely related to how we have one general events page component per destination"))).toBe(true);
+    expect(isSubstantiveComment(c("**[main]** Read CORE-1740. Plan:\n\n1. Trace where Segment disabledEvents is stored…", "Vasile"))).toBe(true);
+  });
+
+  it("drops the bot's own gate prompts, system markers, and stop/error noise", () => {
+    expect(isSubstantiveComment(c("This thread is for an agent session with vasile.", null))).toBe(false);
+    expect(isSubstantiveComment(c("Please reply with an option:\n- Resume — continue prior work (resume)\n- Start fresh (fresh)", "Vasile"))).toBe(false);
+    expect(isSubstantiveComment(c("Which repo should CORE-1740 be implemented in? Recommended: shopify-tracker", "Vasile"))).toBe(false);
+    expect(isSubstantiveComment(c("🛑 Stop received for CORE-1740 — no active work was running; cleared any pending dispatch state.", "Vasile"))).toBe(false);
+    expect(isSubstantiveComment(c("**[main]** Something went wrong while processing this. The system will retry automatically if possible.", "Vasile"))).toBe(false);
+    expect(isSubstantiveComment(c("**[main]** ⚠️ 🛠️ `command -v cli_codex || true` failed", "Vasile"))).toBe(false);
+  });
+
+  it("drops pure one-word gate replies but keeps a repo-name reply", () => {
+    expect(isSubstantiveComment(c("resume"))).toBe(false);
+    expect(isSubstantiveComment(c("fresh"))).toBe(false);
+    expect(isSubstantiveComment(c("yes"))).toBe(false);
+    expect(isSubstantiveComment(c("ld-shopify"))).toBe(true);
+    expect(isSubstantiveComment(c("   "))).toBe(false);
   });
 });

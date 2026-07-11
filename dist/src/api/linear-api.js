@@ -414,6 +414,35 @@ export class LinearAgentApi {
             return [];
         }
     }
+    /**
+     * Fetch recent comments on an issue with author names. Used by the resume gate:
+     * on this workspace the durable record of prior work (Apex plans, review
+     * verdicts, and the user's steering) lives in comments, not agent-session API
+     * objects. Best-effort — returns [] on failure.
+     * @param issueId - the Linear issue id
+     * @param count - how many of the most recent comments to fetch (default 60)
+     * @returns comments oldest→newest with author name (null for system comments)
+     */
+    async getRecentComments(issueId, count = 60) {
+        try {
+            const data = await this.gql(`query IssueComments($id: String!, $count: Int!) {
+          issue(id: $id) {
+            comments(last: $count) {
+              nodes { id body createdAt user { name } }
+            }
+          }
+        }`, { id: issueId, count });
+            return (data.issue?.comments?.nodes ?? []).map((c) => ({
+                id: c.id,
+                body: c.body ?? "",
+                author: c.user?.name ?? null,
+                createdAt: c.createdAt ?? "",
+            }));
+        }
+        catch {
+            return [];
+        }
+    }
     async getTeamStates(teamId) {
         const data = await this.gql(`query TeamStates($id: String!) {
         team(id: $id) {
