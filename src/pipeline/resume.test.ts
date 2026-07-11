@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseResumeDecision } from "./resume-state.js";
+import { parseResumeDecision, isHandledFresh, RESUME_HANDLED_TTL_MS } from "./resume-state.js";
 import { parseResumeAnalysis, isSubstantiveComment } from "./prior-work.js";
 
 describe("parseResumeDecision", () => {
@@ -18,6 +18,24 @@ describe("parseResumeDecision", () => {
   });
   it("returns null when unrecognized", () => {
     expect(parseResumeDecision("what are my options?")).toBeNull();
+  });
+});
+
+describe("isHandledFresh", () => {
+  const now = 1_000_000_000_000;
+  it("is fresh within the TTL", () => {
+    expect(isHandledFresh(now - 60_000, now)).toBe(true);
+    expect(isHandledFresh(now, now)).toBe(true);
+  });
+  it("is stale past the TTL", () => {
+    expect(isHandledFresh(now - RESUME_HANDLED_TTL_MS - 1, now)).toBe(false);
+  });
+  it("is not fresh when no mark exists", () => {
+    expect(isHandledFresh(undefined, now)).toBe(false);
+  });
+  it("honours a custom TTL", () => {
+    expect(isHandledFresh(now - 5_000, now, 1_000)).toBe(false);
+    expect(isHandledFresh(now - 500, now, 1_000)).toBe(true);
   });
 });
 

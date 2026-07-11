@@ -22,7 +22,7 @@ import { getGrill, saveGrill, clearGrill } from "./grill-state.js";
 import { runStatePlan } from "./orchestrator.js";
 import { resolveStatePlan, orchestrationMode } from "./state-plan.js";
 import { gatherPriorWork, analyzeResume } from "./prior-work.js";
-import { getResume, saveResume, clearResume, parseResumeDecision } from "./resume-state.js";
+import { getResume, saveResume, clearResume, parseResumeDecision, markResumeHandled, wasResumeHandledRecently, clearResumeHandled } from "./resume-state.js";
 import { wipeIssueWorkspace } from "../infra/codex-worktree.js";
 import { runGrillStep } from "./grill.js";
 import { ensureClawDir, writeManifest, writeDispatchMemory, resolveOrchestratorWorkspace } from "./artifacts.js";
@@ -734,6 +734,7 @@ export async function handleLinearWebhook(
       clearPendingRepoSelection(issue.id);
       clearGrill(issue.id);
       clearResume(issue.id);
+      clearResumeHandled(issue.id); // next engagement should re-ask resume/fresh
       const stopApi = createLinearApi(api);
       if (stopApi) {
         await stopApi.emitActivity(session.id, {
@@ -776,7 +777,7 @@ export async function handleLinearWebhook(
         const grillApi = createLinearApi(api);
         if (grillApi) {
           api.logger.info(`AgentSession prompted: ${issue.identifier ?? issue.id} — grill answer #${grillPending.qa.length} recorded, resuming`);
-          void handleDispatch(api, grillApi, issue, { existingSessionId: grillPending.agentSessionId ?? session.id })
+          void handleDispatch(api, grillApi, issue, { existingSessionId: grillPending.agentSessionId ?? session.id, resumeResolved: true })
             .catch((err) => api.logger.error(`grill resume failed: ${err}`));
         }
         return true;
@@ -797,6 +798,7 @@ export async function handleLinearWebhook(
           return true;
         }
         clearResume(issue.id);
+        markResumeHandled(issue.id); // suppress the gate for re-triggers this engagement
         activeRuns.delete(issue.id); // release the gate claim so the resume re-claims
         if (!rApi) return true;
 
@@ -918,6 +920,7 @@ export async function handleLinearWebhook(
       void handleDispatch(api, linearApi, issue, {
         repoOverride: selected,
         existingSessionId: pendingRepoSel.agentSessionId ?? session.id,
+        resumeResolved: true, // resume stage already passed earlier in this chain
       }).catch((err) => api.logger.error(`repo-selection resume failed: ${err}`));
       return true;
     }
@@ -2312,7 +2315,13 @@ async function handleDispatch(
   // recap it and ask the user to RESUME (continue the prior plan) or start
   // FRESH — BEFORE grilling or building a worktree. Runs only in stateplan mode
   // and only once per dispatch chain (opts.resumeResolved guards re-entry).
-  if (orchestrationMode(pluginConfig) === "stateplan" && !opts?.resumeResolved && !opts?.grillDone && !getResume(issue.id)) {
+  if (
+    orchestrationMode(pluginConfig) === "stateplan" &&
+    !opts?.resumeResolved &&
+    !opts?.grillDone &&
+    !getResume(issue.id) &&
+    !wasResumeHandledRecently(issue.id)
+  ) {
     const excludeSessionId = opts?.existingSessionId ?? linearSessionByIssue.get(issue.id);
     const prior = await gatherPriorWork(linearApi, issue.id, { excludeSessionId });
     if (prior.hasPriorWork) {
@@ -2337,6 +2346,10 @@ async function handleDispatch(
       return; // activeRuns left set on purpose — released by the prompted resume
     }
   }
+  // Past the resume stage for this engagement — mark it so re-entries (grill /
+  // repo-selection replies, or a stray Issue.update re-delegation) don't re-ask.
+  // Idempotent + sliding: refreshed on each re-entry while work is active.
+  if (orchestrationMode(pluginConfig) === "stateplan") markResumeHandled(issue.id);
 
   // ── /grill-me interview gate ──────────────────────────────────────────
   // When grillMode is on, interview the user (one question at a time) BEFORE

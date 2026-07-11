@@ -74,6 +74,89 @@ export function clearResume(issueId: string): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// "Resume handled" marker — stops the gate re-firing within one engagement.
+//
+// The resume gate lives at the TOP of handleDispatch, so EVERY re-entry (a grill
+// reply, a repo-selection reply, or a stray Issue.update re-delegation) re-checks
+// it. Once the user has decided (or the gate was skipped because there was no
+// prior work), we mark the issue "handled" for a short TTL so those re-entries
+// proceed straight through instead of re-asking. Genuine re-engagement after the
+// TTL re-evaluates prior work as normal. Kept in its own store, independent of
+// the parked-decision store above.
+// ---------------------------------------------------------------------------
+
+/** How long a "resume handled" mark suppresses the gate (sliding — refreshed on each re-entry). */
+export const RESUME_HANDLED_TTL_MS = 20 * 60_000;
+
+function handledPath(): string {
+  return path.join(homedir(), ".openclaw", "linear-resume-handled.json");
+}
+
+function readHandled(): Record<string, number> {
+  const p = handledPath();
+  if (!existsSync(p)) return {};
+  try {
+    return JSON.parse(readFileSync(p, "utf8")) as Record<string, number>;
+  } catch {
+    return {};
+  }
+}
+
+function writeHandled(store: Record<string, number>): void {
+  const p = handledPath();
+  mkdirSync(path.dirname(p), { recursive: true });
+  writeFileSync(p, JSON.stringify(store, null, 2), "utf8");
+}
+
+/** Pure TTL check — a mark is fresh when it exists and is within the window. */
+export function isHandledFresh(
+  ts: number | undefined,
+  now: number,
+  ttlMs: number = RESUME_HANDLED_TTL_MS,
+): boolean {
+  return typeof ts === "number" && now - ts < ttlMs;
+}
+
+/**
+ * Record that the resume gate has been handled for an issue (idempotent; a
+ * fresh call slides the TTL so an active engagement keeps the gate suppressed).
+ * @param issueId - the Linear issue id
+ * @param now - current epoch ms (injectable for tests)
+ */
+export function markResumeHandled(issueId: string, now: number = Date.now()): void {
+  const store = readHandled();
+  store[issueId] = now;
+  writeHandled(store);
+}
+
+/**
+ * Whether the resume gate was handled for this issue recently enough to skip it.
+ * @param issueId - the Linear issue id
+ * @param now - current epoch ms (injectable for tests)
+ * @param ttlMs - suppression window
+ * @returns true when a fresh mark exists
+ */
+export function wasResumeHandledRecently(
+  issueId: string,
+  now: number = Date.now(),
+  ttlMs: number = RESUME_HANDLED_TTL_MS,
+): boolean {
+  return isHandledFresh(readHandled()[issueId], now, ttlMs);
+}
+
+/**
+ * Drop the "resume handled" mark (on STOP, so the next engagement re-asks).
+ * @param issueId - the Linear issue id
+ */
+export function clearResumeHandled(issueId: string): void {
+  const store = readHandled();
+  if (store[issueId] !== undefined) {
+    delete store[issueId];
+    writeHandled(store);
+  }
+}
+
 /**
  * Parse the user's reply to the resume/fresh prompt.
  * @param reply - the raw user message
