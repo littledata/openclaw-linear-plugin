@@ -37,6 +37,8 @@
       "defaultAgentId": { "type": "string", "description": "OpenClaw agent ID to use for pipeline stages" },
       "enableAudit": { "type": "boolean", "description": "Run auditor stage after implementation", "default": true },
       "codexBaseRepo": { "type": "string", "description": "Path to git repo for Codex worktrees", "default": "/home/claw/ai-workspace" },
+      "executionMode": { "type": "string", "enum": ["worktree", "container"], "description": "Worker isolation mode. 'worktree' (default): git worktree off a shared local clone. 'container': a per-session Docker container that clones the repo fresh (removes shared git state → safe for concurrent dispatches on the same repo).", "default": "worktree" },
+      "workerImage": { "type": "string", "description": "Docker image for container execution mode (built from docker/worker.Dockerfile).", "default": "openclaw-linear-worker:latest" },
       "codexModel": { "type": "string", "description": "Model passed to the Codex worker CLI (codex exec --model). If unset, Codex uses its own ~/.codex/config.toml default." },
       "codexReasoningEffort": { "type": "string", "description": "Codex reasoning effort injected as '-c model_reasoning_effort' for the worker (e.g. low, medium, high, xhigh, max, ultra). If unset, Codex uses its config.toml default." },
       "tierModels": {
