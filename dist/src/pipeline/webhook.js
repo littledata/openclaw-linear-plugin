@@ -11,6 +11,8 @@ import { createWorktree, createMultiWorktree, prepareWorkspace } from "../infra/
 import { resolveRepos, isMultiRepo, getRepoEntries, resolveReposByNames } from "../infra/multi-repo.js";
 import { savePendingRepoSelection, getPendingRepoSelection, clearPendingRepoSelection, parseRepoSelection, } from "./repo-selection-state.js";
 import { getGrill, saveGrill, clearGrill } from "./grill-state.js";
+import { runStatePlan } from "./orchestrator.js";
+import { resolveStatePlan, orchestrationMode } from "./state-plan.js";
 import { runGrillStep } from "./grill.js";
 import { ensureClawDir, writeManifest, writeDispatchMemory, resolveOrchestratorWorkspace } from "./artifacts.js";
 import { readPlanningState, isInPlanningMode, getPlanningSession, endPlanningSession } from "./planning-state.js";
@@ -2228,8 +2230,29 @@ async function handleDispatch(api, linearApi, issue, opts) {
         title: enrichedIssue.title ?? "(untitled)",
         status: "dispatched",
     });
-    // spawnWorker handles: dispatched→working→auditing→done/rework/stuck
-    spawnWorker(hookCtx, dispatch)
+    // Choose the pipeline: state-driven specialist orchestrator (opt-in via
+    // config `orchestrationMode: "stateplan"`) or the default single-worker flow.
+    let pipelinePromise;
+    if (orchestrationMode(pluginConfig) === "stateplan") {
+        const wfState = {
+            name: enrichedIssue?.state?.name ?? "",
+            type: enrichedIssue?.state?.type ?? "",
+        };
+        const plan = resolveStatePlan(wfState, pluginConfig);
+        if (plan) {
+            api.logger.info(`@dispatch: state-plan "${plan.stateLabel}" for ${identifier} (state="${wfState.name}")`);
+            pipelinePromise = runStatePlan(hookCtx, dispatch, plan);
+        }
+        else {
+            api.logger.info(`@dispatch: no state-plan for ${identifier} (state="${wfState.name}") — using single worker`);
+            pipelinePromise = spawnWorker(hookCtx, dispatch);
+        }
+    }
+    else {
+        // spawnWorker handles: dispatched→working→auditing→done/rework/stuck
+        pipelinePromise = spawnWorker(hookCtx, dispatch);
+    }
+    pipelinePromise
         .catch(async (err) => {
         api.logger.error(`@dispatch: pipeline v2 failed for ${identifier}: ${err}`);
         await updateDispatchStatus(identifier, "failed", statePath);

@@ -91,7 +91,7 @@ function buildDateContext() {
  * Single attempt to run an agent (no retry logic).
  */
 async function runAgentOnce(params) {
-    const { api, agentId, sessionId, streaming, readOnly, toolsDeny, abortKey } = params;
+    const { api, agentId, sessionId, streaming, readOnly, toolsDeny, abortKey, extraSystemPrompt } = params;
     // Inject current timestamp into every LLM request
     const message = `${buildDateContext()}\n\n${params.message}`;
     const pluginConfig = api.pluginConfig;
@@ -101,7 +101,7 @@ async function runAgentOnce(params) {
     // Try embedded runner first (has streaming callbacks)
     if (streaming) {
         try {
-            return await runEmbedded(api, agentId, sessionId, message, timeoutMs, streaming, wdConfig.inactivityMs, readOnly, toolsDeny, abortKey);
+            return await runEmbedded(api, agentId, sessionId, message, timeoutMs, streaming, wdConfig.inactivityMs, readOnly, toolsDeny, abortKey, extraSystemPrompt);
         }
         catch (err) {
             // Read-only mode MUST NOT fall back to subprocess — subprocess runs a
@@ -148,7 +148,7 @@ const READ_ONLY_DENY = [
     "tts", // audio file generation
     "image", // image file generation
 ];
-async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streaming, inactivityMs, readOnly, toolsDeny, abortKey) {
+async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streaming, inactivityMs, readOnly, toolsDeny, abortKey, extraSystemPrompt) {
     // Load config so we can resolve agent dirs and providers correctly.
     const origConfig = await api.runtime.config.loadConfig();
     let config = origConfig;
@@ -232,6 +232,16 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
     // Derive a friendly label from cli_ tool names: cli_codex→"Codex", cli_claude→"Claude"
     const cliLabel = (name) => name.startsWith("cli_") ? name.slice(4).charAt(0).toUpperCase() + name.slice(5) : name;
     watchdog.start();
+    // Compose the extra system prompt: the specialist ROLE brief (if any) plus
+    // the read-only notice (if readOnly). Either, both, or neither may apply.
+    const readOnlyNotice = [
+        "READ-ONLY MODE: You may read and search files but you MUST NOT",
+        "write, edit, create, or delete any files. Do not run shell commands.",
+        "Your only output is your text response.",
+    ].join(" ");
+    const composedSystemPrompt = [extraSystemPrompt, readOnly ? readOnlyNotice : undefined]
+        .filter(Boolean)
+        .join("\n\n");
     const result = await api.runtime.agent.runEmbeddedPiAgent({
         sessionId,
         sessionFile,
@@ -247,13 +257,7 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
         abortSignal: controller.signal,
         shouldEmitToolResult: () => true,
         shouldEmitToolOutput: () => true,
-        ...(readOnly ? {
-            extraSystemPrompt: [
-                "READ-ONLY MODE: You may read and search files but you MUST NOT",
-                "write, edit, create, or delete any files. Do not run shell commands.",
-                "Your only output is your text response.",
-            ].join(" "),
-        } : {}),
+        ...(composedSystemPrompt ? { extraSystemPrompt: composedSystemPrompt } : {}),
         // Stream reasoning/thinking to Linear
         onReasoningStream: (payload) => {
             watchdog.tick();

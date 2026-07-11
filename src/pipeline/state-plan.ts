@@ -1,0 +1,230 @@
+/**
+ * state-plan.ts — maps a Linear ticket's workflow state to a phase plan.
+ *
+ * The state-driven orchestrator runs a DIFFERENT set of specialist phases
+ * depending on where the ticket sits in the workflow:
+ *
+ *   Todo / In Progress  → Apex plans + routes implementers → they build →
+ *                         Apex self-reviews → (on success) move to Code Review
+ *   Code Review         → Warden + Apex code-review gate → (on success) move to QA
+ *   QA                  → Proof QAs → (on success) move to Done
+ *
+ * Every mapping is overridable via plugin config `statePlans` (keyed by the
+ * exact Linear state NAME, case-insensitive). When no config entry matches, a
+ * built-in matcher picks a plan by state name/type. States with no plan (e.g.
+ * Done, Canceled, Backlog) return null — the orchestrator no-ops for those.
+ *
+ * Transitions are AGENT-DECIDED: a plan only names the CANDIDATE next state(s).
+ * The orchestrator moves the ticket only when the agent reports its work is
+ * complete; any failure leaves the ticket where it is.
+ */
+
+export type PhaseType = "plan-implement" | "review" | "product";
+
+export interface PlanPhase {
+  type: PhaseType;
+  /** Role id for `review` / `product` phases. Ignored for `plan-implement`. */
+  role?: string;
+  /** A failing verdict gates (triggers bounded rework). Defaults true for reviews. */
+  gate?: boolean;
+}
+
+export interface SuccessTarget {
+  /** Candidate Linear state NAMES to move to (first team-state match wins). */
+  names: string[];
+  /** Fallback state TYPE if no name matches (e.g. "started", "completed"). */
+  type?: string;
+}
+
+export interface StatePlan {
+  /** Human label for logs (the matched state / plan). */
+  stateLabel: string;
+  phases: PlanPhase[];
+  /** Candidate next state on success (agent-decided move). Null = don't move. */
+  onSuccess: SuccessTarget | null;
+}
+
+export interface WorkflowState {
+  name: string;
+  type: string;
+}
+
+// ---------------------------------------------------------------------------
+// Built-in default plans
+// ---------------------------------------------------------------------------
+
+/** Todo / In Progress → build (Apex-led) → Code Review. */
+const IMPLEMENT_PLAN: StatePlan = {
+  stateLabel: "implement",
+  phases: [{ type: "plan-implement" }],
+  onSuccess: { names: ["In Review", "Code Review", "Review"], type: "started" },
+};
+
+/** Code Review → security + lead review gate → QA. */
+const CODE_REVIEW_PLAN: StatePlan = {
+  stateLabel: "code-review",
+  phases: [
+    { type: "review", role: "warden", gate: true },
+    { type: "review", role: "apex", gate: true },
+  ],
+  onSuccess: { names: ["QA", "Testing", "In QA", "Ready for QA"], type: "started" },
+};
+
+/** QA → Proof QA gate → Done. */
+const QA_PLAN: StatePlan = {
+  stateLabel: "qa",
+  phases: [{ type: "review", role: "proof", gate: true }],
+  onSuccess: { names: ["Done", "Merged", "Complete", "Completed"], type: "completed" },
+};
+
+/**
+ * Ordered matchers. Review/QA are checked BEFORE implement because custom
+ * Linear states like "In Review" and "QA" usually carry type "started", which
+ * the implement matcher would otherwise swallow.
+ */
+const MATCHERS: Array<{ test: (s: WorkflowState) => boolean; plan: StatePlan }> = [
+  {
+    test: (s) => /\bqa\b|testing|quality assurance/i.test(s.name),
+    plan: QA_PLAN,
+  },
+  {
+    test: (s) => /review/i.test(s.name),
+    plan: CODE_REVIEW_PLAN,
+  },
+  {
+    test: (s) =>
+      /todo|to do|in progress|doing|selected|ready|triage|backlog/i.test(s.name) ||
+      ["unstarted", "started", "triage"].includes(s.type),
+    plan: IMPLEMENT_PLAN,
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Config normalization
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalize a raw config phase entry into a PlanPhase. Accepts either a string
+ * shorthand (a role id or "plan-implement") or a full object.
+ * @param raw - the raw config value
+ * @returns a PlanPhase, or null if unrecognizable
+ */
+function normalizePhase(raw: unknown): PlanPhase | null {
+  if (typeof raw === "string") {
+    if (raw === "plan-implement") return { type: "plan-implement" };
+    // Bare role id → infer review vs product isn't possible here; the
+    // orchestrator resolves the role. Treat product roles as product, else review.
+    const productRoles = ["helm", "lumen"];
+    return productRoles.includes(raw)
+      ? { type: "product", role: raw }
+      : { type: "review", role: raw, gate: true };
+  }
+  if (raw && typeof raw === "object") {
+    const o = raw as Record<string, unknown>;
+    const type = o.type as PhaseType | undefined;
+    if (type === "plan-implement") return { type };
+    if (type === "review" || type === "product") {
+      return {
+        type,
+        role: typeof o.role === "string" ? o.role : undefined,
+        gate: type === "review" ? o.gate !== false : undefined,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Parse a raw config `statePlans[<name>]` entry into a StatePlan.
+ * @param raw - the raw config object for one state
+ * @param label - the state label for logging
+ * @returns a StatePlan, or null if it has no usable phases
+ */
+function parseConfigPlan(raw: unknown, label: string): StatePlan | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  const phases = Array.isArray(o.phases)
+    ? o.phases.map(normalizePhase).filter((p): p is PlanPhase => p !== null)
+    : [];
+  if (phases.length === 0) return null;
+
+  let onSuccess: SuccessTarget | null = null;
+  const os = o.onSuccess as Record<string, unknown> | string | string[] | undefined;
+  if (typeof os === "string") {
+    onSuccess = { names: [os] };
+  } else if (Array.isArray(os)) {
+    onSuccess = { names: os.filter((x): x is string => typeof x === "string") };
+  } else if (os && typeof os === "object") {
+    onSuccess = {
+      names: Array.isArray(os.names) ? os.names.filter((x): x is string => typeof x === "string") : [],
+      type: typeof os.type === "string" ? os.type : undefined,
+    };
+  }
+  return { stateLabel: label, phases, onSuccess };
+}
+
+// ---------------------------------------------------------------------------
+// Resolver
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the phase plan for a ticket's current workflow state.
+ *
+ * Precedence: config `statePlans` keyed by exact state name (case-insensitive)
+ * → built-in matcher by name/type → null (no orchestration for this state).
+ * @param state - the ticket's current workflow state (name + type)
+ * @param pluginConfig - the plugin config object
+ * @returns the plan to run, or null when this state should not be orchestrated
+ */
+export function resolveStatePlan(
+  state: WorkflowState,
+  pluginConfig?: Record<string, unknown>,
+): StatePlan | null {
+  // 1. Config override by exact state name (case-insensitive)
+  const configPlans = pluginConfig?.statePlans as Record<string, unknown> | undefined;
+  if (configPlans) {
+    const key = Object.keys(configPlans).find(
+      (k) => k.toLowerCase() === state.name.toLowerCase(),
+    );
+    if (key) {
+      const plan = parseConfigPlan(configPlans[key], state.name);
+      if (plan) return plan;
+    }
+  }
+
+  // 2. Built-in matcher
+  for (const m of MATCHERS) {
+    if (m.test(state)) return { ...m.plan, stateLabel: `${m.plan.stateLabel} (${state.name})` };
+  }
+
+  // 3. No plan for this state (Done, Canceled, etc.)
+  return null;
+}
+
+/**
+ * Resolve a SuccessTarget against a team's actual workflow states, returning
+ * the concrete state id to move to (or null if none match).
+ * @param target - the candidate next-state descriptor
+ * @param teamStates - all workflow states for the ticket's team
+ * @returns { id, name } of the matched state, or null
+ */
+export function resolveTargetState(
+  target: SuccessTarget | null,
+  teamStates: Array<{ id: string; name: string; type: string }>,
+): { id: string; name: string } | null {
+  if (!target) return null;
+  for (const candidate of target.names) {
+    const hit = teamStates.find((s) => s.name.toLowerCase() === candidate.toLowerCase());
+    if (hit) return { id: hit.id, name: hit.name };
+  }
+  if (target.type) {
+    const hit = teamStates.find((s) => s.type === target.type);
+    if (hit) return { id: hit.id, name: hit.name };
+  }
+  return null;
+}
+
+/** Orchestration mode from config: "single" (default worker) or "stateplan". */
+export function orchestrationMode(pluginConfig?: Record<string, unknown>): "single" | "stateplan" {
+  return pluginConfig?.orchestrationMode === "stateplan" ? "stateplan" : "single";
+}

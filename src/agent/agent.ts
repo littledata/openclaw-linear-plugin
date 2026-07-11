@@ -90,6 +90,13 @@ export async function runAgent(params: {
   readOnly?: boolean;
   /** Additional tools to deny (merged with config + readOnly denies) */
   toolsDeny?: string[];
+  /**
+   * Extra system prompt prepended to the agent's instructions. Used to bind a
+   * specialist ROLE (e.g. Spine/Warden) and its skill to this run. Merged with
+   * the read-only notice when readOnly is also set. Embedded runner only —
+   * ignored on the subprocess fallback (which has no system-prompt injection).
+   */
+  extraSystemPrompt?: string;
 }): Promise<AgentRunResult> {
   const maxAttempts = 2;
 
@@ -151,8 +158,9 @@ async function runAgentOnce(params: {
   readOnly?: boolean;
   toolsDeny?: string[];
   abortKey?: string;
+  extraSystemPrompt?: string;
 }): Promise<AgentRunResult> {
-  const { api, agentId, sessionId, streaming, readOnly, toolsDeny, abortKey } = params;
+  const { api, agentId, sessionId, streaming, readOnly, toolsDeny, abortKey, extraSystemPrompt } = params;
 
   // Inject current timestamp into every LLM request
   const message = `${buildDateContext()}\n\n${params.message}`;
@@ -166,7 +174,7 @@ async function runAgentOnce(params: {
   // Try embedded runner first (has streaming callbacks)
   if (streaming) {
     try {
-      return await runEmbedded(api, agentId, sessionId, message, timeoutMs, streaming, wdConfig.inactivityMs, readOnly, toolsDeny, abortKey);
+      return await runEmbedded(api, agentId, sessionId, message, timeoutMs, streaming, wdConfig.inactivityMs, readOnly, toolsDeny, abortKey, extraSystemPrompt);
     } catch (err) {
       // Read-only mode MUST NOT fall back to subprocess — subprocess runs a
       // full agent with no way to enforce the tool deny policy.
@@ -226,6 +234,7 @@ async function runEmbedded(
   readOnly?: boolean,
   toolsDeny?: string[],
   abortKey?: string,
+  extraSystemPrompt?: string,
 ): Promise<AgentRunResult> {
   // Load config so we can resolve agent dirs and providers correctly.
   const origConfig = await api.runtime.config.loadConfig();
@@ -315,6 +324,17 @@ async function runEmbedded(
 
   watchdog.start();
 
+  // Compose the extra system prompt: the specialist ROLE brief (if any) plus
+  // the read-only notice (if readOnly). Either, both, or neither may apply.
+  const readOnlyNotice = [
+    "READ-ONLY MODE: You may read and search files but you MUST NOT",
+    "write, edit, create, or delete any files. Do not run shell commands.",
+    "Your only output is your text response.",
+  ].join(" ");
+  const composedSystemPrompt = [extraSystemPrompt, readOnly ? readOnlyNotice : undefined]
+    .filter(Boolean)
+    .join("\n\n");
+
   const result = await api.runtime.agent.runEmbeddedPiAgent({
     sessionId,
     sessionFile,
@@ -330,13 +350,7 @@ async function runEmbedded(
     abortSignal: controller.signal,
     shouldEmitToolResult: () => true,
     shouldEmitToolOutput: () => true,
-    ...(readOnly ? {
-      extraSystemPrompt: [
-        "READ-ONLY MODE: You may read and search files but you MUST NOT",
-        "write, edit, create, or delete any files. Do not run shell commands.",
-        "Your only output is your text response.",
-      ].join(" "),
-    } : {}),
+    ...(composedSystemPrompt ? { extraSystemPrompt: composedSystemPrompt } : {}),
 
     // Stream reasoning/thinking to Linear
     onReasoningStream: (payload) => {
