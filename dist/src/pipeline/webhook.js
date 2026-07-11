@@ -627,7 +627,12 @@ export async function handleLinearWebhook(api, req, res) {
         if (stopSignal === "stop") {
             const stopIdentifier = issue.identifier ?? issue.id;
             api.logger.info(`AgentSession prompted: STOP signal for ${stopIdentifier}`);
+            // Abort in-flight EMBEDDED runs (worker/auditor) — the common case — plus
+            // any tmux-based (codex exec) session. A tmux-only kill misses embedded runs.
+            const { abortRunsFor } = await import("../agent/agent.js");
+            const abortedRuns = abortRunsFor(issue.id);
             const killed = killActiveSession(issue.id);
+            const halted = abortedRuns > 0 || killed;
             activeRuns.delete(issue.id);
             try {
                 await removeActiveDispatch(stopIdentifier, pluginConfig?.dispatchStatePath);
@@ -638,9 +643,9 @@ export async function handleLinearWebhook(api, req, res) {
             if (stopApi) {
                 await stopApi.emitActivity(session.id, {
                     type: "response",
-                    body: killed
-                        ? `🛑 Stopped — halted the running worker and cleared the dispatch for ${stopIdentifier}. Re-assign or comment to start again.`
-                        : `🛑 Stop received for ${stopIdentifier} — no active worker was running; cleared any pending dispatch state.`,
+                    body: halted
+                        ? `🛑 Stopped — halted the running work and cleared the dispatch for ${stopIdentifier}. Re-assign or comment to start again.`
+                        : `🛑 Stop received for ${stopIdentifier} — no active work was running; cleared any pending dispatch state.`,
                 }).catch(() => { });
             }
             return true;
