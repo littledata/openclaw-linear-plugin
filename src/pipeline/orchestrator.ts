@@ -343,6 +343,8 @@ async function runContainerImplement(
     "- container_apply_patch — apply a unified diff in a repo",
     "- container_status — git status of the repos",
     "- container_clone_repo — pull in another repo for cross-repo work",
+    "- container_search_code — AST semantic code search; use it to locate code by concept",
+    "  (\"where is X handled?\") when you don't know exact names — better than grep for discovery.",
     "",
     "## What to do",
     "Implement the change fully, then VERIFY it by running the project's build/tests inside the",

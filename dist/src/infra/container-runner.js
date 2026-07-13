@@ -389,6 +389,33 @@ export function readFileFromContainer(name, filePath) {
     const r = dockerSync(["exec", "-e", `FP=${filePath}`, name, "sh", "-c", 'cat "$FP"'], { timeoutMs: 60_000 });
     return { exitCode: r.status ?? -1, stdout: r.stdout, stderr: r.stderr };
 }
+/**
+ * Shell script for `ccc` semantic code search. Keeps the repo pristine: the
+ * index lives in `.cocoindex_code/` which `ccc` auto-gitignores, and we also add
+ * it to the repo's LOCAL git exclude so it never appears in status/commits even
+ * if `.gitignore` isn't honored. Query + limit arrive via env (never interpolated).
+ */
+const CODE_SEARCH_SCRIPT = [
+    'export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"',
+    'command -v ccc >/dev/null 2>&1 || { echo "ccc (cocoindex-code) is not installed in this container" >&2; exit 127; }',
+    'if [ -d .git ]; then grep -qx ".cocoindex_code/" .git/info/exclude 2>/dev/null || echo ".cocoindex_code/" >> .git/info/exclude; fi',
+    // Incremental index (first run downloads the embedding model + full index).
+    'ccc index >/dev/null 2>&1 || true',
+    'ccc search "$CCC_QUERY" --limit "$CCC_LIMIT"',
+].join("\n");
+/**
+ * Run a CocoIndex semantic code search inside a repo in the container.
+ * @param name - container name
+ * @param repoDir - the in-container repo directory (e.g. /work/<repo>)
+ * @param query - natural-language query
+ * @param limit - max results
+ * @param timeoutMs - max runtime (first index can be slow — model download + full index)
+ * @returns exit code + search results (stdout)
+ */
+export function codeSearchInContainer(name, repoDir, query, limit = 10, timeoutMs = 900_000) {
+    const r = dockerSync(["exec", "-w", repoDir, "-e", `CCC_QUERY=${query}`, "-e", `CCC_LIMIT=${limit}`, name, "sh", "-c", CODE_SEARCH_SCRIPT], { timeoutMs });
+    return { exitCode: r.status ?? -1, stdout: r.stdout, stderr: r.stderr };
+}
 /** Read git status for a repo inside the container. */
 export function containerGitStatus(name, repoName) {
     const r = dockerSync(["exec", "-e", `REPO_DIR=${repoWorkdir(repoName)}`, name, "sh", "-c", GIT_STATUS_SCRIPT]);

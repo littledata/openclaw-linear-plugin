@@ -23,6 +23,7 @@ import {
   execInContainer,
   writeFileToContainer,
   readFileFromContainer,
+  codeSearchInContainer,
   containerGitStatus,
   cloneRepo,
   repoWorkdir,
@@ -228,5 +229,41 @@ export function createContainerTools(api: OpenClawPluginApi, rawCtx: Record<stri
     },
   } as unknown as AnyAgentTool;
 
-  return [execTool, writeTool, readTool, patchTool, statusTool, cloneTool];
+  const searchTool: AnyAgentTool = {
+    name: "container_search_code",
+    label: "Container: semantic code search",
+    description:
+      "AST-aware SEMANTIC code search (CocoIndex) over a repo in this ticket's container. " +
+      "Use it to find code by concept/description when you don't know exact names — it beats grep for " +
+      "'where is X handled?'. Returns matches with file paths and line ranges. The first search in a " +
+      "container is slow (it builds the index once); later searches are fast.",
+    promptSnippet: "container_search_code — semantic (meaning-based) code search over the container's repos",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Natural-language description of the code you're looking for." },
+        repo: { type: "string", description: "Repo name to search (defaults to the ticket's primary repo)." },
+        limit: { type: "number", description: "Max results (default 10)." },
+      },
+      required: ["query"],
+    },
+    execute: async (_id: string, params: { query?: string; repo?: string; limit?: number }) => {
+      const c = resolveContainer(api, ctx);
+      if ("error" in c) return jsonResult({ success: false, error: c.error });
+      if (!params.query) return jsonResult({ success: false, error: "query is required" });
+      const rec = getContainerRecord(c.identifier);
+      const repo = params.repo || rec?.repos?.[0];
+      if (!repo) return jsonResult({ success: false, error: "no repo to search" });
+      const limit = Math.min(Math.max(params.limit ?? 10, 1), 100);
+      api.logger.info(`container_search_code [${c.identifier}] ${repo}: ${params.query.slice(0, 120)}`);
+      const r = codeSearchInContainer(c.containerName, repoWorkdir(repo), params.query, limit);
+      if (r.exitCode === 127) {
+        // ccc not in the image (pre-rebuild) — tell the agent to fall back to grep.
+        return jsonResult({ success: false, error: "semantic search unavailable in this container; use container_exec with rg/grep instead" });
+      }
+      return jsonResult({ success: r.exitCode === 0, results: clip(r.stdout), ...(r.exitCode !== 0 ? { error: clip(r.stderr) } : {}) });
+    },
+  } as unknown as AnyAgentTool;
+
+  return [execTool, writeTool, readTool, patchTool, statusTool, cloneTool, searchTool];
 }
