@@ -7,6 +7,7 @@ import { readDispatchState, getActiveDispatch, registerDispatch, updateDispatchS
 import { createManagedFlowForDispatch } from "./taskflow-bridge.js";
 import { createNotifierFromConfig } from "../infra/notify.js";
 import { assessTier } from "./tier-assess.js";
+import { recommendRepos } from "./recommend-repos.js";
 import { startOrReuseContainer, destroyContainer, stopContainerRun, containerNameForIssue, readGhTokenFromCredentials } from "../infra/container-runner.js";
 import { resolveRepos, getRepoEntries, resolveReposByNames, buildCandidateRepositories, detectMentionedRepos } from "../infra/multi-repo.js";
 import { repoSelectSignal, optionsSignal, RESUME_SELECT } from "./select-signal.js";
@@ -799,7 +800,11 @@ export async function handleLinearWebhook(api, req, res) {
         // ── Interactive repo selection: resume a parked dispatch on the user's reply ──
         const pendingRepoSel = getPendingRepoSelection(issue.id);
         if (pendingRepoSel) {
-            const selected = parseRepoSelection(userMessage, pendingRepoSel.candidates);
+            // Numbers map to the displayed shortlist; names may be ANY configured repo
+            // (so a narrowed picker never traps a free-text reply for an off-list repo).
+            const allConfigured = Object.keys(getRepoEntries(api.pluginConfig));
+            const parseCandidates = [...new Set([...pendingRepoSel.candidates, ...allConfigured])];
+            const selected = parseRepoSelection(userMessage, parseCandidates);
             if (selected.length === 0) {
                 const listText = pendingRepoSel.candidates.map((c, i) => `${i + 1}. ${c}`).join("\n");
                 await linearApi.emitActivity(session.id, {
@@ -2117,12 +2122,13 @@ async function handleDispatch(api, linearApi, issue, opts) {
     else {
         repoResolution = resolveRepos(enrichedIssue.description, labels, pluginConfig, dispatchTeamKey);
         api.logger.info(`@dispatch: ${identifier} team=${dispatchTeamKey ?? "none"} repos=${repoResolution.repos.map(r => r.name).join(",")} source=${repoResolution.source}`);
-        // Rescue the silent config-default: markers/labels/team-mapping gave us
-        // nothing, so we'd fall back to codexBaseRepo (e.g. TMv2). But the issue
-        // body + comments often NAME the right repo ("the bug is in ld-shopify").
-        // If exactly one configured repo is explicitly mentioned, use it instead of
-        // blindly defaulting. Ambiguous (>1) or none → leave the default / ask.
+        // Config-default means nothing pinned the repo (no marker/label/team-mapping).
+        // We NEVER silently fall back to codexBaseRepo/TMv2. If the text names exactly
+        // one configured repo, use it; otherwise ask the model which repo(s) this
+        // concerns and ALWAYS present a picker led by that recommendation.
         let mentionShortlist = [];
+        let recoOrder = []; // LLM-ranked repos, most relevant first
+        let recoReasoning = "";
         if (repoResolution.source === "config_default") {
             try {
                 const repoNames = Object.keys(getRepoEntries(pluginConfig));
@@ -2134,23 +2140,38 @@ async function handleDispatch(api, linearApi, issue, opts) {
                     repoResolution = resolveReposByNames(mentioned, pluginConfig);
                     api.logger.info(`@dispatch: ${identifier} repos=${mentioned[0]} source=text_mention (rescued from config_default)`);
                 }
-                else if (mentioned.length > 1) {
-                    // Ambiguous but constrained: keep config_default so we ASK, but narrow the
-                    // options to the repos actually named in the text.
+                else {
+                    // Ambiguous (0 or >1 exact mentions) → ask the model to recommend, then ask
+                    // the user. Never dispatch a blind default.
                     mentionShortlist = mentioned;
-                    api.logger.info(`@dispatch: ${identifier} text mentions multiple repos (${mentioned.join(",")}) — asking, shortlist=${mentioned.join(",")}`);
+                    const reco = await recommendRepos(api, {
+                        identifier,
+                        title: enrichedIssue.title ?? "",
+                        description: enrichedIssue.description,
+                        context: commentText,
+                        repoNames,
+                    }).catch(() => ({ repos: [], reasoning: "" }));
+                    recoOrder = reco.repos;
+                    recoReasoning = reco.reasoning;
+                    api.logger.info(`@dispatch: ${identifier} config_default ambiguous — reco=[${recoOrder.join(",")}] mentions=[${mentioned.join(",")}]`);
                 }
             }
             catch (err) {
                 api.logger.warn(`@dispatch: ${identifier} repo mention-detection failed: ${err}`);
             }
         }
-        // Interactive repo selection: if enabled and the repo is ambiguous, ask the
-        // user which repo(s) to use and park the dispatch until they reply.
-        if (shouldAskRepoSelection(repoResolution, pluginConfig)) {
-            // Prefer the text-mention shortlist when we have one — a 2-3 option prompt is
-            // far more usable than the full configured-repo list.
-            let candidates = mentionShortlist.length ? mentionShortlist : Object.keys(getRepoEntries(pluginConfig));
+        // Interactive repo selection. We ask when config-default couldn't resolve to a
+        // single repo (so we never default to TMv2), or when the configured mode asks.
+        const configuredRepoNames = Object.keys(getRepoEntries(pluginConfig));
+        const mustAskRepo = shouldAskRepoSelection(repoResolution, pluginConfig) ||
+            (repoResolution.source === "config_default" && configuredRepoNames.length >= 2);
+        if (mustAskRepo) {
+            // Lead the picker with the model's recommendation, then any text mentions,
+            // then the rest — a focused prompt beats a 69-option dump, and free-text still
+            // accepts any configured repo. When we have no signal, fall back to the full list.
+            const preferred = [...recoOrder, ...mentionShortlist].filter((v, i, a) => a.indexOf(v) === i && configuredRepoNames.includes(v));
+            let candidates = preferred.length ? preferred : configuredRepoNames;
+            let recommended = recoOrder[0] ?? mentionShortlist[0];
             let selectionSessionId = opts?.existingSessionId;
             if (!selectionSessionId) {
                 try {
@@ -2161,40 +2182,39 @@ async function handleDispatch(api, linearApi, issue, opts) {
                     api.logger.warn(`@dispatch: could not create session for repo selection: ${err}`);
                 }
             }
-            // Rank candidates by Linear's ML repository suggestions (best-effort): repos
-            // with a configured GitHub identity get ordered most-relevant-first and the
-            // top pick is flagged as recommended. Degrades to config order when no repos
-            // have `github` set or the API is unavailable. We still ASK — this only
-            // sharpens the options, it never auto-selects.
-            let recommended;
-            try {
-                const candRepos = buildCandidateRepositories(pluginConfig);
-                if (selectionSessionId && candRepos.length) {
-                    const suggestions = await linearApi.getRepositorySuggestions(issue.id, selectionSessionId, candRepos);
-                    if (suggestions.length) {
-                        const nameByGithub = new Map();
-                        for (const [name, e] of Object.entries(getRepoEntries(pluginConfig))) {
-                            if (e.github)
-                                nameByGithub.set(e.github, name);
-                        }
-                        const ranked = suggestions
-                            .map((s) => nameByGithub.get(s.repositoryFullName))
-                            .filter((n) => typeof n === "string" && candidates.includes(n));
-                        if (ranked.length) {
-                            recommended = ranked[0];
-                            candidates = [...ranked, ...candidates.filter((c) => !ranked.includes(c))];
-                            api.logger.info(`@dispatch: ${identifier} repo suggestions → recommended=${recommended}`);
+            // No model recommendation? Fall back to Linear's ML repository suggestions
+            // (best-effort) to order the list + flag a recommended pick.
+            if (!recommended) {
+                try {
+                    const candRepos = buildCandidateRepositories(pluginConfig);
+                    if (selectionSessionId && candRepos.length) {
+                        const suggestions = await linearApi.getRepositorySuggestions(issue.id, selectionSessionId, candRepos);
+                        if (suggestions.length) {
+                            const nameByGithub = new Map();
+                            for (const [name, e] of Object.entries(getRepoEntries(pluginConfig))) {
+                                if (e.github)
+                                    nameByGithub.set(e.github, name);
+                            }
+                            const ranked = suggestions
+                                .map((s) => nameByGithub.get(s.repositoryFullName))
+                                .filter((n) => typeof n === "string" && candidates.includes(n));
+                            if (ranked.length) {
+                                recommended = ranked[0];
+                                candidates = [...ranked, ...candidates.filter((c) => !ranked.includes(c))];
+                                api.logger.info(`@dispatch: ${identifier} repo suggestions → recommended=${recommended}`);
+                            }
                         }
                     }
                 }
-            }
-            catch (err) {
-                api.logger.warn(`@dispatch: ${identifier} repo suggestions failed: ${err}`);
+                catch (err) {
+                    api.logger.warn(`@dispatch: ${identifier} repo suggestions failed: ${err}`);
+                }
             }
             const listText = candidates
                 .map((c, i) => `${i + 1}. ${c}${c === recommended ? " _(recommended)_" : ""}`)
                 .join("\n");
-            const promptBody = `Which repository should I work on for **${identifier}**? Tap an option below, or reply with the number(s)/name(s) (comma-separated), or "all".\n\n${listText}`;
+            const reasoningLine = recoReasoning ? `\n\n🧭 ${recoReasoning}` : "";
+            const promptBody = `Which repository should I work on for **${identifier}**?${reasoningLine}\n\nTap an option below, or reply with the number(s)/name(s) (comma-separated), or "all".\n\n${listText}`;
             if (selectionSessionId) {
                 await linearApi.emitActivity(selectionSessionId, { type: "elicitation", body: promptBody }, repoSelectSignal(candidates)).catch(() => { });
             }
