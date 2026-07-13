@@ -18,6 +18,10 @@
  * The orchestrator moves the ticket only when the agent reports its work is
  * complete; any failure leaves the ticket where it is.
  */
+/** True when a state plan contains reviewers only and must skip implementation preflight. */
+export function isReviewOnlyPlan(plan) {
+    return !!plan?.phases.length && plan.phases.every((phase) => phase.type === "review");
+}
 // ---------------------------------------------------------------------------
 // Built-in default plans
 // ---------------------------------------------------------------------------

@@ -18,6 +18,10 @@ export interface ResumeState {
   agentSessionId?: string;
   /** Full prior-work transcript, fed to the resume-analysis step. */
   fullContext: string;
+  /** Repositories inferred by the LLM before the resume prompt is shown. */
+  analyzedRepos?: string[];
+  /** LLM-authored semantic understanding shown in the resume prompt and reused as guidance. */
+  analyzedBrief?: string;
   createdAt: string;
 }
 

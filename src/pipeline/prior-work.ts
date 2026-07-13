@@ -158,27 +158,40 @@ export async function gatherPriorWork(
   if (prUrls.size) summaryParts.push(`\n**PRs:** ${[...prUrls].join(", ")}`);
 
   // ---- Full context (resume-analysis agent) ----
+  // Put durable issue comments FIRST and reserve space for both explicit plans
+  // and the latest steering. The previous layout appended comments after up to
+  // six large session feeds and then sliced the combined string, which could
+  // remove the very ticket discussion the model needed to understand.
   const ctxParts: string[] = [];
+  if (comments.length) {
+    const planLike = comments.filter((c) =>
+      /\b(apex plan|implementation plan|plan:|root cause|acceptance criteria|recommended fix)\b/i.test(c.body),
+    );
+    const recent = comments.slice(-16);
+    const selectedSet = new Set([...planLike.slice(-8), ...recent]);
+    const selected = comments.filter((comment) => selectedSet.has(comment));
+    const commentText = selected
+      .map((c) => `[${c.author ?? "note"}] ${c.body.slice(0, 1200)}`)
+      .join("\n\n")
+      .slice(0, 16_000);
+    ctxParts.push(`## Issue comments (authoritative plans and steering)\n${commentText}`, "");
+  }
+
+  const sessionParts: string[] = [];
   sessions.slice(0, 6).forEach((s, i) => {
-    ctxParts.push(`## Prior session ${sessions.length - i} (${s.createdAt}, status=${s.status ?? "?"})`);
-    if (s.plan) ctxParts.push(`Plan:\n${String(s.plan).slice(0, 1500)}`);
-    if (s.summary) ctxParts.push(`Summary:\n${String(s.summary).slice(0, 1000)}`);
-    if (s.pullRequests.length) ctxParts.push(`PRs: ${s.pullRequests.map((p) => p.url).join(", ")}`);
+    sessionParts.push(`## Prior session ${sessions.length - i} (${s.createdAt}, status=${s.status ?? "?"})`);
+    if (s.plan) sessionParts.push(`Plan:\n${String(s.plan).slice(0, 1500)}`);
+    if (s.summary) sessionParts.push(`Summary:\n${String(s.summary).slice(0, 1000)}`);
+    if (s.pullRequests.length) sessionParts.push(`PRs: ${s.pullRequests.map((p) => p.url).join(", ")}`);
     const feed = s.activities
       .map((a) => activityText(a.content))
       .filter(Boolean)
-      .slice(-25)
+      .slice(-12)
       .join("\n");
-    if (feed) ctxParts.push(`Activity:\n${feed.slice(0, 2500)}`);
-    ctxParts.push("");
+    if (feed) sessionParts.push(`Activity:\n${feed.slice(0, 1200)}`);
+    sessionParts.push("");
   });
-  if (comments.length) {
-    ctxParts.push("## Issue comments (plan, verdicts, and user steering)");
-    for (const c of comments.slice(-15)) {
-      ctxParts.push(`[${c.author ?? "note"}] ${c.body.slice(0, 800)}`);
-    }
-    ctxParts.push("");
-  }
+  if (sessionParts.length) ctxParts.push(sessionParts.join("\n").slice(0, 8_000));
   if (clawSummary) ctxParts.push(`## Local worktree artifacts\n${clawSummary.slice(0, 3000)}`);
 
   return {
@@ -186,7 +199,7 @@ export async function gatherPriorWork(
     sessionCount: sessions.length,
     commentCount: comments.length,
     summary: summaryParts.join("\n\n") || "(no readable prior activity)",
-    fullContext: ctxParts.join("\n").slice(0, 12000),
+    fullContext: ctxParts.join("\n").slice(0, 27_000),
     pullRequestUrls: [...prUrls],
   };
 }
@@ -230,6 +243,9 @@ export async function analyzeResume(
     "   " + repoNames.join(", "),
     "2. Write a concise continuation brief: what was already done, what remains, and",
     "   how to finish — so the implementer picks up rather than restarting.",
+    "   SYNTHESIZE the history into your own understanding. Do not quote a truncated",
+    "   list of comments. Treat explicit plans and the user's latest steering as",
+    "   authoritative, and do not ask questions already answered in that history.",
     "",
     `Issue ${issue.identifier}: ${issue.title}`,
     issue.description ? `Description:\n${String(issue.description).slice(0, 1500)}` : "",

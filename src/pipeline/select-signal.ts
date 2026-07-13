@@ -27,10 +27,18 @@ const ALL_OPTION: SelectOption = { label: "All of them", value: "all" };
  * Build select options for a repo-selection elicitation: one per candidate
  * (label === value === repo name) plus an "all" option when there's a choice.
  * @param candidates - repo names in the order they're presented to the user
+ * @param recommended - candidate names whose labels should be marked recommended
  * @returns a select signal, or undefined when there are no candidates
  */
-export function repoSelectSignal(candidates: string[]): SelectSignal | undefined {
-  const options: SelectOption[] = candidates.map((c) => ({ label: c, value: c }));
+export function repoSelectSignal(
+  candidates: string[],
+  recommended: Iterable<string> = [],
+): SelectSignal | undefined {
+  const recommendedSet = new Set(recommended);
+  const options: SelectOption[] = candidates.map((c) => ({
+    label: recommendedSet.has(c) ? `${c} (recommended)` : c,
+    value: c,
+  }));
   if (!options.length) return undefined;
   if (candidates.length > 1) options.push(ALL_OPTION);
   return { signal: "select", signalMetadata: { options } };

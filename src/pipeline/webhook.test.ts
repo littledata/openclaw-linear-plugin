@@ -40,6 +40,7 @@ const {
   createMultiWorktreeMock,
   prepareWorkspaceMock,
   startOrReuseContainerMock,
+  checkoutPullRequestInContainerMock,
   resolveReposMock,
   isMultiRepoMock,
   ensureClawDirMock,
@@ -78,6 +79,7 @@ const {
     createSessionOnIssue: vi.fn().mockResolvedValue({ sessionId: "sess-new" }),
     updateIssue: vi.fn().mockResolvedValue(undefined),
     getRecentComments: vi.fn().mockResolvedValue([]),
+    listAgentSessions: vi.fn().mockResolvedValue([]),
     getTeamLabels: vi.fn().mockResolvedValue([]),
     getTeamStates: vi.fn().mockResolvedValue([
       { id: "st-1", name: "Backlog", type: "backlog" },
@@ -120,6 +122,7 @@ const {
   createMultiWorktreeMock: vi.fn().mockReturnValue({ parentPath: "/tmp/multi", worktrees: [] }),
   prepareWorkspaceMock: vi.fn().mockReturnValue({ pulled: true, submodulesInitialized: false, errors: [] }),
   startOrReuseContainerMock: vi.fn().mockReturnValue({ name: "openclaw-linear-ENG-123", reused: false }),
+  checkoutPullRequestInContainerMock: vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" }),
   resolveReposMock: vi.fn().mockReturnValue({ repos: [{ name: "main", path: "/home/claw/ai-workspace" }], source: "config_default" }),
   isMultiRepoMock: vi.fn().mockReturnValue(false),
   ensureClawDirMock: vi.fn(),
@@ -221,6 +224,7 @@ vi.mock("../infra/container-runner.js", () => ({
   stopContainerRun: vi.fn().mockReturnValue(false),
   containerNameForIssue: (id: string) => `openclaw-linear-${id}`,
   readGhTokenFromCredentials: vi.fn().mockReturnValue("ght_test"),
+  checkoutPullRequestInContainer: checkoutPullRequestInContainerMock,
 }));
 
 vi.mock("../infra/container-registry.js", () => ({
@@ -236,8 +240,22 @@ vi.mock("./orchestrator.js", () => ({
 vi.mock("../infra/multi-repo.js", () => ({
   resolveRepos: resolveReposMock,
   isMultiRepo: isMultiRepoMock,
-  getRepoEntries: vi.fn().mockReturnValue({}),
-  resolveReposByNames: vi.fn().mockReturnValue({ repos: [{ name: "main", path: "/home/claw/ai-workspace" }], source: "repo_selection" }),
+  getRepoEntries: vi.fn((config?: Record<string, any>) => {
+    const repos = config?.repos ?? {};
+    return Object.fromEntries(Object.entries(repos).map(([name, value]) => [
+      name,
+      typeof value === "string" ? { path: value } : value,
+    ]));
+  }),
+  resolveReposByNames: vi.fn((names: string[], config?: Record<string, any>) => ({
+    repos: names.map((name) => ({
+      name,
+      path: typeof config?.repos?.[name] === "string"
+        ? config.repos[name]
+        : config?.repos?.[name]?.path ?? `/home/claw/repos/${name}`,
+    })),
+    source: "repo_selection",
+  })),
   buildCandidateRepositories: vi.fn().mockReturnValue([]),
   detectMentionedRepos: vi.fn().mockReturnValue([]),
 }));
@@ -289,7 +307,7 @@ import {
   _markAsProcessedForTesting,
 } from "./webhook.js";
 
-function createApi(): OpenClawPluginApi {
+function createApi(pluginConfig: Record<string, unknown> = {}): OpenClawPluginApi {
   return {
     logger: {
       info: vi.fn(),
@@ -298,7 +316,7 @@ function createApi(): OpenClawPluginApi {
       debug: vi.fn(),
     },
     runtime: {},
-    pluginConfig: {},
+    pluginConfig,
   } as unknown as OpenClawPluginApi;
 }
 
@@ -321,8 +339,12 @@ async function withServer(
   }
 }
 
-async function postWebhook(payload: unknown, path = "/linear/webhook") {
-  const api = createApi();
+async function postWebhook(
+  payload: unknown,
+  path = "/linear/webhook",
+  pluginConfig: Record<string, unknown> = {},
+) {
+  const api = createApi(pluginConfig);
   let status = 0;
   let body = "";
   // Track when the handler finishes (important: handleLinearWebhook does
@@ -372,6 +394,8 @@ afterEach(() => {
   mockLinearApiInstance.emitActivity.mockReset().mockResolvedValue(undefined);
   mockLinearApiInstance.createComment.mockReset().mockResolvedValue("comment-id");
   mockLinearApiInstance.getIssueDetails.mockReset().mockResolvedValue(null);
+  mockLinearApiInstance.getRecentComments.mockReset().mockResolvedValue([]);
+  mockLinearApiInstance.listAgentSessions.mockReset().mockResolvedValue([]);
   mockLinearApiInstance.getViewerId.mockReset().mockResolvedValue("viewer-1");
   mockLinearApiInstance.createSessionOnIssue.mockReset().mockResolvedValue({ sessionId: "sess-new" });
   mockLinearApiInstance.updateIssue.mockReset().mockResolvedValue(undefined);
@@ -418,6 +442,7 @@ afterEach(() => {
   createWorktreeMock.mockReset().mockReturnValue({ path: "/tmp/worktree", branch: "codex/ENG-123", resumed: false });
   prepareWorkspaceMock.mockReset().mockReturnValue({ pulled: true, submodulesInitialized: false, errors: [] });
   startOrReuseContainerMock.mockReset().mockReturnValue({ name: "openclaw-linear-ENG-123", reused: false });
+  checkoutPullRequestInContainerMock.mockReset().mockReturnValue({ status: 0, stdout: "", stderr: "" });
   resolveReposMock.mockReset().mockReturnValue({ repos: [{ name: "main", path: "/home/claw/ai-workspace" }], source: "config_default" });
   isMultiRepoMock.mockReset().mockReturnValue(false);
   ensureClawDirMock.mockReset();
@@ -2462,6 +2487,85 @@ describe("handleCloseIssue via close_issue intent", () => {
 // ---------------------------------------------------------------------------
 
 describe("handleDispatch via Issue.update assignment", () => {
+  it("enters review directly and checks out the attached PR without resume, repo selection, or grilling", async () => {
+    const pullRequestUrl = "https://github.com/littledata/ld-shopify/pull/1740";
+    const pluginConfig = {
+      orchestrationMode: "stateplan",
+      repoSelectionMode: "always",
+      grillMode: "on",
+      repos: {
+        "ld-shopify": {
+          path: "/root/repos/ld-shopify",
+          github: "littledata/ld-shopify",
+        },
+        "transaction-monitor-2": {
+          path: "/root/repos/transaction-monitor-2",
+          github: "littledata/transaction-monitor-2",
+        },
+      },
+    };
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: "issue-review",
+      identifier: "CORE-1740",
+      title: "Disabled Events Per Market",
+      description: "Existing implementation is ready for review.",
+      state: { name: "In Code Review", type: "started" },
+      team: { id: "team-review" },
+      labels: { nodes: [] },
+      comments: { nodes: [] },
+      attachments: {
+        nodes: [{ url: pullRequestUrl, title: "CORE-1740/Disabled-Events-Per-Market", sourceType: "github" }],
+      },
+      project: null,
+    });
+    mockLinearApiInstance.listAgentSessions.mockResolvedValue([{
+      id: "session-old",
+      createdAt: "2026-07-13T10:00:00.000Z",
+      updatedAt: "2026-07-13T10:30:00.000Z",
+      plan: "Existing Apex implementation plan",
+      pullRequests: [{ url: pullRequestUrl, title: "CORE-1740/Disabled-Events-Per-Market" }],
+      activities: [],
+    }]);
+    mockLinearApiInstance.getRecentComments.mockResolvedValue([{
+      body: "## Apex plan\nThe implementation plan is already complete.",
+    }]);
+
+    const result = await postWebhook({
+      type: "Issue",
+      action: "update",
+      data: {
+        id: "issue-review",
+        identifier: "CORE-1740",
+        assigneeId: "viewer-1",
+      },
+      updatedFrom: { assigneeId: null },
+    }, "/linear/webhook", pluginConfig);
+
+    expect(result.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    expect(startOrReuseContainerMock).toHaveBeenCalled();
+    expect(checkoutPullRequestInContainerMock).toHaveBeenCalledWith(
+      "openclaw-linear-ENG-123",
+      "ld-shopify",
+      pullRequestUrl,
+      1740,
+    );
+    expect(runStatePlanMock).toHaveBeenCalledOnce();
+    const [, registeredDispatch] = registerDispatchMock.mock.calls[0];
+    const [, , plan] = runStatePlanMock.mock.calls[0];
+    expect(registeredDispatch.containerRepos).toEqual(["ld-shopify"]);
+    expect(registeredDispatch.reviewPullRequests).toEqual([
+      expect.objectContaining({ repoName: "ld-shopify", url: pullRequestUrl, number: 1740 }),
+    ]);
+    expect(plan.stateLabel).toContain("code-review");
+    expect(plan.phases.every((phase: { type: string }) => phase.type === "review")).toBe(true);
+    expect(runAgentMock).not.toHaveBeenCalled();
+    expect(
+      mockLinearApiInstance.emitActivity.mock.calls.some(([, activity]: any[]) => activity?.type === "elicitation"),
+    ).toBe(false);
+  });
+
   it("registers dispatch and spawns worker pipeline", async () => {
     mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
     mockLinearApiInstance.getIssueDetails.mockResolvedValue({

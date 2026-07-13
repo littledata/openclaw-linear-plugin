@@ -126,6 +126,11 @@ describe("parseReviewVerdict", () => {
     const v = parseReviewVerdict("REVIEW: fail — early\n...\nREVIEW: pass", "REVIEW");
     expect(v.pass).toBe(true);
   });
+  it("accepts common structured verdict variants", () => {
+    expect(parseReviewVerdict("**REVIEW VERDICT:** pass", "REVIEW").pass).toBe(true);
+    expect(parseReviewVerdict('{"verdict":"fail"}', "REVIEW").pass).toBe(false);
+    expect(parseReviewVerdict("`Verdict: pass`", "REVIEW").pass).toBe(true);
+  });
   it("defaults to FAIL when no verdict line is present", () => {
     const v = parseReviewVerdict("I reviewed it and it seems fine", "SECURITY");
     expect(v.pass).toBe(false);

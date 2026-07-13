@@ -66,6 +66,13 @@ export interface ActiveDispatch {
   // container at /work/<repo>.
   containerName?: string;       // deterministic per-issue docker container
   containerRepos?: string[];    // target repo names cloned writable in the container
+  reviewPullRequests?: Array<{  // exact PR heads prepared for review-only states
+    url: string;
+    title?: string | null;
+    repoName: string;
+    repository: string;
+    number: number;
+  }>;
 
   // OpenClaw 2026.4 task-flow integration. Populated when the plugin
   // successfully calls `api.runtime.taskFlow.bindSession(...).createManaged`.

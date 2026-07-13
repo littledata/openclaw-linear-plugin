@@ -134,6 +134,12 @@ export const CLONE_ONE_SCRIPT = [
     '  git -C "/work/$REPO" checkout -B "$BRANCH"',
     "fi",
 ].join("\n");
+/** Fetch and check out the exact head of a linked GitHub PR for read-only review. */
+export const CHECKOUT_PR_SCRIPT = [
+    "set -eu",
+    'git -C "$REPO_DIR" fetch --force "$REMOTE_URL" "pull/$PR_NUMBER/head"',
+    'git -C "$REPO_DIR" checkout -B "review/pr-$PR_NUMBER" FETCH_HEAD',
+].join("\n");
 /**
  * Build the in-container codex command string (values are trusted: config/derived).
  * `--skip-git-repo-check` lets `-C /work` (the multi-repo parent, not itself a git
@@ -340,6 +346,26 @@ export function provisionRepos(name, repos, branch, logger) {
 /** Clone one more repo into a warm container on demand (cross-repo). */
 export function cloneRepo(name, repo, branch) {
     return dockerSync(["exec", "-e", `REPO=${repo}`, "-e", `BRANCH=${branch}`, name, "sh", "-c", CLONE_ONE_SCRIPT], { timeoutMs: 120_000 });
+}
+/**
+ * Check out a linked GitHub PR head in an already-provisioned repo.
+ * The PR URL and number are passed through environment variables, never shell
+ * interpolation. Returns a normal Docker command result for explicit gating.
+ */
+export function checkoutPullRequestInContainer(name, repo, pullRequestUrl, pullRequestNumber) {
+    const match = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/\d+(?:[/?#].*)?$/i.exec(pullRequestUrl.trim());
+    if (!match || !Number.isInteger(pullRequestNumber) || pullRequestNumber < 1) {
+        return { status: 2, stdout: "", stderr: `invalid GitHub pull request: ${pullRequestUrl}` };
+    }
+    const remoteUrl = `https://github.com/${match[1]}/${match[2].replace(/\.git$/i, "")}.git`;
+    return dockerSync([
+        "exec",
+        "-e", `REPO_DIR=${repoWorkdir(repo)}`,
+        "-e", `REMOTE_URL=${remoteUrl}`,
+        "-e", `PR_NUMBER=${pullRequestNumber}`,
+        name,
+        "sh", "-c", CHECKOUT_PR_SCRIPT,
+    ], { timeoutMs: 120_000 });
 }
 /**
  * Run an arbitrary shell command inside the container and capture its output.

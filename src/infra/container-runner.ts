@@ -157,6 +157,13 @@ export const CLONE_ONE_SCRIPT = [
   "fi",
 ].join("\n");
 
+/** Fetch and check out the exact head of a linked GitHub PR for read-only review. */
+export const CHECKOUT_PR_SCRIPT = [
+  "set -eu",
+  'git -C "$REPO_DIR" fetch --force "$REMOTE_URL" "pull/$PR_NUMBER/head"',
+  'git -C "$REPO_DIR" checkout -B "review/pr-$PR_NUMBER" FETCH_HEAD',
+].join("\n");
+
 /**
  * Build the in-container codex command string (values are trusted: config/derived).
  * `--skip-git-repo-check` lets `-C /work` (the multi-repo parent, not itself a git
@@ -420,6 +427,35 @@ export function provisionRepos(
 export function cloneRepo(name: string, repo: string, branch: string): DockerResult {
   return dockerSync(
     ["exec", "-e", `REPO=${repo}`, "-e", `BRANCH=${branch}`, name, "sh", "-c", CLONE_ONE_SCRIPT],
+    { timeoutMs: 120_000 },
+  );
+}
+
+/**
+ * Check out a linked GitHub PR head in an already-provisioned repo.
+ * The PR URL and number are passed through environment variables, never shell
+ * interpolation. Returns a normal Docker command result for explicit gating.
+ */
+export function checkoutPullRequestInContainer(
+  name: string,
+  repo: string,
+  pullRequestUrl: string,
+  pullRequestNumber: number,
+): DockerResult {
+  const match = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/\d+(?:[/?#].*)?$/i.exec(pullRequestUrl.trim());
+  if (!match || !Number.isInteger(pullRequestNumber) || pullRequestNumber < 1) {
+    return { status: 2, stdout: "", stderr: `invalid GitHub pull request: ${pullRequestUrl}` };
+  }
+  const remoteUrl = `https://github.com/${match[1]}/${match[2].replace(/\.git$/i, "")}.git`;
+  return dockerSync(
+    [
+      "exec",
+      "-e", `REPO_DIR=${repoWorkdir(repo)}`,
+      "-e", `REMOTE_URL=${remoteUrl}`,
+      "-e", `PR_NUMBER=${pullRequestNumber}`,
+      name,
+      "sh", "-c", CHECKOUT_PR_SCRIPT,
+    ],
     { timeoutMs: 120_000 },
   );
 }

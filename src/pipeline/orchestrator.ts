@@ -43,6 +43,7 @@ import {
   roleToolsDeny,
   type RoleDef,
   type RoleKind,
+  type ReviewVerdict,
 } from "./roles.js";
 import { resolveTargetState, type StatePlan, type PlanPhase } from "./state-plan.js";
 import { isCancelled, clearCancel } from "./cancellation.js";
@@ -132,7 +133,12 @@ function buildRoleTask(issue: OrchIssue, dispatch: ActiveDispatch, extra?: strin
   return [
     `Linear issue ${issue.identifier}: ${issue.title}`,
     issue.description ? `\nIssue body:\n${issue.description}` : "",
-    `\nRepositories (edit + commit here; you may clone others from /repos-ro):\n${workspace}`,
+    `\nRepositories prepared in the ticket container:\n${workspace}`,
+    dispatch.reviewPullRequests?.length
+      ? `\nLinked pull request(s) — these exact diffs are authoritative:\n${dispatch.reviewPullRequests
+          .map((pr) => `- ${pr.repoName}: ${pr.url}`)
+          .join("\n")}`
+      : "",
     dispatch.grillGuidance ? `\nClarified requirements:\n${dispatch.grillGuidance}` : "",
     extra ? `\n${extra}` : "",
   ]
@@ -441,16 +447,14 @@ async function runImplementPhase(
     // Apex self-review — read-only, gates the phase.
     if (isCancelled(dispatch.issueId)) return { success: false, reason: "halted" };
     setStatus(dispatch, "reviewing");
-    const review = await runRole(
+    const verdict = await runStructuredReview(
       ctx,
       dispatch,
+      issue,
       ROLES.apex,
-      "review",
       "Self-review the implemented work against the issue's acceptance criteria. " +
         "Confirm the code is complete and the tests pass. This is the gate before code review.",
-      issue,
     );
-    const verdict = parseReviewVerdict(review.output, "REVIEW");
     if (verdict.pass) {
       await openPr(ctx, dispatch, issue);
       return { success: true };
@@ -549,16 +553,77 @@ async function openPr(ctx: HookContext, dispatch: ActiveDispatch, issue: OrchIss
 // ---------------------------------------------------------------------------
 
 function reviewFocus(role: RoleDef): string {
+  const prInstruction =
+    "Review the exact linked pull request head already checked out in the ticket container. " +
+    "Use container_read_file, container_search_code, and read-only container_exec commands " +
+    "to inspect the PR diff and run checks. Do not edit, commit, push, or open a PR. ";
   switch (role.id) {
     case "warden":
-      return "Audit this change for security issues: authz/authn, secrets, injection, unsafe deserialization, and supply-chain risk.";
+      return prInstruction + "Audit this change for security issues: authz/authn, secrets, injection, unsafe deserialization, and supply-chain risk.";
     case "proof":
-      return "QA this change against the issue's acceptance criteria. Run the test suite. Check edge cases and regressions.";
+      return prInstruction + "QA this change against the issue's acceptance criteria. Run the test suite. Check edge cases and regressions.";
     case "apex":
-      return "Code-review this change for correctness, design, and adherence to project conventions.";
+      return prInstruction + "Code-review this change for correctness, design, and adherence to project conventions.";
     default:
-      return "Review this change.";
+      return prInstruction + "Review this change.";
   }
+}
+
+/**
+ * Run a reviewer and obtain a structured verdict. A backend/tool failure is
+ * surfaced directly. If the review is substantive but omitted the required
+ * verdict syntax, the same reviewer gets one format-correction turn instead of
+ * sending the implementation back through meaningless rework.
+ */
+async function runStructuredReview(
+  ctx: HookContext,
+  dispatch: ActiveDispatch,
+  issue: OrchIssue,
+  role: RoleDef,
+  focus: string,
+): Promise<ReviewVerdict> {
+  const tag = role.verdictTag ?? "REVIEW";
+  const review = await runRole(ctx, dispatch, role, "review", focus, issue);
+  if (!review.success) {
+    const detail = review.output.trim().slice(-500);
+    return {
+      pass: false,
+      reason: `${role.label} review agent failed${detail ? `: ${detail}` : " without output"}`,
+    };
+  }
+
+  const verdict = parseReviewVerdict(review.output, tag);
+  if (!verdict.reason.startsWith(`no ${tag} verdict`)) return verdict;
+
+  const correction = await runRole(
+    ctx,
+    dispatch,
+    role,
+    "review",
+    [
+      "Your review completed, but its verdict format was missing or invalid.",
+      "Do not repeat the review. Based on your conclusion below, respond with ONLY:",
+      `${tag}: pass`,
+      `or ${tag}: fail — <one-line reason>`,
+      "",
+      review.output.slice(-4_000),
+    ].join("\n"),
+    issue,
+  );
+  if (!correction.success) {
+    const detail = correction.output.trim().slice(-500);
+    return {
+      pass: false,
+      reason: `${role.label} verdict-format retry failed${detail ? `: ${detail}` : " without output"}`,
+    };
+  }
+  const corrected = parseReviewVerdict(correction.output, tag);
+  if (!corrected.reason.startsWith(`no ${tag} verdict`)) return corrected;
+  const preview = review.output.trim().replace(/\s+/g, " ").slice(-500);
+  return {
+    pass: false,
+    reason: `${role.label} review completed without a structured verdict${preview ? `; output: ${preview}` : ""}`,
+  };
 }
 
 /**
@@ -577,9 +642,7 @@ async function runReviewPhase(
   role: RoleDef,
   gate: boolean,
 ): Promise<{ success: boolean; reason?: string }> {
-  const tag = role.verdictTag ?? "REVIEW";
-  const { output } = await runRole(ctx, dispatch, role, "review", reviewFocus(role), issue);
-  const verdict = parseReviewVerdict(output, tag);
+  const verdict = await runStructuredReview(ctx, dispatch, issue, role, reviewFocus(role));
   emit(ctx, dispatch, {
     type: "thought",
     body: `${verdict.pass ? "✅" : "❌"} ${role.label} review — ${verdict.pass ? "pass" : "fail"}: ${verdict.reason}`,

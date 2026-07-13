@@ -259,8 +259,12 @@ export function buildRolePrompt(role, opts) {
  * @returns the parsed verdict (pass=false when absent/unparseable)
  */
 export function parseReviewVerdict(output, tag) {
-    const re = new RegExp(`${tag}\\s*:\\s*(pass|fail)\\b[^\\n]*`, "gi");
-    const matches = output.match(re);
+    const escapedTag = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // Strip common markdown/JSON punctuation so these all parse equivalently:
+    // REVIEW: pass, **REVIEW VERDICT:** pass, `Verdict: pass`, {"verdict":"pass"}.
+    const normalized = output.replace(/[`*_\"]/g, "");
+    const re = new RegExp(`(?:${escapedTag}(?:\\s+VERDICT)?|VERDICT)\\s*[:=]\\s*(pass|fail)\\b[^\\n}]*`, "gi");
+    const matches = normalized.match(re);
     if (!matches?.length) {
         return { pass: false, reason: `no ${tag} verdict line found in review output` };
     }

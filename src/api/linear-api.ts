@@ -35,6 +35,38 @@ export interface ExternalUrl {
   url: string;
 }
 
+export interface LinearPullRequest {
+  url: string;
+  title?: string | null;
+  sourceBranch?: string | null;
+  targetBranch?: string | null;
+  status?: string | null;
+}
+
+/** Convert Linear's JSON Agent Plan payload into readable context text. */
+export function formatAgentPlan(plan: unknown): string | null {
+  if (typeof plan === "string") return plan.trim() || null;
+  if (Array.isArray(plan)) {
+    const lines = plan
+      .filter((step): step is Record<string, unknown> => !!step && typeof step === "object")
+      .map((step) => {
+        const content = typeof step.content === "string" ? step.content.trim() : "";
+        const status = typeof step.status === "string" ? step.status : "";
+        return content ? `- ${status ? `[${status}] ` : ""}${content}` : "";
+      })
+      .filter(Boolean);
+    return lines.length ? lines.join("\n") : null;
+  }
+  if (plan && typeof plan === "object") {
+    try {
+      return JSON.stringify(plan);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 /**
  * Resolve a Linear access token from multiple sources in priority order:
  * 1. pluginConfig.accessToken (static config)
@@ -356,6 +388,7 @@ export class LinearAgentApi {
     project: { id: string; name: string } | null;
     parent: { id: string; identifier: string } | null;
     relations: { nodes: Array<{ type: string; relatedIssue: { id: string; identifier: string; title: string } }> };
+    attachments: { nodes: Array<{ url: string; title: string; sourceType: string | null }> };
   }> {
     const data = await this.gql<{ issue: unknown }>(
       `query Issue($id: String!) {
@@ -380,6 +413,7 @@ export class LinearAgentApi {
           project { id name }
           parent { id identifier }
           relations { nodes { type relatedIssue { id identifier title } } }
+          attachments(first: 50) { nodes { url title sourceType } }
         }
       }`,
       { id: issueId },
@@ -585,7 +619,7 @@ export class LinearAgentApi {
     summary: string | null;
     plan: string | null;
     url: string | null;
-    pullRequests: Array<{ url: string; title?: string | null }>;
+    pullRequests: LinearPullRequest[];
     activities: Array<{ createdAt: string; content: unknown; signal: string | null }>;
   }>> {
     const activityLimit = opts?.activityLimit ?? 60;
@@ -598,9 +632,9 @@ export class LinearAgentApi {
               createdAt: string;
               status: string | null;
               summary: string | null;
-              plan: string | null;
+              plan: unknown;
               url: string | null;
-              pullRequests?: { nodes: Array<{ url: string; title?: string | null }> };
+              pullRequests?: { nodes: Array<{ pullRequest: LinearPullRequest }> };
               activities: { nodes: Array<{ createdAt: string; content: unknown; signal: string | null }> };
             }>;
           };
@@ -616,7 +650,11 @@ export class LinearAgentApi {
                 summary
                 plan
                 url
-                pullRequests { nodes { url title } }
+                pullRequests {
+                  nodes {
+                    pullRequest { url title sourceBranch targetBranch status }
+                  }
+                }
                 activities(first: $activityLimit) {
                   nodes { createdAt content signal }
                 }
@@ -633,9 +671,9 @@ export class LinearAgentApi {
           createdAt: s.createdAt,
           status: s.status ?? null,
           summary: s.summary ?? null,
-          plan: s.plan ?? null,
+          plan: formatAgentPlan(s.plan),
           url: s.url ?? null,
-          pullRequests: s.pullRequests?.nodes ?? [],
+          pullRequests: (s.pullRequests?.nodes ?? []).map((node) => node.pullRequest).filter(Boolean),
           activities: s.activities?.nodes ?? [],
         }))
         .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)); // newest first

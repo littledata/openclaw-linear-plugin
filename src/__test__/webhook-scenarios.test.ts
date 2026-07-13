@@ -73,6 +73,7 @@ vi.mock("../api/linear-api.js", () => ({
     getTeamStates = mockGetTeamStates;
     createSessionOnIssue = mockCreateSessionOnIssue;
     getRecentComments = vi.fn().mockResolvedValue([]);
+    listAgentSessions = vi.fn().mockResolvedValue([]);
   },
   resolveLinearToken: vi.fn().mockReturnValue({
     accessToken: "test-token",
@@ -142,6 +143,7 @@ vi.mock("../infra/container-runner.js", () => ({
   stopContainerRun: vi.fn().mockReturnValue(false),
   containerNameForIssue: (id: string) => `openclaw-linear-${id}`,
   readGhTokenFromCredentials: vi.fn().mockReturnValue("ght_test"),
+  checkoutPullRequestInContainer: vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" }),
 }));
 
 vi.mock("../infra/container-registry.js", () => ({

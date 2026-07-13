@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, type Mock } from "vitest";
-import { resolveLinearToken, LinearAgentApi, AUTH_PROFILES_PATH, refreshTokenProactively } from "./linear-api.js";
+import { resolveLinearToken, LinearAgentApi, AUTH_PROFILES_PATH, refreshTokenProactively, formatAgentPlan } from "./linear-api.js";
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -444,6 +444,13 @@ describe("LinearAgentApi", () => {
         project: { id: "p1", name: "Q1 Sprint" },
         parent: null,
         relations: { nodes: [] },
+        attachments: {
+          nodes: [{
+            url: "https://github.com/littledata/ld-shopify/pull/12",
+            title: "Fix market events",
+            sourceType: "github",
+          }],
+        },
       };
 
       fetchMock.mockResolvedValueOnce(okResponse({ issue: issueData }));
@@ -464,10 +471,54 @@ describe("LinearAgentApi", () => {
       expect(result.project?.name).toBe("Q1 Sprint");
       expect(result.parent).toBeNull();
       expect(result.relations.nodes).toHaveLength(0);
+      expect(result.attachments.nodes[0].url).toContain("/pull/12");
 
       // Verify variables sent
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
       expect(body.variables).toEqual({ id: "iss-1" });
+      expect(body.query).toContain("attachments(first: 50)");
+    });
+  });
+
+  describe("listAgentSessions", () => {
+    it("reads PRs through the AgentSessionToPullRequest join and formats JSON plans", async () => {
+      fetchMock.mockResolvedValueOnce(okResponse({
+        issue: {
+          agentSessions: {
+            nodes: [{
+              id: "sess-old",
+              createdAt: "2026-07-13T10:00:00Z",
+              status: "complete",
+              summary: "Implemented the market toggle",
+              plan: [{ content: "Update ld-shopify", status: "completed" }],
+              url: "https://linear.app/session/old",
+              pullRequests: {
+                nodes: [{
+                  pullRequest: {
+                    url: "https://github.com/littledata/ld-shopify/pull/12",
+                    title: "Fix market events",
+                    sourceBranch: "CORE-1740/market-events",
+                    targetBranch: "main",
+                    status: "open",
+                  },
+                }],
+              },
+              activities: { nodes: [] },
+            }],
+          },
+        },
+      }));
+
+      const api = new LinearAgentApi(TOKEN);
+      const sessions = await api.listAgentSessions("iss-1");
+
+      expect(sessions[0].plan).toBe("- [completed] Update ld-shopify");
+      expect(sessions[0].pullRequests[0]).toMatchObject({
+        url: "https://github.com/littledata/ld-shopify/pull/12",
+        sourceBranch: "CORE-1740/market-events",
+      });
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.query).toContain("pullRequest { url title sourceBranch targetBranch status }");
     });
   });
 
@@ -619,6 +670,15 @@ describe("LinearAgentApi", () => {
       expect(result.error).toBeDefined();
       expect(result.error).toContain("Linear API 500");
     });
+  });
+});
+
+describe("formatAgentPlan", () => {
+  it("formats Linear's JSON plan steps", () => {
+    expect(formatAgentPlan([
+      { content: "Inspect the PR", status: "inProgress" },
+      { content: "Run tests", status: "pending" },
+    ])).toBe("- [inProgress] Inspect the PR\n- [pending] Run tests");
   });
 });
 

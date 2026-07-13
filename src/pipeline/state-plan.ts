@@ -49,6 +49,11 @@ export interface WorkflowState {
   type: string;
 }
 
+/** True when a state plan contains reviewers only and must skip implementation preflight. */
+export function isReviewOnlyPlan(plan: StatePlan | null | undefined): plan is StatePlan {
+  return !!plan?.phases.length && plan.phases.every((phase) => phase.type === "review");
+}
+
 // ---------------------------------------------------------------------------
 // Built-in default plans
 // ---------------------------------------------------------------------------

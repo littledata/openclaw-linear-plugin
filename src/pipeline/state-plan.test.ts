@@ -3,6 +3,7 @@ import {
   resolveStatePlan,
   resolveTargetState,
   orchestrationMode,
+  isReviewOnlyPlan,
   type StatePlan,
 } from "./state-plan.js";
 
@@ -13,6 +14,15 @@ describe("orchestrationMode", () => {
   });
   it("returns stateplan when configured", () => {
     expect(orchestrationMode({ orchestrationMode: "stateplan" })).toBe("stateplan");
+  });
+});
+
+describe("isReviewOnlyPlan", () => {
+  it("distinguishes review/QA plans from implementation plans", () => {
+    expect(isReviewOnlyPlan(resolveStatePlan({ name: "Code Review", type: "started" }))).toBe(true);
+    expect(isReviewOnlyPlan(resolveStatePlan({ name: "QA", type: "started" }))).toBe(true);
+    expect(isReviewOnlyPlan(resolveStatePlan({ name: "In Progress", type: "started" }))).toBe(false);
+    expect(isReviewOnlyPlan(null)).toBe(false);
   });
 });
 

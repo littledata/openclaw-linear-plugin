@@ -5,6 +5,7 @@ import {
   buildRunArgs,
   buildCodexInner,
   PROVISION_SCRIPT,
+  CHECKOUT_PR_SCRIPT,
   parseContainerRows,
   selectExpired,
   ISSUE_LABEL,
@@ -76,6 +77,13 @@ describe("PROVISION_SCRIPT", () => {
     expect(PROVISION_SCRIPT).toContain('git clone --shared "/repos-ro/$r" "/work/$r"');
     expect(PROVISION_SCRIPT).toContain('checkout -B "$BRANCH"');
     expect(PROVISION_SCRIPT).toContain("for r in $REPOS");
+  });
+});
+
+describe("CHECKOUT_PR_SCRIPT", () => {
+  it("fetches the exact GitHub pull ref and checks out a dedicated review branch", () => {
+    expect(CHECKOUT_PR_SCRIPT).toContain('fetch --force "$REMOTE_URL" "pull/$PR_NUMBER/head"');
+    expect(CHECKOUT_PR_SCRIPT).toContain('checkout -B "review/pr-$PR_NUMBER" FETCH_HEAD');
   });
 });
 

@@ -23,6 +23,13 @@ describe("repoSelectSignal", () => {
   it("returns undefined for no candidates", () => {
     expect(repoSelectSignal([])).toBeUndefined();
   });
+  it("marks recommended labels without changing their values", () => {
+    const s = repoSelectSignal(["ld-shopify", "tmv2"], ["ld-shopify"]);
+    expect(s?.signalMetadata.options[0]).toEqual({
+      label: "ld-shopify (recommended)",
+      value: "ld-shopify",
+    });
+  });
 });
 
 describe("RESUME_SELECT", () => {
