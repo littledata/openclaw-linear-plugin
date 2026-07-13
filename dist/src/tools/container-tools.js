@@ -13,7 +13,7 @@
  * sliding TTL is reset on every call.
  */
 import { jsonResult } from "openclaw/plugin-sdk/core";
-import { getCurrentSession, getActiveSessionByAgentId } from "../pipeline/active-session.js";
+import { getCurrentSession, getActiveSessionByAgentId, getIssueIdentifierForAgentRun, } from "../pipeline/active-session.js";
 import { getContainerRecord, touchContainer } from "../infra/container-registry.js";
 import { ensureContainerAlive, execInContainer, writeFileToContainer, readFileFromContainer, codeSearchInContainer, containerGitStatus, cloneRepo, repoWorkdir, WORK_ROOT, } from "../infra/container-runner.js";
 /** Cap tool output so a runaway command can't flood the agent's context. */
@@ -29,10 +29,11 @@ function clip(s) {
  */
 function resolveContainer(api, ctx) {
     const pluginConfig = api.pluginConfig;
-    const session = (ctx.agentId ? getActiveSessionByAgentId(ctx.agentId) : null) ??
-        getCurrentSession() ??
+    const boundIdentifier = getIssueIdentifierForAgentRun(ctx.sessionId, ctx.sessionKey, ctx.agentId);
+    const session = (boundIdentifier ? null : ctx.agentId ? getActiveSessionByAgentId(ctx.agentId) : null) ??
+        (boundIdentifier ? null : getCurrentSession()) ??
         null;
-    const identifier = session?.issueIdentifier;
+    const identifier = boundIdentifier ?? session?.issueIdentifier;
     if (!identifier) {
         return { error: "No active Linear issue for this session — cannot resolve a container." };
     }

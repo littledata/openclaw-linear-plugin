@@ -34,7 +34,7 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 
-import { runAgent } from "./agent.js";
+import { formatToolActivityValue, runAgent } from "./agent.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 
 function createApi(): OpenClawPluginApi {
@@ -361,5 +361,81 @@ describe("runAgent retry wrapper", () => {
 
     expect(result.success).toBe(true);
     expect(runCmd).toHaveBeenCalledOnce();
+  });
+});
+
+describe("embedded tool activity projection", () => {
+  it("emits one ephemeral start and one completed action paired by toolCallId", async () => {
+    const api = createApi() as any;
+    const emitActivity = vi.fn().mockResolvedValue(undefined);
+    const runEmbeddedPiAgent = vi.fn().mockImplementation(async (opts: any) => {
+      expect(opts.shouldEmitToolResult()).toBe(false);
+      expect(opts.shouldEmitToolOutput()).toBe(false);
+      opts.onAgentEvent({
+        stream: "tool",
+        data: {
+          phase: "start",
+          name: "container_exec",
+          toolCallId: "call-1",
+          args: { command: "git diff", workdir: "/work/repo" },
+        },
+      });
+      opts.onAgentToolResult({
+        toolName: "container_exec",
+        result: { success: true, stdout: "diff output" },
+        isError: false,
+      });
+      opts.onAgentEvent({
+        stream: "tool",
+        data: { phase: "result", name: "container_exec", toolCallId: "call-1", isError: false },
+      });
+      return { payloads: [{ text: "REVIEW: pass" }], meta: { durationMs: 10 } };
+    });
+    api.runtime.agent = {
+      defaults: { provider: "openrouter", model: "test-model" },
+      runEmbeddedPiAgent,
+    };
+
+    const result = await runAgent({
+      api,
+      agentId: "apex",
+      sessionId: "linear-apex-CORE-1-0",
+      issueIdentifier: "CORE-1",
+      message: "review",
+      readOnly: true,
+      streaming: { linearApi: { emitActivity } as any, agentSessionId: "linear-session" },
+    });
+
+    expect(result.success).toBe(true);
+    expect(emitActivity).toHaveBeenCalledTimes(2);
+    expect(emitActivity).toHaveBeenNthCalledWith(
+      1,
+      "linear-session",
+      {
+        type: "action",
+        action: "container_exec",
+        parameter: '{\n  "command": "git diff",\n  "workdir": "/work/repo"\n}',
+      },
+      { ephemeral: true },
+    );
+    expect(emitActivity).toHaveBeenNthCalledWith(
+      2,
+      "linear-session",
+      expect.objectContaining({
+        type: "action",
+        action: "container_exec",
+        result: '{\n  "success": true,\n  "stdout": "diff output"\n}',
+      }),
+      undefined,
+    );
+    expect(runEmbeddedPiAgent.mock.calls[0][0].extraSystemPrompt).toContain(
+      "Repository shell commands are allowed only through the container_* tools",
+    );
+    expect(runEmbeddedPiAgent.mock.calls[0][0].extraSystemPrompt).not.toContain("Do not run shell commands");
+  });
+
+  it("pretty-prints JSON and caps oversized values", () => {
+    expect(formatToolActivityValue('{"a":1}', 100)).toBe('{\n  "a": 1\n}');
+    expect(formatToolActivityValue("abcdefgh", 4)).toContain("abcd\n…(4 more characters)");
   });
 });

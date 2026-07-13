@@ -19,7 +19,7 @@
  * single-worker pipeline (spawnWorker) is untouched.
  */
 import { runAgent, READ_ONLY_DENY } from "../agent/agent.js";
-import { execCodexInContainer, containerGitStatus, openPrInContainer, repoWorkdir, WORK_ROOT, } from "../infra/container-runner.js";
+import { execCodexInContainer, containerGitStatus, checkoutPullRequestInContainer, openPrInContainer, publishPullRequestReviewInContainer, repoWorkdir, WORK_ROOT, } from "../infra/container-runner.js";
 import { readManifest, writeManifest, updateManifest, savePlan, saveWorkerOutput, appendLog } from "./artifacts.js";
 import { ROLES, resolveRole, implementerRoles, buildRolePrompt, parseReviewVerdict, resolveRoleModel, resolveRoleBackend, loadSkillGuidance, roleToolsDeny, } from "./roles.js";
 import { resolveTargetState } from "./state-plan.js";
@@ -161,6 +161,7 @@ async function runRole(ctx, dispatch, role, phase, extra, issue) {
         // No role agent may touch the Linear issue — all ticket-lifecycle changes
         // are the orchestrator's job (deterministic, config-driven, on success only).
         toolsDeny: roleToolsDeny(role),
+        issueIdentifier: dispatch.issueIdentifier,
         streaming: dispatch.agentSessionId
             ? { linearApi: ctx.linearApi, agentSessionId: dispatch.agentSessionId }
             : undefined,
@@ -312,6 +313,7 @@ async function runContainerImplement(ctx, dispatch, issue, assignments, reworkNo
         extraSystemPrompt: system,
         // Deny host writes/exec — the agent acts ONLY through the container tools.
         toolsDeny: READ_ONLY_DENY,
+        issueIdentifier: dispatch.issueIdentifier,
         streaming: dispatch.agentSessionId
             ? { linearApi: ctx.linearApi, agentSessionId: dispatch.agentSessionId }
             : undefined,
@@ -478,9 +480,10 @@ async function openPr(ctx, dispatch, issue) {
 // Phase: review (Warden / Apex code-review / Proof QA) — gates
 // ---------------------------------------------------------------------------
 function reviewFocus(role) {
-    const prInstruction = "Review the exact linked pull request head already checked out in the ticket container. " +
-        "Use container_read_file, container_search_code, and read-only container_exec commands " +
-        "to inspect the PR diff and run checks. Do not edit, commit, push, or open a PR. ";
+    const prInstruction = "Review the exact linked pull request head freshly fetched and checked out in this ticket's existing Docker container. " +
+        "Use ONLY container_read_file, container_search_code, and read-only container_exec commands for repository work. " +
+        "Never use host bash/exec. Inspect the PR diff and run relevant checks inside Docker. " +
+        "Do not edit, commit, push, or open a PR. Write a detailed review; the orchestrator will publish it to GitHub. ";
     switch (role.id) {
         case "warden":
             return prInstruction + "Audit this change for security issues: authz/authn, secrets, injection, unsafe deserialization, and supply-chain risk.";
@@ -491,6 +494,65 @@ function reviewFocus(role) {
         default:
             return prInstruction + "Review this change.";
     }
+}
+/** Re-fetch and reset every linked PR head in the issue's existing container. */
+function syncReviewSandbox(dispatch) {
+    const pullRequests = dispatch.reviewPullRequests ?? [];
+    if (!pullRequests.length)
+        return null;
+    if (!dispatch.containerName)
+        return "no ticket container is available for review";
+    for (const pullRequest of pullRequests) {
+        const synced = checkoutPullRequestInContainer(dispatch.containerName, pullRequest.repoName, pullRequest.url, pullRequest.number);
+        if (synced.status !== 0) {
+            return `could not refresh ${pullRequest.url} in ${pullRequest.repoName}: ${synced.stderr.trim().slice(0, 500)}`;
+        }
+    }
+    return null;
+}
+/** Detect a denied/missing tool outcome that cannot be treated as a code verdict. */
+function reviewInfrastructureFailure(output) {
+    const compact = output.trim().replace(/\s+/g, " ").slice(-600);
+    if (!compact)
+        return null;
+    const patterns = [
+        /["']?status["']?\s*:\s*["']?(?:declined|approval-unavailable)/i,
+        /(?:bash|exec|container_[\w-]+|tool)[^\n]{0,160}\b(?:failed|declined|unavailable|not available)\b/i,
+        /No active Linear issue for this session|cannot resolve a container|No container is registered/i,
+    ];
+    return patterns.some((pattern) => pattern.test(output)) ? compact : null;
+}
+/** Publish a substantive review to every linked PR, falling back to Linear. */
+async function publishReview(ctx, dispatch, role, verdict) {
+    const pullRequests = dispatch.reviewPullRequests ?? [];
+    if (!pullRequests.length || verdict.infrastructureFailure)
+        return;
+    const body = [
+        `## ${role.label} review`,
+        "",
+        `**Verdict:** ${verdict.pass ? "pass" : "fail"}${verdict.reason ? ` — ${verdict.reason}` : ""}`,
+        "",
+        verdict.output.trim(),
+        "",
+        `_Automated review for Linear issue ${dispatch.issueIdentifier}._`,
+    ].join("\n").slice(0, 30_000);
+    const failures = [];
+    for (const pullRequest of pullRequests) {
+        if (!dispatch.containerName) {
+            failures.push(`${pullRequest.url}: no ticket container`);
+            continue;
+        }
+        const published = publishPullRequestReviewInContainer(dispatch.containerName, pullRequest.repoName, pullRequest.url, body);
+        if (published.status !== 0) {
+            failures.push(`${pullRequest.url}: ${published.stderr.trim().slice(0, 300)}`);
+        }
+    }
+    if (!failures.length)
+        return;
+    ctx.api.logger.warn(`[orchestrator] ${dispatch.issueIdentifier} GitHub review publication failed: ${failures.join("; ")}`);
+    await ctx.linearApi.createComment(dispatch.issueId, `${body}\n\n> GitHub publication failed; preserved in Linear instead.\n> ${failures.join("\n> ")}`).catch((err) => {
+        ctx.api.logger.warn(`[orchestrator] Linear review fallback failed for ${dispatch.issueIdentifier}: ${err}`);
+    });
 }
 /**
  * Run a reviewer and obtain a structured verdict. A backend/tool failure is
@@ -506,11 +568,22 @@ async function runStructuredReview(ctx, dispatch, issue, role, focus) {
         return {
             pass: false,
             reason: `${role.label} review agent failed${detail ? `: ${detail}` : " without output"}`,
+            output: review.output,
+            infrastructureFailure: true,
         };
     }
     const verdict = parseReviewVerdict(review.output, tag);
     if (!verdict.reason.startsWith(`no ${tag} verdict`))
-        return verdict;
+        return { ...verdict, output: review.output };
+    const infrastructureFailure = reviewInfrastructureFailure(review.output);
+    if (infrastructureFailure) {
+        return {
+            pass: false,
+            reason: `${role.label} review tooling failed: ${infrastructureFailure}`,
+            output: review.output,
+            infrastructureFailure: true,
+        };
+    }
     const correction = await runRole(ctx, dispatch, role, "review", [
         "Your review completed, but its verdict format was missing or invalid.",
         "Do not repeat the review. Based on your conclusion below, respond with ONLY:",
@@ -524,15 +597,19 @@ async function runStructuredReview(ctx, dispatch, issue, role, focus) {
         return {
             pass: false,
             reason: `${role.label} verdict-format retry failed${detail ? `: ${detail}` : " without output"}`,
+            output: review.output,
+            infrastructureFailure: true,
         };
     }
     const corrected = parseReviewVerdict(correction.output, tag);
-    if (!corrected.reason.startsWith(`no ${tag} verdict`))
-        return corrected;
+    if (!corrected.reason.startsWith(`no ${tag} verdict`)) {
+        return { ...corrected, output: review.output };
+    }
     const preview = review.output.trim().replace(/\s+/g, " ").slice(-500);
     return {
         pass: false,
         reason: `${role.label} review completed without a structured verdict${preview ? `; output: ${preview}` : ""}`,
+        output: review.output,
     };
 }
 /**
@@ -545,11 +622,16 @@ async function runStructuredReview(ctx, dispatch, issue, role, focus) {
  * @param gate - true when the phase blocks on failure; false = annotate-only
  */
 async function runReviewPhase(ctx, dispatch, issue, role, gate) {
+    const syncFailure = syncReviewSandbox(dispatch);
+    if (syncFailure) {
+        return { success: false, reason: `${role.label} review sandbox sync failed: ${syncFailure}` };
+    }
     const verdict = await runStructuredReview(ctx, dispatch, issue, role, reviewFocus(role));
     emit(ctx, dispatch, {
         type: "thought",
         body: `${verdict.pass ? "✅" : "❌"} ${role.label} review — ${verdict.pass ? "pass" : "fail"}: ${verdict.reason}`,
     });
+    await publishReview(ctx, dispatch, role, verdict);
     if (verdict.pass)
         return { success: true };
     if (!gate)

@@ -16,7 +16,11 @@
 import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/core";
 import { jsonResult } from "openclaw/plugin-sdk/core";
-import { getCurrentSession, getActiveSessionByAgentId, getActiveSessionByIdentifier } from "../pipeline/active-session.js";
+import {
+  getCurrentSession,
+  getActiveSessionByAgentId,
+  getIssueIdentifierForAgentRun,
+} from "../pipeline/active-session.js";
 import { getContainerRecord, touchContainer } from "../infra/container-registry.js";
 import {
   ensureContainerAlive,
@@ -47,11 +51,12 @@ function resolveContainer(
   ctx: OpenClawPluginToolContext,
 ): { containerName: string; identifier: string } | { error: string } {
   const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
+  const boundIdentifier = getIssueIdentifierForAgentRun(ctx.sessionId, ctx.sessionKey, ctx.agentId);
   const session =
-    (ctx.agentId ? getActiveSessionByAgentId(ctx.agentId) : null) ??
-    getCurrentSession() ??
+    (boundIdentifier ? null : ctx.agentId ? getActiveSessionByAgentId(ctx.agentId) : null) ??
+    (boundIdentifier ? null : getCurrentSession()) ??
     null;
-  const identifier = session?.issueIdentifier;
+  const identifier = boundIdentifier ?? session?.issueIdentifier;
   if (!identifier) {
     return { error: "No active Linear issue for this session — cannot resolve a container." };
   }

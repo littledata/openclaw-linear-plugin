@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { mkdirSync } from "node:fs";
 import { InactivityWatchdog, resolveWatchdogConfig } from "./watchdog.js";
+import { bindAgentRunToIssue, unbindAgentRunFromIssue } from "../pipeline/active-session.js";
 function resolveAgentDirs(agentId, config) {
     const home = homedir();
     const agentList = config?.agents?.list;
@@ -16,6 +17,38 @@ function resolveAgentDirs(agentId, config) {
     const agentDir = join(home, ".openclaw", "agents", agentId, "agent");
     mkdirSync(agentDir, { recursive: true });
     return { workspaceDir, agentDir };
+}
+/** Format structured tool data as readable activity content with a safe size cap. */
+export function formatToolActivityValue(value, maxChars) {
+    let text;
+    if (typeof value === "string") {
+        const trimmed = value.trim();
+        if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+            try {
+                text = JSON.stringify(JSON.parse(trimmed), null, 2);
+            }
+            catch {
+                text = trimmed;
+            }
+        }
+        else {
+            text = trimmed;
+        }
+    }
+    else if (value === undefined) {
+        text = "";
+    }
+    else {
+        try {
+            text = JSON.stringify(value, null, 2);
+        }
+        catch {
+            text = String(value);
+        }
+    }
+    if (text.length <= maxChars)
+        return text;
+    return `${text.slice(0, maxChars)}\n…(${text.length - maxChars} more characters)`;
 }
 /**
  * Run an agent with automatic retry on watchdog kill.
@@ -51,18 +84,28 @@ export function abortRunsFor(abortKey) {
 }
 export async function runAgent(params) {
     const maxAttempts = 2;
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        const result = await runAgentOnce(params);
-        if (result.success || !result.watchdogKilled || attempt === maxAttempts - 1) {
-            return result;
+    if (params.issueIdentifier) {
+        bindAgentRunToIssue(params.sessionId, params.agentId, params.issueIdentifier);
+    }
+    try {
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            const result = await runAgentOnce(params);
+            if (result.success || !result.watchdogKilled || attempt === maxAttempts - 1) {
+                return result;
+            }
+            params.api.logger.warn(`Agent ${params.agentId} killed by watchdog, retrying (attempt ${attempt + 1}/${maxAttempts})`);
+            // Emit Linear activity about the retry if streaming
+            if (params.streaming) {
+                params.streaming.linearApi.emitActivity(params.streaming.agentSessionId, {
+                    type: "error",
+                    body: `Agent killed by inactivity watchdog — no I/O for the configured threshold. Retrying...`,
+                }).catch(() => { });
+            }
         }
-        params.api.logger.warn(`Agent ${params.agentId} killed by watchdog, retrying (attempt ${attempt + 1}/${maxAttempts})`);
-        // Emit Linear activity about the retry if streaming
-        if (params.streaming) {
-            params.streaming.linearApi.emitActivity(params.streaming.agentSessionId, {
-                type: "error",
-                body: `Agent killed by inactivity watchdog — no I/O for the configured threshold. Retrying...`,
-            }).catch(() => { });
+    }
+    finally {
+        if (params.issueIdentifier) {
+            unbindAgentRunFromIssue(params.sessionId, params.agentId);
         }
     }
     // Unreachable, but TypeScript needs it
@@ -200,8 +243,12 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
     const provider = slashIdx > 0 ? modelRef.slice(0, slashIdx) : api.runtime.agent.defaults.provider;
     const model = slashIdx > 0 ? modelRef.slice(slashIdx + 1) : modelRef;
     api.logger.info(`Embedded agent run: agent=${agentId} session=${sessionId} runId=${runId} provider=${provider} model=${model} workspaceDir=${workspaceDir} agentDir=${agentDir}`);
-    const emit = (content) => {
-        streaming.linearApi.emitActivity(streaming.agentSessionId, content).catch((err) => {
+    // Serialize writes so an ephemeral start cannot race its completed card.
+    let activityQueue = Promise.resolve();
+    const emit = (content, opts) => {
+        activityQueue = activityQueue
+            .then(() => streaming.linearApi.emitActivity(streaming.agentSessionId, content, opts))
+            .catch((err) => {
             api.logger.warn(`Activity emit failed: ${err}`);
         });
     };
@@ -227,16 +274,16 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
             controller.abort();
         },
     });
-    // Track last emitted tool to avoid duplicates
-    let lastToolAction = "";
-    // Derive a friendly label from cli_ tool names: cli_codex→"Codex", cli_claude→"Claude"
-    const cliLabel = (name) => name.startsWith("cli_") ? name.slice(4).charAt(0).toUpperCase() + name.slice(5) : name;
+    const pendingTools = new Map();
+    const completedResults = new Map();
     watchdog.start();
     // Compose the extra system prompt: the specialist ROLE brief (if any) plus
     // the read-only notice (if readOnly). Either, both, or neither may apply.
     const readOnlyNotice = [
         "READ-ONLY MODE: You may read and search files but you MUST NOT",
-        "write, edit, create, or delete any files. Do not run shell commands.",
+        "write, edit, create, or delete any files. Do not use host bash/exec.",
+        "Repository shell commands are allowed only through the container_* tools",
+        "provided for this ticket's Docker sandbox.",
         "Your only output is your text response.",
     ].join(" ");
     const composedSystemPrompt = [extraSystemPrompt, readOnly ? readOnlyNotice : undefined]
@@ -255,8 +302,10 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
         provider,
         model,
         abortSignal: controller.signal,
-        shouldEmitToolResult: () => true,
-        shouldEmitToolOutput: () => true,
+        // Project the structured lifecycle below. OpenClaw's aggregate summaries
+        // would otherwise create extra, uncorrelated Linear rows.
+        shouldEmitToolResult: () => false,
+        shouldEmitToolOutput: () => false,
         ...(composedSystemPrompt ? { extraSystemPrompt: composedSystemPrompt } : {}),
         // Stream reasoning/thinking to Linear
         onReasoningStream: (payload) => {
@@ -266,16 +315,13 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
                 emit({ type: "thought", body: text.slice(0, 500) });
             }
         },
-        // Stream tool results to Linear
-        onToolResult: (payload) => {
+        // OpenClaw supplies the actual result immediately before the matching
+        // `phase=result` event. The latter carries the toolCallId needed to pair it.
+        onAgentToolResult: ({ toolName, result, isError }) => {
             watchdog.tick();
-            const text = payload.text?.trim();
-            if (text) {
-                // Truncate tool results for activity display
-                const truncated = text.length > 300 ? text.slice(0, 300) + "..." : text;
-                const prefix = lastToolAction.startsWith("cli_") ? `[${cliLabel(lastToolAction)}] ` : "";
-                emit({ type: "action", action: `${prefix}${lastToolAction || "Tool result"}`, parameter: truncated });
-            }
+            const queued = completedResults.get(toolName) ?? [];
+            queued.push({ result, isError });
+            completedResults.set(toolName, queued);
         },
         // Raw agent events — capture tool starts/ends/updates
         onAgentEvent: (evt) => {
@@ -285,53 +331,35 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
                 return;
             const phase = String(data.phase ?? "");
             const toolName = String(data.name ?? "tool");
+            const toolCallId = String(data.toolCallId ?? "");
             const meta = typeof data.meta === "string" ? data.meta : "";
-            const rawInput = data.input;
-            const input = typeof rawInput === "string" ? rawInput : "";
-            // Parse structured input for richer detail on cli_* tools
-            let inputObj = null;
-            if (rawInput && typeof rawInput === "object") {
-                inputObj = rawInput;
-            }
-            else if (input.startsWith("{")) {
-                try {
-                    inputObj = JSON.parse(input);
-                }
-                catch { }
-            }
-            // Tool execution start — emit action with tool name + available context
+            const rawArgs = data.args ?? data.input;
+            // Transient live card. The persistent completion carries args + result.
             if (phase === "start") {
-                lastToolAction = toolName;
-                // cli_codex / cli_claude / cli_gemini: emit a thought + action so the
-                // user immediately sees what the agent is dispatching and why.
-                if (toolName.startsWith("cli_") && inputObj) {
-                    const tag = cliLabel(toolName);
-                    const prompt = String(inputObj.prompt ?? "").slice(0, 250);
-                    const workDir = inputObj.workingDir ? ` in ${inputObj.workingDir}` : "";
-                    emit({ type: "thought", body: `[${tag}] Starting${workDir}: "${prompt}"\n\n${toolName}\nin progress` });
-                    emit({ type: "action", action: `[${tag}] Running${workDir}`, parameter: prompt });
-                }
-                else {
-                    const detail = input || meta || toolName;
-                    emit({ type: "action", action: `Running ${toolName}`, parameter: detail.slice(0, 300) });
-                }
+                const parameter = formatToolActivityValue(rawArgs ?? meta, 4_000) || undefined;
+                if (toolCallId)
+                    pendingTools.set(toolCallId, { name: toolName, parameter });
+                emit({ type: "action", action: toolName, parameter }, { ephemeral: true });
             }
-            // Tool execution update — partial progress (keeps Linear UI alive for long tools)
-            if (phase === "update") {
-                const detail = meta || input || "in progress";
-                const prefix = toolName.startsWith("cli_") ? `[${cliLabel(toolName)}] ` : "";
-                emit({ type: "action", action: `${prefix}${toolName}`, parameter: detail.slice(0, 300) });
-            }
-            // Tool execution completed successfully
-            if (phase === "result" && !data.isError) {
-                const detail = meta ? meta.slice(0, 300) : "completed";
-                const prefix = toolName.startsWith("cli_") ? `[${cliLabel(toolName)}] ` : "";
-                emit({ type: "action", action: `${prefix}${toolName} done`, parameter: detail });
-            }
-            // Tool execution result with error
-            if (phase === "result" && data.isError) {
-                const prefix = toolName.startsWith("cli_") ? `[${cliLabel(toolName)}] ` : "";
-                emit({ type: "action", action: `${prefix}${toolName} failed`, parameter: (meta || "error").slice(0, 300) });
+            if (phase === "result") {
+                const pending = toolCallId ? pendingTools.get(toolCallId) : undefined;
+                const queued = completedResults.get(toolName) ?? [];
+                const completed = queued.shift();
+                if (queued.length)
+                    completedResults.set(toolName, queued);
+                else
+                    completedResults.delete(toolName);
+                if (toolCallId)
+                    pendingTools.delete(toolCallId);
+                const isError = completed?.isError ?? Boolean(data.isError);
+                const rawResult = completed?.result ?? data.result ?? meta ?? (isError ? "failed" : "completed");
+                const formattedResult = formatToolActivityValue(rawResult, 12_000) || (isError ? "failed" : "completed");
+                emit({
+                    type: "action",
+                    action: pending?.name ?? toolName,
+                    parameter: pending?.parameter,
+                    result: isError ? `Failed\n\n${formattedResult}` : formattedResult,
+                });
             }
         },
         // Partial assistant text (for long responses)
@@ -341,6 +369,7 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
             // The final response will be posted as a comment
         },
     });
+    await activityQueue;
     watchdog.stop();
     if (abortKey) {
         const set = runsByAbortKey.get(abortKey);

@@ -82,7 +82,9 @@ function activityText(content: unknown): string {
     case "thought":
       return c.body ? `think: ${String(c.body)}` : "";
     case "action":
-      return `do: ${c.action ?? ""}${c.parameter ? ` — ${c.parameter}` : ""}`.trim();
+      return `do: ${c.action ?? ""}${c.parameter ? ` — ${c.parameter}` : ""}${c.result ? ` → ${c.result}` : ""}`.trim();
+    case "prompt":
+      return c.body ? `user: ${String(c.body)}` : "";
     case "response":
       return c.body ? `end: ${String(c.body)}` : "";
     case "elicitation":

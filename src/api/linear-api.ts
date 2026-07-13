@@ -18,6 +18,9 @@ export type ActivityContent =
   | { type: "elicitation"; body: string }
   | { type: "error"; body: string };
 
+/** Activity content returned by Linear, including user prompts (read-only). */
+export type AgentActivityContent = ActivityContent | { type: "prompt"; body: string };
+
 /**
  * Optional Linear agent "signal" attached to an activity. Siblings of `content`
  * in AgentActivityCreateInput. A `select` signal renders the elicitation body
@@ -28,6 +31,8 @@ export type ActivityContent =
 export interface ActivityEmitOptions {
   signal?: "select" | "stop" | "auth";
   signalMetadata?: { options?: Array<{ label?: string; value: string }> };
+  /** Transient activity removed by Linear when the next activity arrives. */
+  ephemeral?: boolean;
 }
 
 export interface ExternalUrl {
@@ -282,6 +287,7 @@ export class LinearAgentApi {
     const input: Record<string, unknown> = { agentSessionId, content };
     if (opts?.signal) input.signal = opts.signal;
     if (opts?.signalMetadata) input.signalMetadata = opts.signalMetadata;
+    if (opts?.ephemeral !== undefined) input.ephemeral = opts.ephemeral;
 
     if (input.signal || input.signalMetadata) {
       try {
@@ -290,7 +296,13 @@ export class LinearAgentApi {
       } catch {
         // Signal fields fell over — retry with a plain activity below.
       }
-      await this.gql(mutation, { input: { agentSessionId, content } });
+      await this.gql(mutation, {
+        input: {
+          agentSessionId,
+          content,
+          ...(opts?.ephemeral !== undefined ? { ephemeral: opts.ephemeral } : {}),
+        },
+      });
       return;
     }
     await this.gql(mutation, { input });
@@ -620,7 +632,7 @@ export class LinearAgentApi {
     plan: string | null;
     url: string | null;
     pullRequests: LinearPullRequest[];
-    activities: Array<{ createdAt: string; content: unknown; signal: string | null }>;
+    activities: Array<{ createdAt: string; content: AgentActivityContent; signal: string | null }>;
   }>> {
     const activityLimit = opts?.activityLimit ?? 60;
     try {
@@ -635,7 +647,13 @@ export class LinearAgentApi {
               plan: unknown;
               url: string | null;
               pullRequests?: { nodes: Array<{ pullRequest: LinearPullRequest }> };
-              activities: { nodes: Array<{ createdAt: string; content: unknown; signal: string | null }> };
+              activities: {
+                nodes: Array<{
+                  createdAt: string;
+                  content: AgentActivityContent & { __typename?: string };
+                  signal: string | null;
+                }>;
+              };
             }>;
           };
         };
@@ -656,7 +674,19 @@ export class LinearAgentApi {
                   }
                 }
                 activities(first: $activityLimit) {
-                  nodes { createdAt content signal }
+                  nodes {
+                    createdAt
+                    signal
+                    content {
+                      __typename
+                      ... on AgentActivityThoughtContent { type body }
+                      ... on AgentActivityActionContent { type action parameter result }
+                      ... on AgentActivityResponseContent { type body }
+                      ... on AgentActivityPromptContent { type body }
+                      ... on AgentActivityErrorContent { type body }
+                      ... on AgentActivityElicitationContent { type body }
+                    }
+                  }
                 }
               }
             }
@@ -674,7 +704,10 @@ export class LinearAgentApi {
           plan: formatAgentPlan(s.plan),
           url: s.url ?? null,
           pullRequests: (s.pullRequests?.nodes ?? []).map((node) => node.pullRequest).filter(Boolean),
-          activities: s.activities?.nodes ?? [],
+          activities: (s.activities?.nodes ?? []).map((activity) => {
+            const { __typename: _typename, ...content } = activity.content;
+            return { ...activity, content: content as AgentActivityContent };
+          }),
         }))
         .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)); // newest first
     } catch (err) {

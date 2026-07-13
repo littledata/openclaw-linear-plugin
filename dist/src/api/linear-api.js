@@ -206,6 +206,8 @@ export class LinearAgentApi {
             input.signal = opts.signal;
         if (opts?.signalMetadata)
             input.signalMetadata = opts.signalMetadata;
+        if (opts?.ephemeral !== undefined)
+            input.ephemeral = opts.ephemeral;
         if (input.signal || input.signalMetadata) {
             try {
                 await this.gql(mutation, { input });
@@ -214,7 +216,13 @@ export class LinearAgentApi {
             catch {
                 // Signal fields fell over — retry with a plain activity below.
             }
-            await this.gql(mutation, { input: { agentSessionId, content } });
+            await this.gql(mutation, {
+                input: {
+                    agentSessionId,
+                    content,
+                    ...(opts?.ephemeral !== undefined ? { ephemeral: opts.ephemeral } : {}),
+                },
+            });
             return;
         }
         await this.gql(mutation, { input });
@@ -420,7 +428,19 @@ export class LinearAgentApi {
                   }
                 }
                 activities(first: $activityLimit) {
-                  nodes { createdAt content signal }
+                  nodes {
+                    createdAt
+                    signal
+                    content {
+                      __typename
+                      ... on AgentActivityThoughtContent { type body }
+                      ... on AgentActivityActionContent { type action parameter result }
+                      ... on AgentActivityResponseContent { type body }
+                      ... on AgentActivityPromptContent { type body }
+                      ... on AgentActivityErrorContent { type body }
+                      ... on AgentActivityElicitationContent { type body }
+                    }
+                  }
                 }
               }
             }
@@ -436,7 +456,10 @@ export class LinearAgentApi {
                 plan: formatAgentPlan(s.plan),
                 url: s.url ?? null,
                 pullRequests: (s.pullRequests?.nodes ?? []).map((node) => node.pullRequest).filter(Boolean),
-                activities: s.activities?.nodes ?? [],
+                activities: (s.activities?.nodes ?? []).map((activity) => {
+                    const { __typename: _typename, ...content } = activity.content;
+                    return { ...activity, content: content };
+                }),
             }))
                 .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)); // newest first
         }

@@ -162,6 +162,14 @@ export const CHECKOUT_PR_SCRIPT = [
   "set -eu",
   'git -C "$REPO_DIR" fetch --force "$REMOTE_URL" "pull/$PR_NUMBER/head"',
   'git -C "$REPO_DIR" checkout -B "review/pr-$PR_NUMBER" FETCH_HEAD',
+  'git -C "$REPO_DIR" reset --hard FETCH_HEAD',
+].join("\n");
+
+/** Publish a persistent GitHub PR review comment from inside the ticket sandbox. */
+export const PUBLISH_PR_REVIEW_SCRIPT = [
+  "set -eu",
+  'cd "$REPO_DIR"',
+  'gh pr review "$PR_URL" --comment --body "$REVIEW_BODY"',
 ].join("\n");
 
 /**
@@ -455,6 +463,33 @@ export function checkoutPullRequestInContainer(
       "-e", `PR_NUMBER=${pullRequestNumber}`,
       name,
       "sh", "-c", CHECKOUT_PR_SCRIPT,
+    ],
+    { timeoutMs: 120_000 },
+  );
+}
+
+/**
+ * Publish a review comment on a linked PR using the container's authenticated
+ * GitHub CLI. Keeping this inside the ticket container uses the same credentials
+ * and repository context as implementation/review work.
+ */
+export function publishPullRequestReviewInContainer(
+  name: string,
+  repo: string,
+  pullRequestUrl: string,
+  body: string,
+): DockerResult {
+  if (!/^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+(?:[/?#].*)?$/i.test(pullRequestUrl.trim())) {
+    return { status: 2, stdout: "", stderr: `invalid GitHub pull request: ${pullRequestUrl}` };
+  }
+  return dockerSync(
+    [
+      "exec",
+      "-e", `REPO_DIR=${repoWorkdir(repo)}`,
+      "-e", `PR_URL=${pullRequestUrl.trim()}`,
+      "-e", `REVIEW_BODY=${body}`,
+      name,
+      "sh", "-c", PUBLISH_PR_REVIEW_SCRIPT,
     ],
     { timeoutMs: 120_000 },
   );

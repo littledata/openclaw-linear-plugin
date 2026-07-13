@@ -26,6 +26,42 @@ export interface ActiveSession {
 // Keyed by issue ID — one active session per issue at a time.
 const sessions = new Map<string, ActiveSession>();
 
+// Embedded specialist runs use their own agent/session ids while operating on
+// an issue-owned container. Bind those trusted runtime identities explicitly so
+// container tools never guess from a global "current session" under concurrency.
+const agentRunIssueBySession = new Map<string, string>();
+const agentRunIssuesByAgent = new Map<string, Map<string, string>>();
+
+/** Bind an embedded agent run to the Linear issue whose container it may use. */
+export function bindAgentRunToIssue(sessionId: string, agentId: string, issueIdentifier: string): void {
+  agentRunIssueBySession.set(sessionId, issueIdentifier);
+  const runs = agentRunIssuesByAgent.get(agentId) ?? new Map<string, string>();
+  runs.set(sessionId, issueIdentifier);
+  agentRunIssuesByAgent.set(agentId, runs);
+}
+
+/** Remove a completed embedded-run binding. */
+export function unbindAgentRunFromIssue(sessionId: string, agentId: string): void {
+  agentRunIssueBySession.delete(sessionId);
+  const runs = agentRunIssuesByAgent.get(agentId);
+  if (!runs) return;
+  runs.delete(sessionId);
+  if (!runs.size) agentRunIssuesByAgent.delete(agentId);
+}
+
+/** Resolve a trusted tool context to its explicitly-bound issue identifier. */
+export function getIssueIdentifierForAgentRun(
+  sessionId?: string,
+  sessionKey?: string,
+  agentId?: string,
+): string | null {
+  if (sessionId && agentRunIssueBySession.has(sessionId)) return agentRunIssueBySession.get(sessionId)!;
+  if (sessionKey && agentRunIssueBySession.has(sessionKey)) return agentRunIssueBySession.get(sessionKey)!;
+  if (!agentId) return null;
+  const identifiers = new Set(agentRunIssuesByAgent.get(agentId)?.values() ?? []);
+  return identifiers.size === 1 ? identifiers.values().next().value ?? null : null;
+}
+
 // ---------------------------------------------------------------------------
 // Issue-agent affinity: tracks which agent last handled each issue.
 // Entries expire after a configurable TTL (default 30 min).
@@ -187,5 +223,7 @@ export function _getAffinityTtlMs(): number {
 /** @internal — test-only; clears all affinity state and resets TTL. */
 export function _resetAffinityForTesting(): void {
   issueAgentAffinity.clear();
+  agentRunIssueBySession.clear();
+  agentRunIssuesByAgent.clear();
   _affinityTtlMs = 30 * 60_000;
 }

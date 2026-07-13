@@ -6,6 +6,7 @@ import {
   buildCodexInner,
   PROVISION_SCRIPT,
   CHECKOUT_PR_SCRIPT,
+  PUBLISH_PR_REVIEW_SCRIPT,
   parseContainerRows,
   selectExpired,
   ISSUE_LABEL,
@@ -84,6 +85,13 @@ describe("CHECKOUT_PR_SCRIPT", () => {
   it("fetches the exact GitHub pull ref and checks out a dedicated review branch", () => {
     expect(CHECKOUT_PR_SCRIPT).toContain('fetch --force "$REMOTE_URL" "pull/$PR_NUMBER/head"');
     expect(CHECKOUT_PR_SCRIPT).toContain('checkout -B "review/pr-$PR_NUMBER" FETCH_HEAD');
+    expect(CHECKOUT_PR_SCRIPT).toContain('reset --hard FETCH_HEAD');
+  });
+});
+
+describe("PUBLISH_PR_REVIEW_SCRIPT", () => {
+  it("publishes a GitHub review comment using env-provided content", () => {
+    expect(PUBLISH_PR_REVIEW_SCRIPT).toContain('gh pr review "$PR_URL" --comment --body "$REVIEW_BODY"');
   });
 });
 

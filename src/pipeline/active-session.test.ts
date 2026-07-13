@@ -15,6 +15,9 @@ import {
   _configureAffinityTtl,
   _getAffinityTtlMs,
   _resetAffinityForTesting,
+  bindAgentRunToIssue,
+  unbindAgentRunFromIssue,
+  getIssueIdentifierForAgentRun,
   type ActiveSession,
 } from "./active-session.js";
 
@@ -101,6 +104,25 @@ describe("getSessionCount", () => {
     expect(getSessionCount()).toBe(2);
     clearActiveSession("uuid-1");
     expect(getSessionCount()).toBe(1);
+  });
+});
+
+describe("embedded agent run bindings", () => {
+  it("resolves a reviewer session directly to its issue", () => {
+    bindAgentRunToIssue("linear-apex-CORE-1731-0", "apex", "CORE-1731");
+    expect(getIssueIdentifierForAgentRun("linear-apex-CORE-1731-0", undefined, "apex"))
+      .toBe("CORE-1731");
+    expect(getIssueIdentifierForAgentRun(undefined, undefined, "apex")).toBe("CORE-1731");
+    unbindAgentRunFromIssue("linear-apex-CORE-1731-0", "apex");
+    expect(getIssueIdentifierForAgentRun("linear-apex-CORE-1731-0", undefined, "apex"))
+      .toBeNull();
+  });
+
+  it("does not guess by agent id when that reviewer has concurrent issues", () => {
+    bindAgentRunToIssue("review-a", "warden", "CORE-1");
+    bindAgentRunToIssue("review-b", "warden", "CORE-2");
+    expect(getIssueIdentifierForAgentRun(undefined, undefined, "warden")).toBeNull();
+    expect(getIssueIdentifierForAgentRun("review-b", undefined, "warden")).toBe("CORE-2");
   });
 });
 

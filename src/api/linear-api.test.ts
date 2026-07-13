@@ -396,6 +396,26 @@ describe("LinearAgentApi", () => {
         content: { type: "thought", body: "thinking..." },
       });
     });
+
+    it("passes ephemeral for transient tool-start activities", async () => {
+      fetchMock.mockResolvedValueOnce(
+        okResponse({ agentActivityCreate: { success: true } }),
+      );
+
+      const api = new LinearAgentApi(TOKEN);
+      await api.emitActivity(
+        "session-1",
+        { type: "action", action: "container_exec", parameter: "git diff" },
+        { ephemeral: true },
+      );
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.variables.input).toMatchObject({
+        agentSessionId: "session-1",
+        ephemeral: true,
+        content: { type: "action", action: "container_exec", parameter: "git diff" },
+      });
+    });
   });
 
   describe("createComment", () => {
@@ -503,7 +523,17 @@ describe("LinearAgentApi", () => {
                   },
                 }],
               },
-              activities: { nodes: [] },
+              activities: { nodes: [{
+                createdAt: "2026-07-13T10:01:00Z",
+                signal: null,
+                content: {
+                  __typename: "AgentActivityActionContent",
+                  type: "action",
+                  action: "container_exec",
+                  parameter: "git diff",
+                  result: "clean",
+                },
+              }] },
             }],
           },
         },
@@ -517,8 +547,16 @@ describe("LinearAgentApi", () => {
         url: "https://github.com/littledata/ld-shopify/pull/12",
         sourceBranch: "CORE-1740/market-events",
       });
+      expect(sessions[0].activities[0].content).toEqual({
+        type: "action",
+        action: "container_exec",
+        parameter: "git diff",
+        result: "clean",
+      });
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
       expect(body.query).toContain("pullRequest { url title sourceBranch targetBranch status }");
+      expect(body.query).toContain("... on AgentActivityActionContent { type action parameter result }");
+      expect(body.query).toContain("... on AgentActivityPromptContent { type body }");
     });
   });
 
