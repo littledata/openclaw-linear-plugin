@@ -18,12 +18,13 @@
  * This path is opt-in via config `orchestrationMode: "stateplan"`; the default
  * single-worker pipeline (spawnWorker) is untouched.
  */
-import { runAgent } from "../agent/agent.js";
+import { runAgent, READ_ONLY_DENY } from "../agent/agent.js";
 import { execCodexInContainer, containerGitStatus, openPrInContainer, repoWorkdir, WORK_ROOT, } from "../infra/container-runner.js";
 import { readManifest, writeManifest, updateManifest, savePlan, saveWorkerOutput, appendLog } from "./artifacts.js";
 import { ROLES, resolveRole, implementerRoles, buildRolePrompt, parseReviewVerdict, resolveRoleModel, resolveRoleBackend, loadSkillGuidance, roleToolsDeny, } from "./roles.js";
 import { resolveTargetState } from "./state-plan.js";
 import { isCancelled, clearCancel } from "./cancellation.js";
+import { getActiveSession } from "./active-session.js";
 /** Max bounded rework attempts (config `maxReworkAttempts`, default 2). */
 function maxRework(pluginConfig) {
     const v = pluginConfig?.maxReworkAttempts;
@@ -229,25 +230,116 @@ async function runApexPlan(ctx, dispatch, issue) {
 // ---------------------------------------------------------------------------
 // Phase: plan-implement (Apex → implementers → Apex self-review → PR)
 // ---------------------------------------------------------------------------
+/**
+ * Whether implementers run as a single steerable OpenClaw agent driving the
+ * container via tools (the default), vs. the legacy one-shot `codex exec` per
+ * specialist. Config `implementMode: "codex"` opts back into the old path.
+ * @param cfg - plugin config
+ * @returns true when the container-agent path should be used
+ */
+function implementerUsesContainer(cfg) {
+    return cfg?.implementMode !== "codex";
+}
+/**
+ * Run ONE OpenClaw agent that implements the issue inside its per-ticket
+ * container. The agent's host filesystem is read-only (READ_ONLY_DENY); its only
+ * way to change anything is the container_* tools, so all writes are isolated to
+ * the container. A stable per-ticket session id keeps it continuous/steerable
+ * across turns.
+ * @param ctx - hook context
+ * @param dispatch - the active dispatch
+ * @param issue - the issue context
+ * @param assignments - Apex's specialist plan (used as the implementation brief)
+ * @param reworkNote - review findings to address on a rework attempt
+ * @returns the agent run result
+ */
+async function runContainerImplement(ctx, dispatch, issue, assignments, reworkNote) {
+    const repos = dispatch.containerRepos ?? [];
+    const repoLines = repos.map((r) => `- ${r}: ${repoWorkdir(r)}`).join("\n") || WORK_ROOT;
+    const plan = assignments
+        .map((a) => `- ${resolveRole(a.role)?.label ?? a.role}: ${a.task}`)
+        .join("\n");
+    const system = [
+        `You are implementing Linear issue ${issue.identifier} end to end.`,
+        "",
+        "## Your sandbox",
+        `You have a DEDICATED Docker container for this ticket — your private workspace.`,
+        `These repositories are already cloned and WRITABLE inside it:`,
+        repoLines,
+        "",
+        "Your host filesystem is READ-ONLY. The ONLY way to change files, run commands, run tests,",
+        "or run the app is via the container_* tools:",
+        "- container_exec — run any shell command (build, test, run the app, git, install deps)",
+        "- container_write_file / container_read_file — edit/read files",
+        "- container_apply_patch — apply a unified diff in a repo",
+        "- container_status — git status of the repos",
+        "- container_clone_repo — pull in another repo for cross-repo work",
+        "",
+        "## What to do",
+        "Implement the change fully, then VERIFY it by running the project's build/tests inside the",
+        `container. Commit your work in each changed repo (git add -A && git commit) on branch`,
+        `\`${dispatch.branch}\`. Do NOT open a pull request — that happens after review.`,
+        dispatch.grillGuidance ? `\n## Clarified requirements\n${dispatch.grillGuidance}` : "",
+    ]
+        .filter(Boolean)
+        .join("\n");
+    const task = [
+        `Issue ${issue.identifier}: ${issue.title}`,
+        issue.description ? `\nIssue body:\n${issue.description}` : "",
+        plan ? `\nImplementation plan (from Apex):\n${plan}` : "",
+        reworkNote ? `\n${reworkNote}` : "",
+    ]
+        .filter(Boolean)
+        .join("\n");
+    // Match the agentId the dispatch registered its active session under, so the
+    // container tools resolve this issue's container via getActiveSessionByAgentId.
+    const agentId = ctx.pluginConfig?.implementerAgentId ??
+        getActiveSession(dispatch.issueId)?.agentId ??
+        "main";
+    const r = await runAgent({
+        api: ctx.api,
+        agentId,
+        // Stable per-ticket session → one continuous, steerable implementer.
+        sessionId: `linear-impl-${dispatch.issueIdentifier}`,
+        message: task,
+        extraSystemPrompt: system,
+        // Deny host writes/exec — the agent acts ONLY through the container tools.
+        toolsDeny: READ_ONLY_DENY,
+        streaming: dispatch.agentSessionId
+            ? { linearApi: ctx.linearApi, agentSessionId: dispatch.agentSessionId }
+            : undefined,
+        abortKey: dispatch.issueId,
+    });
+    return { success: r.success, output: r.output };
+}
 async function runImplementPhase(ctx, dispatch, issue) {
     const limit = maxRework(ctx.pluginConfig);
     let assignments = await runApexPlan(ctx, dispatch, issue);
     let lastReason = "";
+    const useContainerAgent = implementerUsesContainer(ctx.pluginConfig);
     for (let attempt = 0; attempt <= limit; attempt++) {
         if (isCancelled(dispatch.issueId))
             return { success: false, reason: "halted" };
         setStatus(dispatch, attempt === 0 ? "implementing" : `reworking (attempt ${attempt + 1})`);
-        // Implementers run sequentially — they share one worktree.
         const attemptOutputs = [];
-        for (const a of assignments) {
-            if (isCancelled(dispatch.issueId))
-                return { success: false, reason: "halted" };
-            const role = resolveRole(a.role) ?? ROLES.spine;
-            const { success, output } = await runRole(ctx, dispatch, role, "implement", a.task, issue);
-            attemptOutputs.push(`## ${role.label}\n${output}`);
-            if (!success) {
-                lastReason = `${role.label} implementation failed: ${output.slice(-300)}`;
-                // Keep going to self-review — codex may have partially applied changes.
+        if (useContainerAgent) {
+            // One steerable agent per ticket, editing + running ONLY inside its container.
+            const { success, output } = await runContainerImplement(ctx, dispatch, issue, assignments, reworkNoteFrom(lastReason, attempt));
+            attemptOutputs.push(output);
+            lastReason = success ? "" : `implementation agent failed: ${output.slice(-300)}`;
+        }
+        else {
+            // Legacy: one-shot codex exec per specialist, sharing the container.
+            for (const a of assignments) {
+                if (isCancelled(dispatch.issueId))
+                    return { success: false, reason: "halted" };
+                const role = resolveRole(a.role) ?? ROLES.spine;
+                const { success, output } = await runRole(ctx, dispatch, role, "implement", a.task, issue);
+                attemptOutputs.push(`## ${role.label}\n${output}`);
+                if (!success) {
+                    lastReason = `${role.label} implementation failed: ${output.slice(-300)}`;
+                    // Keep going to self-review — codex may have partially applied changes.
+                }
             }
         }
         // Persist this attempt's implementer output for future-session recall.
@@ -290,8 +382,9 @@ async function runImplementPhase(ctx, dispatch, issue) {
             type: "thought",
             body: `🔁 Apex self-review failed (attempt ${attempt + 1}/${limit + 1}): ${verdict.reason}`,
         });
-        if (attempt < limit) {
-            // Rework: re-run each implementer focused on the reviewer's findings.
+        if (attempt < limit && !useContainerAgent) {
+            // Legacy codex rework: re-task each implementer on the reviewer's findings.
+            // (The container agent gets the findings via reworkNoteFrom(lastReason).)
             assignments = assignments.map((a) => ({
                 role: a.role,
                 task: `Fix the following review findings, preserving working code:\n${verdict.reason}`,
@@ -299,6 +392,18 @@ async function runImplementPhase(ctx, dispatch, issue) {
         }
     }
     return { success: false, reason: lastReason || "implementation did not pass self-review" };
+}
+/**
+ * Build the rework instruction for a container-agent retry, or undefined on the
+ * first attempt / when there's nothing to address.
+ * @param lastReason - the previous attempt's failure/verdict reason
+ * @param attempt - the current attempt index (0-based)
+ * @returns a rework note, or undefined
+ */
+function reworkNoteFrom(lastReason, attempt) {
+    if (attempt === 0 || !lastReason)
+        return undefined;
+    return `This is rework attempt ${attempt + 1}. Address these review findings, preserving working code:\n${lastReason}`;
 }
 /**
  * Whether any target repo in the container has uncommitted working-tree changes.

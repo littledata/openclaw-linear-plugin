@@ -207,7 +207,7 @@ async function runAgentOnce(params: {
 //   group:web (web_search, web_fetch) — external context
 //   group:memory (memory_search/get)  — knowledge retrieval
 //   sessions_list, sessions_history   — read-only introspection
-const READ_ONLY_DENY: string[] = [
+export const READ_ONLY_DENY: string[] = [
   // group:fs = read + write + edit + apply_patch — but we need read,
   // so deny the write-capable members individually.
   "write", "edit", "apply_patch",

@@ -38,6 +38,17 @@ vi.mock("./steering-tools.js", () => ({
   ]),
 }));
 
+vi.mock("./container-tools.js", () => ({
+  createContainerTools: vi.fn(() => [
+    { name: "container_exec", execute: vi.fn() },
+    { name: "container_write_file", execute: vi.fn() },
+    { name: "container_read_file", execute: vi.fn() },
+    { name: "container_apply_patch", execute: vi.fn() },
+    { name: "container_status", execute: vi.fn() },
+    { name: "container_clone_repo", execute: vi.fn() },
+  ]),
+}));
+
 import { createLinearTools } from "./tools.js";
 import { createCodeTools } from "./code-tool.js";
 import { createOrchestrationTools } from "./orchestration-tools.js";
@@ -64,7 +75,7 @@ describe("createLinearTools", () => {
     const api = makeApi();
     const tools = createLinearTools(api, {});
 
-    expect(tools).toHaveLength(9);
+    expect(tools).toHaveLength(15);
     const names = tools.map((t: any) => t.name);
     expect(names).toContain("cli_codex");
     expect(names).toContain("cli_claude");
@@ -89,7 +100,7 @@ describe("createLinearTools", () => {
     const api = makeApi({ enableOrchestration: false });
     const tools = createLinearTools(api, {});
 
-    expect(tools).toHaveLength(7);
+    expect(tools).toHaveLength(13);
     const names = tools.map((t: any) => t.name);
     expect(names).toContain("cli_codex");
     expect(names).toContain("cli_claude");
@@ -107,7 +118,7 @@ describe("createLinearTools", () => {
     const api = makeApi();
     const tools = createLinearTools(api, {});
 
-    expect(tools).toHaveLength(6);
+    expect(tools).toHaveLength(12);
     const names = tools.map((t: any) => t.name);
     expect(names).toContain("spawn_agent");
     expect(names).toContain("ask_agent");
@@ -126,7 +137,7 @@ describe("createLinearTools", () => {
     const api = makeApi();
     const tools = createLinearTools(api, {});
 
-    expect(tools).toHaveLength(7);
+    expect(tools).toHaveLength(13);
     const names = tools.map((t: any) => t.name);
     expect(names).toContain("cli_codex");
     expect(names).toContain("cli_claude");
@@ -146,7 +157,7 @@ describe("createLinearTools", () => {
     const api = makeApi();
     const tools = createLinearTools(api, {});
 
-    expect(tools).toHaveLength(8);
+    expect(tools).toHaveLength(14);
     const names = tools.map((t: any) => t.name);
     expect(names).toContain("cli_codex");
     expect(names).toContain("cli_claude");

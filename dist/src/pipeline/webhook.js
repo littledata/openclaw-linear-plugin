@@ -8,7 +8,8 @@ import { createManagedFlowForDispatch } from "./taskflow-bridge.js";
 import { createNotifierFromConfig } from "../infra/notify.js";
 import { assessTier } from "./tier-assess.js";
 import { recommendRepos } from "./recommend-repos.js";
-import { startOrReuseContainer, destroyContainer, stopContainerRun, containerNameForIssue, readGhTokenFromCredentials } from "../infra/container-runner.js";
+import { startOrReuseContainer, buildContainerSpec, destroyContainer, stopContainerRun, containerNameForIssue } from "../infra/container-runner.js";
+import { setContainerRecord, getContainerRecord, removeContainerRecord } from "../infra/container-registry.js";
 import { resolveRepos, getRepoEntries, resolveReposByNames, buildCandidateRepositories, detectMentionedRepos } from "../infra/multi-repo.js";
 import { repoSelectSignal, optionsSignal, RESUME_SELECT } from "./select-signal.js";
 import { savePendingRepoSelection, getPendingRepoSelection, clearPendingRepoSelection, parseRepoSelection, } from "./repo-selection-state.js";
@@ -730,6 +731,7 @@ export async function handleLinearWebhook(api, req, res) {
                     try {
                         // Fresh = throw away the warm container; the re-dispatch recreates it.
                         destroyContainer(containerNameForIssue(issue.identifier ?? issue.id));
+                        removeContainerRecord(issue.identifier ?? issue.id);
                     }
                     catch (err) {
                         api.logger.warn(`resume-fresh container destroy failed: ${err}`);
@@ -2273,23 +2275,20 @@ async function handleDispatch(api, linearApi, issue, opts) {
     const worktreeBranch = dispatchBranch;
     let containerName;
     try {
-        const start = startOrReuseContainer({
-            issueIdentifier: identifier,
-            image: pluginConfig?.workerImage ?? "openclaw-linear-worker:latest",
-            targetRepos: targetRepoNames,
-            branch: dispatchBranch,
-            reposRoot: pluginConfig?.reposRoot ?? join(home, "repos"),
-            clawHostDir,
-            codexAuthFile: join(home, ".codex", "auth.json"),
-            gitCredentialsFile,
-            ghToken: pluginConfig?.githubToken ??
-                process.env.GH_TOKEN ??
-                readGhTokenFromCredentials(gitCredentialsFile),
-            memory: pluginConfig?.containerMemory ?? "6g",
-            cpus: pluginConfig?.containerCpus ?? "3",
-            createdAtMs: Date.now(),
-        }, api.logger);
+        const nowMs = Date.now();
+        const start = startOrReuseContainer(buildContainerSpec(identifier, targetRepoNames, dispatchBranch, pluginConfig, nowMs), api.logger);
         containerName = start.name;
+        // Record the container so the agent's container tools + the idle reaper can
+        // find it. Reuse preserves the original createdAt; a fresh create stamps now.
+        const existing = getContainerRecord(identifier);
+        setContainerRecord({
+            issueIdentifier: identifier,
+            containerName: start.name,
+            repos: targetRepoNames,
+            branch: dispatchBranch,
+            createdAtMs: start.reused && existing ? existing.createdAtMs : nowMs,
+            lastUsedMs: nowMs,
+        });
         api.logger.info(`@dispatch: ${identifier} container ${start.reused ? "reused" : "created"} (${start.name}) repos=${targetRepoNames.join(",")}`);
     }
     catch (err) {

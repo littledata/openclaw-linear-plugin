@@ -27,10 +27,13 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { mkdirSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { LinearAgentApi, ActivityContent } from "../api/linear-api.js";
 import { InactivityWatchdog } from "../agent/watchdog.js";
 import { createProgressEmitter, formatActivityLogLine, type CliResult, type OnProgressUpdate } from "../tools/cli-shared.js";
 import { mapCodexEventToActivity } from "../tools/codex-tool.js";
+import { listContainerRecords, removeContainerRecord, selectIdleExpired } from "./container-registry.js";
 
 export const CONTAINER_PREFIX = "openclaw-linear";
 export const ISSUE_LABEL = "openclaw.linear.issue";
@@ -298,6 +301,92 @@ export function startOrReuseContainer(
 }
 
 /**
+ * Build a container start spec from plugin config + host defaults. Centralizes the
+ * config plumbing so both the initial dispatch and a later revive use identical
+ * settings.
+ * @param identifier - the Linear issue identifier
+ * @param targetRepos - repo names to clone writable
+ * @param branch - the working branch
+ * @param pluginConfig - the plugin config (image/reposRoot/memory/cpus/token overrides)
+ * @param createdAtMs - creation timestamp (for the TTL label)
+ * @returns a fully-populated ContainerStartSpec
+ */
+export function buildContainerSpec(
+  identifier: string,
+  targetRepos: string[],
+  branch: string,
+  pluginConfig: Record<string, unknown> | undefined,
+  createdAtMs: number,
+): ContainerStartSpec {
+  const home = process.env.HOME ?? homedir();
+  const containersBase =
+    (pluginConfig?.containersBaseDir as string) ?? join(home, ".openclaw", "containers");
+  const hostRoot = join(containersBase, identifier.replace(/[^a-zA-Z0-9_.-]/g, "-"));
+  const gitCredentialsFile = join(home, ".git-credentials");
+  return {
+    issueIdentifier: identifier,
+    image: (pluginConfig?.workerImage as string) ?? "openclaw-linear-worker:latest",
+    targetRepos,
+    branch,
+    reposRoot: (pluginConfig?.reposRoot as string) ?? join(home, "repos"),
+    clawHostDir: join(hostRoot, ".claw"),
+    codexAuthFile: join(home, ".codex", "auth.json"),
+    gitCredentialsFile,
+    ghToken:
+      (pluginConfig?.githubToken as string) ??
+      process.env.GH_TOKEN ??
+      readGhTokenFromCredentials(gitCredentialsFile),
+    memory: (pluginConfig?.containerMemory as string) ?? "6g",
+    cpus: (pluginConfig?.containerCpus as string) ?? "3",
+    createdAtMs,
+  };
+}
+
+/**
+ * Ensure the issue's container is up and provisioned before running work in it.
+ * Handles the three post-crash states: running (reuse), stopped (`docker start`
+ * to preserve the cloned repos), or gone (recreate from a fresh spec). Returns
+ * the live container name, or null if it couldn't be revived.
+ * @param identifier - the Linear issue identifier
+ * @param repos - target repo names
+ * @param branch - the working branch
+ * @param pluginConfig - the plugin config
+ * @param logger - logger
+ * @returns the running container name, or null on failure
+ */
+export function ensureContainerAlive(
+  identifier: string,
+  repos: string[],
+  branch: string,
+  pluginConfig: Record<string, unknown> | undefined,
+  logger: { info: (m: string) => void; warn: (m: string) => void },
+): string | null {
+  const name = containerNameForIssue(identifier);
+  if (isContainerRunning(name)) return name;
+  if (containerExists(name)) {
+    // Stopped (e.g. host reboot, OOM of the payload, or an exec killed by a
+    // gateway restart). Restart it — the cloned repos + any commits survive.
+    const started = dockerSync(["start", name], { timeoutMs: 30_000 });
+    if (started.status === 0 && isContainerRunning(name)) {
+      logger.info(`[container] restarted stopped container ${name}`);
+      provisionRepos(name, repos, branch, logger); // idempotent — no-op if already cloned
+      return name;
+    }
+    logger.warn(`[container] failed to restart ${name} (exit ${started.status}) — recreating`);
+    destroyContainer(name);
+  }
+  try {
+    const spec = buildContainerSpec(identifier, repos, branch, pluginConfig, Date.now());
+    const res = startOrReuseContainer(spec, logger);
+    logger.info(`[container] revived ${res.name} (recreated)`);
+    return res.name;
+  } catch (err) {
+    logger.warn(`[container] could not revive ${name}: ${err}`);
+    return null;
+  }
+}
+
+/**
  * Clone/checkout the given repos inside a running container (idempotent).
  * Returns the names of repos that are actually present (have a .git dir) after
  * the attempt, so callers can detect a fully-empty provisioning.
@@ -333,6 +422,74 @@ export function cloneRepo(name: string, repo: string, branch: string): DockerRes
     ["exec", "-e", `REPO=${repo}`, "-e", `BRANCH=${branch}`, name, "sh", "-c", CLONE_ONE_SCRIPT],
     { timeoutMs: 120_000 },
   );
+}
+
+export interface ContainerCommandResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * Run an arbitrary shell command inside the container and capture its output.
+ * The command is passed via env + `eval` (never interpolated into the script
+ * text), so quoting/pipes/redirects are preserved and a hostile string can't
+ * break out of the intended shell — and the container is the sandbox regardless.
+ * @param name - container name
+ * @param command - the shell command line to run
+ * @param cwd - working directory inside the container (default /work)
+ * @param timeoutMs - max runtime (default 10 min)
+ * @returns exit code + captured stdout/stderr
+ */
+export function execInContainer(
+  name: string,
+  command: string,
+  cwd: string = WORK_ROOT,
+  timeoutMs: number = 600_000,
+): ContainerCommandResult {
+  const r = dockerSync(
+    ["exec", "-w", cwd, "-e", `AGENT_CMD=${command}`, name, "sh", "-c", 'eval "$AGENT_CMD"'],
+    { timeoutMs },
+  );
+  return { exitCode: r.status ?? -1, stdout: r.stdout, stderr: r.stderr };
+}
+
+/**
+ * Write a file inside the container (content base64-piped so any bytes/quotes
+ * survive). Creates parent directories.
+ * @param name - container name
+ * @param filePath - absolute path inside the container
+ * @param content - file contents
+ * @returns exit code + captured output
+ */
+export function writeFileToContainer(name: string, filePath: string, content: string): ContainerCommandResult {
+  const b64 = Buffer.from(content, "utf8").toString("base64");
+  const r = dockerSync(
+    [
+      "exec",
+      "-e",
+      `FP=${filePath}`,
+      "-e",
+      `B64=${b64}`,
+      name,
+      "sh",
+      "-c",
+      'mkdir -p "$(dirname "$FP")" && printf %s "$B64" | base64 -d > "$FP"',
+    ],
+    { timeoutMs: 60_000 },
+  );
+  return { exitCode: r.status ?? -1, stdout: r.stdout, stderr: r.stderr };
+}
+
+/**
+ * Read a file from inside the container.
+ * @param name - container name
+ * @param filePath - absolute path inside the container
+ * @returns exit code + file contents (in stdout)
+ */
+export function readFileFromContainer(name: string, filePath: string): ContainerCommandResult {
+  const r = dockerSync(["exec", "-e", `FP=${filePath}`, name, "sh", "-c", 'cat "$FP"'], { timeoutMs: 60_000 });
+  return { exitCode: r.status ?? -1, stdout: r.stdout, stderr: r.stderr };
 }
 
 export interface ContainerGitStatus {
@@ -387,17 +544,39 @@ export function stopContainerRun(name: string): boolean {
   return r.status === 0;
 }
 
-/** Reap containers whose TTL has elapsed. Returns removed names. */
+/**
+ * Reap containers idle past the TTL (SLIDING — reset on every container tool use,
+ * tracked in the container registry), plus orphan labeled containers that have no
+ * registry record and are older than the TTL by creation. Returns removed names.
+ * @param now - current time in ms
+ * @param ttlMs - idle time-to-live in ms
+ * @returns the container names removed
+ */
 export function reapExpiredContainers(now: number, ttlMs: number = CONTAINER_TTL_MS): string[] {
+  const removed: string[] = [];
+  // 1. Idle-expired registered containers (sliding TTL on lastUsed).
+  const records = listContainerRecords();
+  const knownNames = new Set(records.map((rec) => rec.containerName));
+  for (const rec of selectIdleExpired(records, now, ttlMs)) {
+    destroyContainer(rec.containerName);
+    removeContainerRecord(rec.issueIdentifier);
+    removed.push(rec.containerName);
+  }
+  // 2. Orphans: labeled worker containers with no registry record, expired by
+  //    creation time (stale from before the registry, or a lost record).
   const r = dockerSync([
     "ps", "-a",
     "--filter", `label=${ISSUE_LABEL}`,
     "--format", `{{.Names}}|{{.Label "${CREATED_LABEL}"}}`,
   ]);
-  if (r.status !== 0) return [];
-  const expired = selectExpired(parseContainerRows(r.stdout), now, ttlMs);
-  for (const name of expired) destroyContainer(name);
-  return expired;
+  if (r.status === 0) {
+    const orphanRows = parseContainerRows(r.stdout).filter((row) => !knownNames.has(row.name));
+    for (const name of selectExpired(orphanRows, now, ttlMs)) {
+      destroyContainer(name);
+      removed.push(name);
+    }
+  }
+  return removed;
 }
 
 // ---------------------------------------------------------------------------

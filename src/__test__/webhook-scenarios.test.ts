@@ -129,10 +129,25 @@ vi.mock("../infra/codex-worktree.js", () => ({
 
 vi.mock("../infra/container-runner.js", () => ({
   startOrReuseContainer: vi.fn().mockReturnValue({ name: "openclaw-linear-ENG-123", reused: false }),
+  buildContainerSpec: vi.fn((identifier: string, targetRepos: string[], branch: string) => ({
+    issueIdentifier: identifier,
+    image: "openclaw-linear-worker:latest",
+    targetRepos,
+    branch,
+    reposRoot: "/root/repos",
+    clawHostDir: `/root/.openclaw/containers/${identifier}/.claw`,
+    createdAtMs: 0,
+  })),
   destroyContainer: vi.fn(),
   stopContainerRun: vi.fn().mockReturnValue(false),
   containerNameForIssue: (id: string) => `openclaw-linear-${id}`,
   readGhTokenFromCredentials: vi.fn().mockReturnValue("ght_test"),
+}));
+
+vi.mock("../infra/container-registry.js", () => ({
+  setContainerRecord: vi.fn(),
+  getContainerRecord: vi.fn().mockReturnValue(undefined),
+  removeContainerRecord: vi.fn(),
 }));
 
 vi.mock("../pipeline/orchestrator.js", () => ({
