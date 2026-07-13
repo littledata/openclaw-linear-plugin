@@ -32,6 +32,7 @@ const {
   mockCreateSessionOnIssue,
   mockClassifyIntent,
   mockSpawnWorker,
+  mockRunStatePlan,
   mockSetActiveSession,
   mockClearActiveSession,
   mockEmitDiagnostic,
@@ -48,6 +49,7 @@ const {
   mockCreateSessionOnIssue: vi.fn(),
   mockClassifyIntent: vi.fn(),
   mockSpawnWorker: vi.fn(),
+  mockRunStatePlan: vi.fn().mockResolvedValue(undefined),
   mockSetActiveSession: vi.fn(),
   mockClearActiveSession: vi.fn(),
   mockEmitDiagnostic: vi.fn(),
@@ -70,6 +72,7 @@ vi.mock("../api/linear-api.js", () => ({
     getTeamLabels = mockGetTeamLabels;
     getTeamStates = mockGetTeamStates;
     createSessionOnIssue = mockCreateSessionOnIssue;
+    getRecentComments = vi.fn().mockResolvedValue([]);
   },
   resolveLinearToken: vi.fn().mockReturnValue({
     accessToken: "test-token",
@@ -124,9 +127,25 @@ vi.mock("../infra/codex-worktree.js", () => ({
   prepareWorkspace: vi.fn().mockReturnValue({ pulled: false, submodulesInitialized: false, errors: [] }),
 }));
 
+vi.mock("../infra/container-runner.js", () => ({
+  startOrReuseContainer: vi.fn().mockReturnValue({ name: "openclaw-linear-ENG-123", reused: false }),
+  destroyContainer: vi.fn(),
+  stopContainerRun: vi.fn().mockReturnValue(false),
+  containerNameForIssue: (id: string) => `openclaw-linear-${id}`,
+  readGhTokenFromCredentials: vi.fn().mockReturnValue("ght_test"),
+}));
+
+vi.mock("../pipeline/orchestrator.js", () => ({
+  runStatePlan: mockRunStatePlan,
+}));
+
 vi.mock("../infra/multi-repo.js", () => ({
-  resolveRepos: vi.fn().mockReturnValue({ repos: [] }),
+  resolveRepos: vi.fn().mockReturnValue({ repos: [{ name: "main", path: "/home/claw/ai-workspace" }], source: "config_default" }),
   isMultiRepo: vi.fn().mockReturnValue(false),
+  getRepoEntries: vi.fn().mockReturnValue({}),
+  resolveReposByNames: vi.fn().mockReturnValue({ repos: [{ name: "main", path: "/home/claw/ai-workspace" }], source: "repo_selection" }),
+  buildCandidateRepositories: vi.fn().mockReturnValue([]),
+  detectMentionedRepos: vi.fn().mockReturnValue([]),
 }));
 
 vi.mock("../pipeline/artifacts.js", () => ({
@@ -563,13 +582,17 @@ describe("webhook scenario tests — full handler flows", () => {
     it("assignment dispatch: triggers handleDispatch pipeline", async () => {
       // Set viewerId to match the fixture's assigneeId
       mockGetViewerId.mockResolvedValue("viewer-1");
+      mockGetIssueDetails.mockResolvedValue(makeIssueDetails({
+        state: { name: "In Progress", type: "started" },
+      }));
 
       const api = createApi();
       const payload = makeIssueUpdateWithAssignment();
       await postWebhook(api, payload);
 
-      await waitForMock(mockSpawnWorker, { timeout: 3000 });
-      expect(mockSpawnWorker).toHaveBeenCalledOnce();
+      // Container-only: dispatch runs the state-driven orchestrator in a container.
+      await waitForMock(mockRunStatePlan, { timeout: 3000 });
+      expect(mockRunStatePlan).toHaveBeenCalledOnce();
     });
   });
 

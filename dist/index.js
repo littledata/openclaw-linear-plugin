@@ -19,6 +19,32 @@ import { registerDispatchCommands } from "./src/infra/commands.js";
 import { createDispatchHistoryTool } from "./src/tools/dispatch-history-tool.js";
 import { readDispatchState as readStateForHook, listActiveDispatches as listActiveForHook } from "./src/pipeline/dispatch-state.js";
 import { startTokenRefreshTimer, stopTokenRefreshTimer } from "./src/infra/token-refresh-timer.js";
+import { reapExpiredContainers, CONTAINER_TTL_MS } from "./src/infra/container-runner.js";
+let containerReaperTimer;
+/**
+ * Start the container reaper: an immediate sweep plus every 30 min, removing
+ * per-issue containers past their TTL (default 24h). Persistent containers keep
+ * resume fast; the reaper caps the idle tail.
+ * @param api - the plugin API (for logging)
+ * @param pluginConfig - plugin config (`containerTtlMs` override)
+ */
+function startContainerReaper(api, pluginConfig) {
+    const ttlMs = typeof pluginConfig?.containerTtlMs === "number" ? pluginConfig.containerTtlMs : CONTAINER_TTL_MS;
+    const sweep = () => {
+        try {
+            const removed = reapExpiredContainers(Date.now(), ttlMs);
+            if (removed.length)
+                api.logger.info(`[container-reaper] removed ${removed.length} expired container(s): ${removed.join(", ")}`);
+        }
+        catch (err) {
+            api.logger.warn(`[container-reaper] sweep failed: ${err}`);
+        }
+    };
+    sweep();
+    containerReaperTimer = setInterval(sweep, 30 * 60_000);
+    if (typeof containerReaperTimer.unref === "function")
+        containerReaperTimer.unref();
+}
 const SUCCESS_STATUSES = new Set(["ok", "success", "completed", "complete", "done", "pass", "passed"]);
 const FAILURE_STATUSES = new Set(["error", "failed", "failure", "timeout", "timed_out", "cancelled", "canceled", "aborted", "unknown"]);
 function parseCompletionSuccess(event) {
@@ -431,6 +457,12 @@ export default function register(api) {
     api.logger.info(`Linear agent extension registered (agent: ${agentId}, token: ${tokenInfo.source !== "none" ? `${tokenInfo.source}` : "missing"}, ${cliSummary}, orchestration: ${orchestration})`);
     // Start proactive token refresh timer (runs immediately, then every 6h)
     startTokenRefreshTimer(api, pluginConfig);
-    // Clean up timer on process exit
-    process.on("beforeExit", () => stopTokenRefreshTimer());
+    // Start the container reaper (immediate sweep + every 30 min)
+    startContainerReaper(api, pluginConfig);
+    // Clean up timers on process exit
+    process.on("beforeExit", () => {
+        stopTokenRefreshTimer();
+        if (containerReaperTimer)
+            clearInterval(containerReaperTimer);
+    });
 }

@@ -19,8 +19,7 @@
  * single-worker pipeline (spawnWorker) is untouched.
  */
 import { runAgent } from "../agent/agent.js";
-import { runCodex } from "../tools/codex-tool.js";
-import { createPullRequest, getWorktreeStatus } from "../infra/codex-worktree.js";
+import { execCodexInContainer, containerGitStatus, openPrInContainer, repoWorkdir, WORK_ROOT, } from "../infra/container-runner.js";
 import { readManifest, writeManifest, updateManifest, savePlan, saveWorkerOutput, appendLog } from "./artifacts.js";
 import { ROLES, resolveRole, implementerRoles, buildRolePrompt, parseReviewVerdict, resolveRoleModel, resolveRoleBackend, loadSkillGuidance, roleToolsDeny, } from "./roles.js";
 import { resolveTargetState } from "./state-plan.js";
@@ -29,6 +28,12 @@ import { isCancelled, clearCancel } from "./cancellation.js";
 function maxRework(pluginConfig) {
     const v = pluginConfig?.maxReworkAttempts;
     return typeof v === "number" && v >= 0 ? v : 2;
+}
+/** Codex inactivity + hard timeouts (config `inactivitySec`/`toolTimeoutSec`). */
+function resolveCodexTimeouts(cfg) {
+    const inactivitySec = typeof cfg?.inactivitySec === "number" ? cfg.inactivitySec : 3600;
+    const toolTimeoutSec = typeof cfg?.toolTimeoutSec === "number" ? cfg.toolTimeoutSec : 7200;
+    return { inactivityMs: inactivitySec * 1000, timeoutMs: toolTimeoutSec * 1000 };
 }
 /**
  * Ensure a `.claw/manifest.json` exists so updateManifest / buildSummaryFromArtifacts
@@ -77,13 +82,14 @@ async function comment(ctx, dispatch, body) {
 // Task-body builder (the DATA; the persona/skill lives in the system prompt)
 // ---------------------------------------------------------------------------
 function buildRoleTask(issue, dispatch, extra) {
-    const worktree = dispatch.worktrees
-        ? dispatch.worktrees.map((w) => `${w.repoName}: ${w.path}`).join("\n")
-        : dispatch.worktreePath;
+    const repos = dispatch.containerRepos ?? [];
+    const workspace = repos.length
+        ? repos.map((r) => `${r}: ${repoWorkdir(r)}`).join("\n")
+        : WORK_ROOT;
     return [
         `Linear issue ${issue.identifier}: ${issue.title}`,
         issue.description ? `\nIssue body:\n${issue.description}` : "",
-        `\nWorktree(s):\n${worktree}`,
+        `\nRepositories (edit + commit here; you may clone others from /repos-ro):\n${workspace}`,
         dispatch.grillGuidance ? `\nClarified requirements:\n${dispatch.grillGuidance}` : "",
         extra ? `\n${extra}` : "",
     ]
@@ -117,16 +123,26 @@ async function runRole(ctx, dispatch, role, phase, extra, issue) {
         const codexSystem = skillBody
             ? `${system}\n\n## Your specialist guidance (${role.skill})\n${skillBody}`
             : system;
-        const r = await runCodex(ctx.api, {
+        if (!dispatch.containerName) {
+            return { success: false, output: "No container provisioned for this dispatch — cannot run codex." };
+        }
+        // Single target repo → run inside it; multiple → run at /work so the agent
+        // can work across the cloned repos.
+        const repos = dispatch.containerRepos ?? [];
+        const workdir = repos.length === 1 ? repoWorkdir(repos[0]) : WORK_ROOT;
+        const { inactivityMs, timeoutMs } = resolveCodexTimeouts(ctx.pluginConfig);
+        const r = await execCodexInContainer({
+            containerName: dispatch.containerName,
+            workdir,
             prompt: `${codexSystem}\n\n${task}`,
-            workingDir: dispatch.worktreePath,
+            model: resolveRoleModel(role, ctx.pluginConfig) ?? ctx.pluginConfig?.codexModel,
+            effort: ctx.pluginConfig?.codexReasoningEffort,
+            timeoutMs,
+            inactivityMs,
+            linearApi: ctx.linearApi,
             agentSessionId: dispatch.agentSessionId,
-            issueId: dispatch.issueId,
-            issueIdentifier: dispatch.issueIdentifier,
-            ...(resolveRoleModel(role, ctx.pluginConfig)
-                ? { model: resolveRoleModel(role, ctx.pluginConfig) }
-                : {}),
-        }, ctx.pluginConfig);
+            logger: ctx.api.logger,
+        });
         return { success: r.success, output: r.output };
     }
     const r = await runAgent({
@@ -269,20 +285,44 @@ async function runImplementPhase(ctx, dispatch, issue) {
     }
     return { success: false, reason: lastReason || "implementation did not pass self-review" };
 }
-/** Open a PR from the worktree so the Code Review phase has something to review. */
+/**
+ * Open a PR per changed repo (cross-repo aware) from inside the container so the
+ * Code Review phase has something to review. Repos with no changes are skipped.
+ */
 async function openPr(ctx, dispatch, issue) {
-    try {
-        const status = getWorktreeStatus(dispatch.worktreePath);
-        if (!status.hasUncommitted && !status.lastCommit) {
-            ctx.api.logger.warn(`[orchestrator] ${issue.identifier} no changes to open a PR`);
-            return;
-        }
-        const { prUrl } = createPullRequest(dispatch.worktreePath, `${issue.identifier}: ${issue.title}`, `Implements ${issue.identifier}.\n\n_Opened by the state-driven agent pipeline (Apex → implementers → self-review)._`);
-        await comment(ctx, dispatch, `## ✅ Implementation complete\n\nPR: ${prUrl}`);
+    const repos = dispatch.containerRepos ?? [];
+    if (!dispatch.containerName || !repos.length) {
+        ctx.api.logger.warn(`[orchestrator] ${issue.identifier} no container/repos to open a PR`);
+        return;
     }
-    catch (err) {
-        ctx.api.logger.warn(`[orchestrator] PR creation failed for ${issue.identifier}: ${err}`);
-        await comment(ctx, dispatch, `## ⚠️ Implementation complete, PR creation failed\n\n\`${String(err).slice(0, 300)}\``);
+    const opened = [];
+    const failures = [];
+    const body = `Implements ${issue.identifier}.\n\n_Opened by the state-driven agent pipeline (Apex → implementers → self-review)._`;
+    for (const repo of repos) {
+        try {
+            const status = containerGitStatus(dispatch.containerName, repo);
+            if (!status.hasChanges) {
+                // Still attempt: the agent may have committed (porcelain clean but ahead
+                // of base). openPrInContainer no-ops gh when there's truly no diff.
+            }
+            const prUrl = openPrInContainer(dispatch.containerName, repo, dispatch.branch, `${issue.identifier}: ${issue.title}`, body);
+            if (prUrl)
+                opened.push(`**${repo}**: ${prUrl}`);
+        }
+        catch (err) {
+            ctx.api.logger.warn(`[orchestrator] PR failed for ${issue.identifier}/${repo}: ${err}`);
+            failures.push(`**${repo}**: ${String(err).slice(0, 200)}`);
+        }
+    }
+    if (opened.length) {
+        await comment(ctx, dispatch, `## ✅ Implementation complete\n\nPR(s):\n${opened.map((o) => `- ${o}`).join("\n")}`);
+    }
+    else if (failures.length) {
+        await comment(ctx, dispatch, `## ⚠️ Implementation complete, PR creation failed\n\n${failures.map((f) => `- ${f}`).join("\n")}`);
+    }
+    else {
+        ctx.api.logger.warn(`[orchestrator] ${issue.identifier} no changes across repos — no PR opened`);
+        emit(ctx, dispatch, { type: "thought", body: "No code changes to open a PR (nothing to review)." });
     }
 }
 // ---------------------------------------------------------------------------

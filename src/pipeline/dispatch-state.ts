@@ -61,6 +61,12 @@ export interface ActiveDispatch {
   worktrees?: Array<{ repoName: string; path: string; branch: string }>;
   grillGuidance?: string;       // implementation brief from the /grill-me interview
 
+  // Container execution (replaces worktrees). worktreePath is now the HOST
+  // artifact root (`<root>/.claw` holds plan/worker/manifest); code lives in the
+  // container at /work/<repo>.
+  containerName?: string;       // deterministic per-issue docker container
+  containerRepos?: string[];    // target repo names cloned writable in the container
+
   // OpenClaw 2026.4 task-flow integration. Populated when the plugin
   // successfully calls `api.runtime.taskFlow.bindSession(...).createManaged`.
   // null/undefined when the gateway runtime doesn't expose the taskFlow seam

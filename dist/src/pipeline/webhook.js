@@ -1,14 +1,14 @@
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { LinearAgentApi, resolveLinearToken } from "../api/linear-api.js";
-import { spawnWorker, buildProjectContext } from "./pipeline.js";
+import { buildProjectContext } from "./pipeline.js";
 import { setActiveSession, clearActiveSession, getIssueAffinity, _resetAffinityForTesting } from "./active-session.js";
 import { readDispatchState, getActiveDispatch, registerDispatch, updateDispatchStatus, removeActiveDispatch } from "./dispatch-state.js";
 import { createManagedFlowForDispatch } from "./taskflow-bridge.js";
 import { createNotifierFromConfig } from "../infra/notify.js";
 import { assessTier } from "./tier-assess.js";
-import { createWorktree, createMultiWorktree, prepareWorkspace } from "../infra/codex-worktree.js";
-import { resolveRepos, isMultiRepo, getRepoEntries, resolveReposByNames, buildCandidateRepositories, detectMentionedRepos } from "../infra/multi-repo.js";
+import { startOrReuseContainer, destroyContainer, stopContainerRun, containerNameForIssue, readGhTokenFromCredentials } from "../infra/container-runner.js";
+import { resolveRepos, getRepoEntries, resolveReposByNames, buildCandidateRepositories, detectMentionedRepos } from "../infra/multi-repo.js";
 import { repoSelectSignal, optionsSignal, RESUME_SELECT } from "./select-signal.js";
 import { savePendingRepoSelection, getPendingRepoSelection, clearPendingRepoSelection, parseRepoSelection, } from "./repo-selection-state.js";
 import { getGrill, saveGrill, clearGrill } from "./grill-state.js";
@@ -16,7 +16,6 @@ import { runStatePlan } from "./orchestrator.js";
 import { resolveStatePlan, orchestrationMode } from "./state-plan.js";
 import { gatherPriorWork, analyzeResume } from "./prior-work.js";
 import { getResume, saveResume, clearResume, parseResumeDecision, markResumeHandled, wasResumeHandledRecently, clearResumeHandled } from "./resume-state.js";
-import { wipeIssueWorkspace } from "../infra/codex-worktree.js";
 import { runGrillStep } from "./grill.js";
 import { ensureClawDir, writeManifest, writeDispatchMemory, resolveOrchestratorWorkspace } from "./artifacts.js";
 import { readPlanningState, isInPlanningMode, getPlanningSession, endPlanningSession } from "./planning-state.js";
@@ -26,7 +25,7 @@ import { emitDiagnostic } from "../infra/observability.js";
 import { classifyIntent } from "./intent-classify.js";
 import { extractGuidance, formatGuidanceAppendix, cacheGuidanceForTeam, getCachedGuidanceForTeam, isGuidanceEnabled, _resetGuidanceCacheForTesting } from "./guidance.js";
 import { loadAgentProfiles, buildMentionPattern, resolveAgentFromAlias, validateProfiles, _resetProfilesCacheForTesting } from "../infra/shared-profiles.js";
-import { getActiveTmuxSession, killActiveSession } from "../infra/tmux-runner.js";
+import { getActiveTmuxSession } from "../infra/tmux-runner.js";
 import { capturePane } from "../infra/tmux.js";
 import { loadCodingConfig, resolveToolName } from "../tools/code-tool.js";
 // ── Prompt input sanitization ─────────────────────────────────────
@@ -635,16 +634,17 @@ export async function handleLinearWebhook(api, req, res) {
         if (stopSignal === "stop") {
             const stopIdentifier = issue.identifier ?? issue.id;
             api.logger.info(`AgentSession prompted: STOP signal for ${stopIdentifier}`);
-            // Abort in-flight EMBEDDED runs (worker/auditor) — the common case — plus
-            // any tmux-based (codex exec) session. A tmux-only kill misses embedded runs.
+            // Abort in-flight EMBEDDED runs (reviewers) AND the codex process inside
+            // the container. The container is LEFT RUNNING (warm) so the next message
+            // can continue in the same workspace.
             const { abortRunsFor } = await import("../agent/agent.js");
             const abortedRuns = abortRunsFor(issue.id);
             // Flag the state-driven orchestrator to stop advancing between phases —
             // killing the current sub-run alone lets its loop spawn the next one.
             const { requestCancel } = await import("./cancellation.js");
             requestCancel(issue.id);
-            const killed = killActiveSession(issue.id);
-            const halted = abortedRuns > 0 || killed;
+            const codexKilled = stopContainerRun(containerNameForIssue(stopIdentifier));
+            const halted = abortedRuns > 0 || codexKilled;
             activeRuns.delete(issue.id);
             try {
                 await removeActiveDispatch(stopIdentifier, pluginConfig?.dispatchStatePath);
@@ -720,20 +720,13 @@ export async function handleLinearWebhook(api, req, res) {
                     return true;
                 if (decision === "fresh") {
                     api.logger.info(`AgentSession prompted: ${issue.identifier ?? issue.id} resume-gate → FRESH`);
-                    await rApi.emitActivity(session.id, { type: "thought", body: "Starting fresh — clearing the prior worktree and re-planning." }).catch(() => { });
+                    await rApi.emitActivity(session.id, { type: "thought", body: "Starting fresh — discarding the prior container and re-planning." }).catch(() => { });
                     try {
-                        const branch = resolveBranchName(issue.identifier ?? issue.id, issue.title, pluginConfig);
-                        const repoPaths = Object.values(pluginConfig?.repos ?? {})
-                            .map((v) => (typeof v === "string" ? v : v?.path))
-                            .filter((p) => typeof p === "string");
-                        wipeIssueWorkspace(issue.identifier ?? issue.id, {
-                            baseDir: pluginConfig?.worktreeBaseDir,
-                            branch,
-                            repos: repoPaths,
-                        });
+                        // Fresh = throw away the warm container; the re-dispatch recreates it.
+                        destroyContainer(containerNameForIssue(issue.identifier ?? issue.id));
                     }
                     catch (err) {
-                        api.logger.warn(`resume-fresh wipe failed: ${err}`);
+                        api.logger.warn(`resume-fresh container destroy failed: ${err}`);
                     }
                     void handleDispatch(api, rApi, issue, {
                         existingSessionId: resumePending.agentSessionId ?? session.id,
@@ -2230,53 +2223,46 @@ async function handleDispatch(api, linearApi, issue, opts) {
         issueId: issue.id,
         agentId: resolveAgentId(api),
     });
-    // 5. Create persistent worktree(s)
-    let worktreePath;
-    let worktreeBranch;
-    let worktreeResumed;
-    let worktrees;
-    // Branch name from the configurable `branchTemplate` (default: codex/{identifier}).
+    // 5. Create (or reuse) the per-issue container. Repos are cloned writable
+    //    inside it from the read-only /root/repos mount; code lives at /work/<repo>.
+    //    worktreePath below is the HOST artifact root (.claw); no git worktrees.
+    const targetRepoNames = repoResolution.repos.map((r) => r.name);
     const dispatchBranch = resolveBranchName(identifier, enrichedIssue.title, pluginConfig);
+    const home = process.env.HOME ?? homedir();
+    const containersBase = pluginConfig?.containersBaseDir ??
+        worktreeBaseDir ??
+        join(home, ".openclaw", "containers");
+    const hostRoot = join(containersBase, identifier.replace(/[^a-zA-Z0-9_.-]/g, "-"));
+    const clawHostDir = join(hostRoot, ".claw");
+    const gitCredentialsFile = join(home, ".git-credentials");
+    const worktreePath = hostRoot;
+    const worktreeBranch = dispatchBranch;
+    let containerName;
     try {
-        if (isMultiRepo(repoResolution)) {
-            const multi = createMultiWorktree(identifier, repoResolution.repos, { baseDir: worktreeBaseDir, branch: dispatchBranch });
-            worktreePath = multi.parentPath;
-            worktreeBranch = dispatchBranch;
-            worktreeResumed = multi.worktrees.some(w => w.resumed);
-            worktrees = multi.worktrees.map(w => ({ repoName: w.repoName, path: w.path, branch: w.branch }));
-            api.logger.info(`@dispatch: multi-repo worktrees ${worktreeResumed ? "resumed" : "created"} at ${worktreePath} (${repoResolution.repos.map(r => r.name).join(", ")})`);
-        }
-        else {
-            const single = createWorktree(identifier, { baseRepo, baseDir: worktreeBaseDir, branch: dispatchBranch });
-            worktreePath = single.path;
-            worktreeBranch = single.branch;
-            worktreeResumed = single.resumed;
-            api.logger.info(`@dispatch: worktree ${worktreeResumed ? "resumed" : "created"} at ${worktreePath}`);
-        }
+        const start = startOrReuseContainer({
+            issueIdentifier: identifier,
+            image: pluginConfig?.workerImage ?? "openclaw-linear-worker:latest",
+            targetRepos: targetRepoNames,
+            branch: dispatchBranch,
+            reposRoot: pluginConfig?.reposRoot ?? join(home, "repos"),
+            clawHostDir,
+            codexAuthFile: join(home, ".codex", "auth.json"),
+            gitCredentialsFile,
+            ghToken: pluginConfig?.githubToken ??
+                process.env.GH_TOKEN ??
+                readGhTokenFromCredentials(gitCredentialsFile),
+            memory: pluginConfig?.containerMemory ?? "6g",
+            cpus: pluginConfig?.containerCpus ?? "3",
+            createdAtMs: Date.now(),
+        }, api.logger);
+        containerName = start.name;
+        api.logger.info(`@dispatch: ${identifier} container ${start.reused ? "reused" : "created"} (${start.name}) repos=${targetRepoNames.join(",")}`);
     }
     catch (err) {
-        api.logger.error(`@dispatch: worktree creation failed: ${err}`);
+        api.logger.error(`@dispatch: container start failed: ${err}`);
         activeRuns.delete(issue.id); // release the early claim on failure
-        await createCommentWithDedup(linearApi, issue.id, `**Dispatch failed** — couldn't create the worktree.\n\n> ${String(err).slice(0, 200)}\n\n**What to try:**\n- Check that the base repo exists\n- Re-assign this issue to try again\n- Check logs: \`journalctl --user -u openclaw-gateway --since "5 min ago"\``);
+        await createCommentWithDedup(linearApi, issue.id, `**Dispatch failed** — couldn't start the coding container.\n\n> ${String(err).slice(0, 200)}\n\n**What to try:**\n- Re-assign this issue to retry\n- Check the gateway logs`);
         return;
-    }
-    // 5b. Prepare workspace(s)
-    if (worktrees) {
-        for (const wt of worktrees) {
-            const prep = prepareWorkspace(wt.path, wt.branch);
-            if (prep.errors.length > 0) {
-                api.logger.warn(`@dispatch: workspace prep for ${wt.repoName} had errors: ${prep.errors.join("; ")}`);
-            }
-        }
-    }
-    else {
-        const prep = prepareWorkspace(worktreePath, worktreeBranch);
-        if (prep.errors.length > 0) {
-            api.logger.warn(`@dispatch: workspace prep had errors: ${prep.errors.join("; ")}`);
-        }
-        else {
-            api.logger.info(`@dispatch: workspace prepared — pulled=${prep.pulled}, submodules=${prep.submodulesInitialized}`);
-        }
     }
     // 6. Reuse the Linear session — an explicit opt, or the one Linear auto-created
     // on delegation that the created-handler captured — so the whole pipeline runs
@@ -2330,7 +2316,8 @@ async function handleDispatch(api, linearApi, issue, opts) {
         agentSessionId,
         attempt: 0,
         project: enrichedIssue?.project?.id,
-        worktrees,
+        containerName,
+        containerRepos: targetRepoNames,
         grillGuidance,
     };
     const dispatchWithFlow = createManagedFlowForDispatch(api, initialDispatch);
@@ -2413,28 +2400,31 @@ async function handleDispatch(api, linearApi, issue, opts) {
         title: enrichedIssue.title ?? "(untitled)",
         status: "dispatched",
     });
-    // Choose the pipeline: state-driven specialist orchestrator (opt-in via
-    // config `orchestrationMode: "stateplan"`) or the default single-worker flow.
-    let pipelinePromise;
-    if (orchestrationMode(pluginConfig) === "stateplan") {
-        const wfState = {
-            name: enrichedIssue?.state?.name ?? "",
-            type: enrichedIssue?.state?.type ?? "",
-        };
-        const plan = resolveStatePlan(wfState, pluginConfig);
-        if (plan) {
-            api.logger.info(`@dispatch: state-plan "${plan.stateLabel}" for ${identifier} (state="${wfState.name}")`);
-            pipelinePromise = runStatePlan(hookCtx, dispatch, plan);
+    // Container-only: every actionable dispatch runs the state-driven orchestrator
+    // inside its container. States with no configured plan (e.g. Done/Canceled) do
+    // nothing. The legacy worktree-based single worker has been retired.
+    const wfState = {
+        name: enrichedIssue?.state?.name ?? "",
+        type: enrichedIssue?.state?.type ?? "",
+    };
+    const plan = resolveStatePlan(wfState, pluginConfig);
+    if (!plan) {
+        api.logger.info(`@dispatch: no state-plan for ${identifier} (state="${wfState.name}") — nothing to run`);
+        if (agentSessionId) {
+            await linearApi.emitActivity(agentSessionId, {
+                type: "response",
+                body: `No pipeline is configured for the "${wfState.name}" state — nothing to do here.`,
+            }).catch(() => { });
         }
-        else {
-            api.logger.info(`@dispatch: no state-plan for ${identifier} (state="${wfState.name}") — using single worker`);
-            pipelinePromise = spawnWorker(hookCtx, dispatch);
+        activeRuns.delete(issue.id);
+        try {
+            await removeActiveDispatch(identifier, statePath);
         }
+        catch { /* best effort */ }
+        return;
     }
-    else {
-        // spawnWorker handles: dispatched→working→auditing→done/rework/stuck
-        pipelinePromise = spawnWorker(hookCtx, dispatch);
-    }
+    api.logger.info(`@dispatch: state-plan "${plan.stateLabel}" for ${identifier} (state="${wfState.name}")`);
+    const pipelinePromise = runStatePlan(hookCtx, dispatch, plan);
     pipelinePromise
         .catch(async (err) => {
         api.logger.error(`@dispatch: pipeline v2 failed for ${identifier}: ${err}`);
