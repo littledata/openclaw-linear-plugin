@@ -2122,6 +2122,7 @@ async function handleDispatch(api, linearApi, issue, opts) {
         // body + comments often NAME the right repo ("the bug is in ld-shopify").
         // If exactly one configured repo is explicitly mentioned, use it instead of
         // blindly defaulting. Ambiguous (>1) or none → leave the default / ask.
+        let mentionShortlist = [];
         if (repoResolution.source === "config_default") {
             try {
                 const repoNames = Object.keys(getRepoEntries(pluginConfig));
@@ -2134,7 +2135,10 @@ async function handleDispatch(api, linearApi, issue, opts) {
                     api.logger.info(`@dispatch: ${identifier} repos=${mentioned[0]} source=text_mention (rescued from config_default)`);
                 }
                 else if (mentioned.length > 1) {
-                    api.logger.info(`@dispatch: ${identifier} text mentions multiple repos (${mentioned.join(",")}) — keeping config_default/ask`);
+                    // Ambiguous but constrained: keep config_default so we ASK, but narrow the
+                    // options to the repos actually named in the text.
+                    mentionShortlist = mentioned;
+                    api.logger.info(`@dispatch: ${identifier} text mentions multiple repos (${mentioned.join(",")}) — asking, shortlist=${mentioned.join(",")}`);
                 }
             }
             catch (err) {
@@ -2144,7 +2148,9 @@ async function handleDispatch(api, linearApi, issue, opts) {
         // Interactive repo selection: if enabled and the repo is ambiguous, ask the
         // user which repo(s) to use and park the dispatch until they reply.
         if (shouldAskRepoSelection(repoResolution, pluginConfig)) {
-            let candidates = Object.keys(getRepoEntries(pluginConfig));
+            // Prefer the text-mention shortlist when we have one — a 2-3 option prompt is
+            // far more usable than the full configured-repo list.
+            let candidates = mentionShortlist.length ? mentionShortlist : Object.keys(getRepoEntries(pluginConfig));
             let selectionSessionId = opts?.existingSessionId;
             if (!selectionSessionId) {
                 try {

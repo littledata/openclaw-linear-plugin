@@ -282,24 +282,49 @@ export function startOrReuseContainer(
   if (run.status !== 0) {
     throw new Error(`docker run failed for ${name}: ${run.stderr.slice(0, 500)}`);
   }
-  provisionRepos(name, spec.targetRepos, spec.branch, logger);
-  logger.info(`[container] created ${name} with repos=${spec.targetRepos.join(",")}`);
+  const provisioned = provisionRepos(name, spec.targetRepos, spec.branch, logger);
+  if (spec.targetRepos.length && !provisioned.length) {
+    // Empty container: every clone failed (e.g. the repo name has no matching
+    // /repos-ro/<name>). Don't leave a hollow container to run codex in — tear it
+    // down and fail loudly so the dispatch surfaces a real error.
+    destroyContainer(name);
+    throw new Error(
+      `no repos could be provisioned in ${name} (requested: ${spec.targetRepos.join(", ")}) — ` +
+        `check that each is a real repo under the read-only repos mount`,
+    );
+  }
+  logger.info(`[container] created ${name} with repos=${provisioned.join(",")}`);
   return { name, reused: false };
 }
 
-/** Clone/checkout the given repos inside a running container (idempotent). */
+/**
+ * Clone/checkout the given repos inside a running container (idempotent).
+ * Returns the names of repos that are actually present (have a .git dir) after
+ * the attempt, so callers can detect a fully-empty provisioning.
+ */
 export function provisionRepos(
   name: string,
   repos: string[],
   branch: string,
   logger: { warn: (m: string) => void },
-): void {
-  if (!repos.length) return;
+): string[] {
+  if (!repos.length) return [];
   const r = dockerSync(
     ["exec", "-e", `REPOS=${repos.join(" ")}`, "-e", `BRANCH=${branch}`, name, "sh", "-c", PROVISION_SCRIPT],
     { timeoutMs: 120_000 },
   );
   if (r.status !== 0) logger.warn(`[container] provision on ${name} exit ${r.status}: ${r.stderr.slice(0, 300)}`);
+  // Verify what actually landed — `set -eu` aborts the whole script on the first
+  // failed clone, so a non-zero status doesn't tell us which repos made it.
+  const present = repos.filter((repo) => {
+    const check = dockerSync(["exec", name, "test", "-d", `${repoWorkdir(repo)}/.git`]);
+    return check.status === 0;
+  });
+  if (present.length < repos.length) {
+    const missing = repos.filter((repo) => !present.includes(repo));
+    logger.warn(`[container] provision on ${name}: missing repos ${missing.join(",")}`);
+  }
+  return present;
 }
 
 /** Clone one more repo into a warm container on demand (cross-repo). */

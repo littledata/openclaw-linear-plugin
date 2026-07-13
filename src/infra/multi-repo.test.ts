@@ -52,7 +52,7 @@ describe("resolveRepos", () => {
     const result = resolveRepos("Plain description", [], config);
     expect(result.source).toBe("config_default");
     expect(result.repos).toHaveLength(1);
-    expect(result.repos[0].name).toBe("default");
+    expect(result.repos[0].name).toBe("myproject");
     expect(result.repos[0].path).toBe("/tmp/test/myproject");
   });
 
@@ -66,19 +66,31 @@ describe("resolveRepos", () => {
     expect(result.repos[0].name).toBe("api");
   });
 
-  it("returns single repo from codexBaseRepo when no repos config", () => {
+  it("returns single repo named after codexBaseRepo basename when no repos config", () => {
+    // Name must be a REAL repo name (used to clone /repos-ro/<name>), so it's the
+    // basename of codexBaseRepo — never the synthetic "default".
     const result = resolveRepos("Nothing special", []);
     expect(result.source).toBe("config_default");
     expect(result.repos).toHaveLength(1);
-    expect(result.repos[0].name).toBe("default");
+    expect(result.repos[0].name).toBe("ai-workspace");
     expect(result.repos[0].path).toBe(path.join(homedir(), "ai-workspace"));
   });
 
-  it("handles empty description + no labels (single repo fallback)", () => {
-    const result = resolveRepos("", []);
+  it("uses codexBaseRepo basename as the fallback repo name", () => {
+    const result = resolveRepos("", [], { codexBaseRepo: "/root/repos/transaction-monitor-2" });
     expect(result.source).toBe("config_default");
     expect(result.repos).toHaveLength(1);
-    expect(result.repos[0].name).toBe("default");
+    expect(result.repos[0].name).toBe("transaction-monitor-2");
+    expect(result.repos[0].path).toBe("/root/repos/transaction-monitor-2");
+  });
+
+  it("prefers the matching configured entry's path for the basename fallback", () => {
+    const result = resolveRepos("", [], {
+      codexBaseRepo: "/root/repos/transaction-monitor-2",
+      repos: { "transaction-monitor-2": { path: "/custom/tmv2", github: "littledata/tmv2" } },
+    });
+    expect(result.repos[0].name).toBe("transaction-monitor-2");
+    expect(result.repos[0].path).toBe("/custom/tmv2");
   });
 
   it("trims whitespace in repo names from markers", () => {

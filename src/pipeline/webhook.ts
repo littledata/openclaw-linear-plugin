@@ -2402,6 +2402,7 @@ async function handleDispatch(
     // body + comments often NAME the right repo ("the bug is in ld-shopify").
     // If exactly one configured repo is explicitly mentioned, use it instead of
     // blindly defaulting. Ambiguous (>1) or none → leave the default / ask.
+    let mentionShortlist: string[] = [];
     if (repoResolution.source === "config_default") {
       try {
         const repoNames = Object.keys(getRepoEntries(pluginConfig));
@@ -2413,7 +2414,10 @@ async function handleDispatch(
           repoResolution = resolveReposByNames(mentioned, pluginConfig);
           api.logger.info(`@dispatch: ${identifier} repos=${mentioned[0]} source=text_mention (rescued from config_default)`);
         } else if (mentioned.length > 1) {
-          api.logger.info(`@dispatch: ${identifier} text mentions multiple repos (${mentioned.join(",")}) — keeping config_default/ask`);
+          // Ambiguous but constrained: keep config_default so we ASK, but narrow the
+          // options to the repos actually named in the text.
+          mentionShortlist = mentioned;
+          api.logger.info(`@dispatch: ${identifier} text mentions multiple repos (${mentioned.join(",")}) — asking, shortlist=${mentioned.join(",")}`);
         }
       } catch (err) {
         api.logger.warn(`@dispatch: ${identifier} repo mention-detection failed: ${err}`);
@@ -2423,7 +2427,9 @@ async function handleDispatch(
     // Interactive repo selection: if enabled and the repo is ambiguous, ask the
     // user which repo(s) to use and park the dispatch until they reply.
     if (shouldAskRepoSelection(repoResolution, pluginConfig)) {
-      let candidates = Object.keys(getRepoEntries(pluginConfig));
+      // Prefer the text-mention shortlist when we have one — a 2-3 option prompt is
+      // far more usable than the full configured-repo list.
+      let candidates = mentionShortlist.length ? mentionShortlist : Object.keys(getRepoEntries(pluginConfig));
       let selectionSessionId = opts?.existingSessionId;
       if (!selectionSessionId) {
         try {

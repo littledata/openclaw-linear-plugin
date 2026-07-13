@@ -118,10 +118,17 @@ export function resolveRepos(description, labels, pluginConfig, teamKey) {
             return { repos, source: "team_mapping" };
         }
     }
-    // 4. Config default: single repo
+    // 4. Config default: single repo.
+    // The name must be a REAL repo name (it's used to clone /repos-ro/<name> in the
+    // container model), never a synthetic "default". Derive it from codexBaseRepo's
+    // basename so the fallback stays cloneable; prefer the matching configured entry
+    // when one exists so the path/github identity come along too.
     const baseRepo = pluginConfig?.codexBaseRepo ?? path.join(homedir(), "ai-workspace");
+    const baseName = path.basename(baseRepo);
+    const entries = getRepoEntries(pluginConfig);
+    const baseEntry = entries[baseName];
     return {
-        repos: [{ name: "default", path: baseRepo }],
+        repos: [{ name: baseName, path: baseEntry?.path ?? baseRepo }],
         source: "config_default",
     };
 }

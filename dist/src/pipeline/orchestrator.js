@@ -259,6 +259,21 @@ async function runImplementPhase(ctx, dispatch, issue) {
             appendLog(dispatch.worktreePath, { ts: new Date().toISOString(), phase: "worker", attempt, agent: assignments.map((a) => a.role).join("+"), prompt: "", outputPreview: attemptOutputs.join("\n\n").slice(0, 500), success: !lastReason, durationMs: 0 });
         }
         catch { /* best effort */ }
+        // No-diff guard: an implementer failed (lastReason set) AND left zero working
+        // changes — the container is effectively untouched (e.g. codex exited 1 in an
+        // empty container). There's nothing for a self-review to gate on, so it would
+        // just fail to find a verdict line ("no REVIEW verdict line found"). Surface the
+        // REAL reason instead of that cryptic message.
+        if (lastReason && !hasAnyChanges(dispatch)) {
+            emit(ctx, dispatch, {
+                type: "thought",
+                body: `⚠️ No code changes were produced (attempt ${attempt + 1}/${limit + 1}): ${lastReason}`,
+            });
+            if (attempt < limit) {
+                continue; // give rework a shot before giving up
+            }
+            return { success: false, reason: `no changes produced — ${lastReason}` };
+        }
         // Apex self-review — read-only, gates the phase.
         if (isCancelled(dispatch.issueId))
             return { success: false, reason: "halted" };
@@ -284,6 +299,29 @@ async function runImplementPhase(ctx, dispatch, issue) {
         }
     }
     return { success: false, reason: lastReason || "implementation did not pass self-review" };
+}
+/**
+ * Whether any target repo in the container has uncommitted working-tree changes.
+ * Best-effort: a git-status probe that throws is treated as "no changes" for that
+ * repo. Used only as a negative signal (combined with a failed implementer) to
+ * avoid running a self-review over an untouched workspace.
+ * @param dispatch - the active dispatch (needs containerName + containerRepos)
+ * @returns true if at least one repo shows changes
+ */
+function hasAnyChanges(dispatch) {
+    const repos = dispatch.containerRepos ?? [];
+    if (!dispatch.containerName || !repos.length)
+        return false;
+    for (const repo of repos) {
+        try {
+            if (containerGitStatus(dispatch.containerName, repo).hasChanges)
+                return true;
+        }
+        catch {
+            /* treat probe failure as no-signal */
+        }
+    }
+    return false;
 }
 /**
  * Open a PR per changed repo (cross-repo aware) from inside the container so the
