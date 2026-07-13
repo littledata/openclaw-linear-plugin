@@ -7,23 +7,20 @@ describe("parseGrillStep", () => {
       .toEqual({ ready: false, question: "Which repo? (rec: events-manager)" });
   });
 
-  it("parses a ready step with repos + guidance", () => {
-    expect(parseGrillStep('{"ready":true,"repos":["events-manager","shopify-tracker"],"guidance":"Fix X in Y"}'))
-      .toEqual({ ready: true, repos: ["events-manager", "shopify-tracker"], guidance: "Fix X in Y" });
+  it("parses a ready step with guidance (repo is chosen elsewhere, ignored here)", () => {
+    // The grill no longer selects repos; any `repos` in the output is ignored.
+    expect(parseGrillStep('{"ready":true,"repos":["events-manager"],"guidance":"Fix X in Y"}'))
+      .toEqual({ ready: true, guidance: "Fix X in Y" });
   });
 
   it("handles markdown-fenced JSON", () => {
-    const r = parseGrillStep('```json\n{"ready":true,"repos":["a"],"guidance":"g"}\n```');
+    const r = parseGrillStep('```json\n{"ready":true,"guidance":"g"}\n```');
     expect(r?.ready).toBe(true);
-    expect(r?.repos).toEqual(["a"]);
+    expect(r?.guidance).toBe("g");
   });
 
-  it("defaults repos/guidance on a bare ready", () => {
-    expect(parseGrillStep('{"ready":true}')).toEqual({ ready: true, repos: undefined, guidance: "" });
-  });
-
-  it("filters non-string repos", () => {
-    expect(parseGrillStep('{"ready":true,"repos":["ok",3,null]}').repos).toEqual(["ok"]);
+  it("defaults guidance on a bare ready", () => {
+    expect(parseGrillStep('{"ready":true}')).toEqual({ ready: true, guidance: "" });
   });
 
   it("returns null for unparseable or empty-question output", () => {

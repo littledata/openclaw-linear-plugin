@@ -25,6 +25,12 @@ export interface GrillState {
   qa: GrillQA[];
   /** The question awaiting a user answer (set when parked on an elicitation). */
   pendingQuestion?: string;
+  /**
+   * Repo(s) already chosen for this dispatch (by the repo-selection gate, which
+   * runs BEFORE grilling). Carried on each grill resume so repo selection is never
+   * re-asked mid-interview. The grill itself never picks repos.
+   */
+  repos?: string[];
   createdAt: string;
 }
 
