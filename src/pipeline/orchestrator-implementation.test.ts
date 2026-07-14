@@ -48,6 +48,7 @@ describe("plan-implement no-change guard", () => {
       hasChanges: false,
       hasUncommitted: false,
       lastCommit: "abc base",
+      lastCommitMessage: "base",
       commitsAhead: 0,
     });
     openPrMock.mockReset().mockResolvedValue("https://github.com/littledata/api/pull/1");
@@ -102,6 +103,7 @@ describe("plan-implement no-change guard", () => {
       hasChanges: true,
       hasUncommitted: false,
       lastCommit: "def existing coder commit",
+      lastCommitMessage: "CORE-REMEDIATE: existing\n\nChangelog:\n- code\n\nValidation:\n- test: pass",
       commitsAhead: 1,
     });
     const createComment = vi.fn().mockResolvedValue("comment-1");
@@ -154,6 +156,7 @@ describe("plan-implement no-change guard", () => {
       hasChanges: true,
       hasUncommitted: false,
       lastCommit: "def resumed work",
+      lastCommitMessage: "CORE-RESUME: work\n\nChangelog:\n- code\n\nValidation:\n- test: pass",
       commitsAhead: 1,
     });
     const ctx = {
@@ -223,18 +226,21 @@ describe("plan-implement no-change guard", () => {
       hasChanges: false,
       hasUncommitted: false,
       lastCommit: "aaa base",
+      lastCommitMessage: "base",
       commitsAhead: 0,
     };
     const coder = {
       hasChanges: true,
       hasUncommitted: false,
       lastCommit: "bbb coder commit",
+      lastCommitMessage: "CORE-FIX: implement\n\nChangelog:\n- code\n\nValidation:\n- test: pass",
       commitsAhead: 1,
     };
     const remediation = {
       hasChanges: true,
       hasUncommitted: false,
       lastCommit: "ccc review remediation",
+      lastCommitMessage: "CORE-FIX: remediate\n\nChangelog:\n- fix\n\nValidation:\n- test: pass",
       commitsAhead: 2,
     };
     containerGitStatusMock

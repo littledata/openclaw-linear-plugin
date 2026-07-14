@@ -470,6 +470,24 @@ async function runImplementPhase(ctx, dispatch, issue, resumeGuidance) {
             }
             return { success: false, reason: `no changes produced — ${lastReason}` };
         }
+        const newlyCommitted = repoStatuses.filter(({ repo, status }) => beforeCommits.get(repo) !== status.lastCommit);
+        const unstructuredCommits = newlyCommitted
+            .filter(({ status }) => !status.lastCommitMessage.startsWith(`${issue.identifier}:`) ||
+            !/(?:^|\n)Changelog:\s*(?:\n|$)/.test(status.lastCommitMessage) ||
+            !/(?:^|\n)Validation:\s*(?:\n|$)/.test(status.lastCommitMessage))
+            .map(({ repo }) => repo);
+        if (unstructuredCommits.length) {
+            lastReason =
+                `commit message in ${unstructuredCommits.join(", ")} must start with ` +
+                    `"${issue.identifier}:" and include Changelog: and Validation: sections`;
+            emit(ctx, dispatch, {
+                type: "thought",
+                body: `⚠️ ${lastReason} (attempt ${attempt + 1}/${limit + 1})`,
+            });
+            if (attempt < limit)
+                continue;
+            return { success: false, reason: lastReason };
+        }
         const requiresNewCommit = attempt > 0 ||
             (!resumeGuidance && beforeStatuses.some(({ status }) => status.hasChanges));
         if (requiresNewCommit &&

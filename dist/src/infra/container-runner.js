@@ -206,6 +206,9 @@ export const GIT_STATUS_SCRIPT = [
     "git status --porcelain",
     'printf ">>\\nLASTCOMMIT="',
     "git log --oneline -1 2>/dev/null || true",
+    'printf "\\nCOMMITMESSAGE<<\\n"',
+    "git log -1 --pretty=%B 2>/dev/null || true",
+    'printf ">>\\n"',
     'BASE=$(git rev-parse refs/openclaw/base 2>/dev/null || git merge-base HEAD refs/remotes/origin/HEAD 2>/dev/null || true)',
     'AHEAD=0; if [ -n "$BASE" ]; then AHEAD=$(git rev-list --count "$BASE"..HEAD 2>/dev/null || echo 0); fi',
     'printf "\\nCOMMITS_AHEAD=%s\\n" "$AHEAD"',
@@ -634,6 +637,7 @@ export function codeSearchInContainer(name, repoDir, query, limit = 10, timeoutM
 export function parseContainerGitStatus(output) {
     const porcelain = /PORCELAIN<<\n([\s\S]*?)\n?>>/.exec(output)?.[1] ?? "";
     const lastCommit = /LASTCOMMIT=(.*)$/m.exec(output)?.[1]?.trim() ?? "";
+    const lastCommitMessage = /COMMITMESSAGE<<\n([\s\S]*?)\n?>>/.exec(output)?.[1]?.trim() ?? "";
     const parsedAhead = Number(/COMMITS_AHEAD=(\d+)/.exec(output)?.[1] ?? "0");
     const commitsAhead = Number.isFinite(parsedAhead) ? parsedAhead : 0;
     const hasUncommitted = porcelain.trim().length > 0;
@@ -641,6 +645,7 @@ export function parseContainerGitStatus(output) {
         hasChanges: hasUncommitted || commitsAhead > 0,
         hasUncommitted,
         lastCommit,
+        lastCommitMessage,
         commitsAhead,
     };
 }

@@ -108,33 +108,36 @@ describe("PROVISION_GITHUB_REPO_SCRIPT", () => {
 describe("parseContainerGitStatus", () => {
   it("treats an uncommitted file as implementation activity", () => {
     expect(parseContainerGitStatus(
-      "PORCELAIN<<\n M src/a.ts\n>>\nLASTCOMMIT=abc existing\nCOMMITS_AHEAD=0\n",
+      "PORCELAIN<<\n M src/a.ts\n>>\nLASTCOMMIT=abc existing\nCOMMITMESSAGE<<\nExisting\n>>\nCOMMITS_AHEAD=0\n",
     )).toEqual({
       hasChanges: true,
       hasUncommitted: true,
       lastCommit: "abc existing",
+      lastCommitMessage: "Existing",
       commitsAhead: 0,
     });
   });
 
   it("treats a clean committed branch as implementation activity", () => {
     expect(parseContainerGitStatus(
-      "PORCELAIN<<\n>>\nLASTCOMMIT=def implementation\nCOMMITS_AHEAD=2\n",
+      "PORCELAIN<<\n>>\nLASTCOMMIT=def implementation\nCOMMITMESSAGE<<\nCORE-1: implementation\n\nChangelog:\n- code\n\nValidation:\n- test: pass\n>>\nCOMMITS_AHEAD=2\n",
     )).toEqual({
       hasChanges: true,
       hasUncommitted: false,
       lastCommit: "def implementation",
+      lastCommitMessage: "CORE-1: implementation\n\nChangelog:\n- code\n\nValidation:\n- test: pass",
       commitsAhead: 2,
     });
   });
 
   it("recognizes a completely untouched repo", () => {
     expect(parseContainerGitStatus(
-      "PORCELAIN<<\n>>\nLASTCOMMIT=abc base\nCOMMITS_AHEAD=0\n",
+      "PORCELAIN<<\n>>\nLASTCOMMIT=abc base\nCOMMITMESSAGE<<\nBase\n>>\nCOMMITS_AHEAD=0\n",
     )).toEqual({
       hasChanges: false,
       hasUncommitted: false,
       lastCommit: "abc base",
+      lastCommitMessage: "Base",
       commitsAhead: 0,
     });
   });
