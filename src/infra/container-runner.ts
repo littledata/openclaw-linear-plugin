@@ -4,10 +4,9 @@
  * Replaces git worktrees. Each Linear issue gets ONE long-lived container
  * (created on first engagement, reused on resume, reaped after a TTL):
  *
- *   - `/root/repos` (all repos) is bind-mounted READ-ONLY at `/repos-ro`.
- *   - target repo(s) are `git clone --shared`d writable into `/work/<name>`
- *     (alternates → instant, tiny; hardlinks can't cross the RO-mount/overlay
- *     filesystem boundary, so `--shared` not `--local`).
+ *   - target repo(s) are cloned directly from GitHub into `/work/<name>` with a
+ *     short-lived coding-App installation token. Legacy local-mirror mode is
+ *     retained for migration compatibility.
  *   - `.claw` artifacts live on a host-mounted dir so they survive the container
  *     for resume/summary.
  *   - codex runs via `docker exec … codex exec --dangerously-bypass-approvals-
@@ -32,15 +31,15 @@ import { join } from "node:path";
 import type { LinearAgentApi, ActivityContent } from "../api/linear-api.js";
 import { InactivityWatchdog } from "../agent/watchdog.js";
 import { createProgressEmitter, formatActivityLogLine, type CliResult, type OnProgressUpdate } from "../tools/cli-shared.js";
-import { mapCodexEventToActivity } from "../tools/codex-tool.js";
+import { formatCodexCommandOutput, mapCodexEventToActivity } from "../tools/codex-tool.js";
 import { listContainerRecords, removeContainerRecord, selectIdleExpired } from "./container-registry.js";
 import {
-  getGitHubAppToken,
+  getGitHubAppTokenForRepositories,
   githubAuthenticationEnvironment,
   invalidateGitHubAppToken,
   type GitHubAppRole,
 } from "./github-app-auth.js";
-import { resolveGitHubRepository } from "./multi-repo.js";
+import { resolveGitHubDefaultBranch, resolveGitHubRepository } from "./multi-repo.js";
 
 export const CONTAINER_PREFIX = "openclaw-linear";
 export const ISSUE_LABEL = "openclaw.linear.issue";
@@ -73,7 +72,8 @@ export interface ContainerStartSpec {
   targetRepos: string[];
   branch: string;
   /** Host path holding all repos (bind-mounted read-only). */
-  reposRoot: string;
+  reposRoot?: string;
+  repositorySource: "local" | "github-app";
   /** Host dir mounted at /work/.claw for durable artifacts. */
   clawHostDir: string;
   codexAuthFile?: string;
@@ -100,10 +100,11 @@ export function buildRunArgs(spec: ContainerStartSpec): string[] {
     "--label",
     `${CREATED_LABEL}=${spec.createdAtMs}`,
     "-v",
-    `${spec.reposRoot}:${REPOS_RO_MOUNT}:ro`,
-    "-v",
     `${spec.clawHostDir}:${CLAW_MOUNT}`,
   ];
+  if (spec.repositorySource !== "github-app" && spec.reposRoot) {
+    args.splice(args.length - 2, 0, "-v", `${spec.reposRoot}:${REPOS_RO_MOUNT}:ro`);
+  }
   if (spec.codexAuthFile) args.push("-v", `${spec.codexAuthFile}:/root/.codex/auth.json:ro`);
   if (spec.memory) args.push("--memory", spec.memory);
   if (spec.cpus) args.push("--cpus", spec.cpus);
@@ -141,6 +142,52 @@ export const CLONE_ONE_SCRIPT = [
   '  git clone --shared "/repos-ro/$REPO" "/work/$REPO"',
   '  git -C "/work/$REPO" checkout -B "$BRANCH"',
   '  git -C "/work/$REPO" update-ref refs/openclaw/base HEAD',
+  "fi",
+].join("\n");
+
+/** Clone or refresh one GitHub repository without persisting its token. */
+export const PROVISION_GITHUB_REPO_SCRIPT = [
+  "set -eu",
+  'git config --global user.email "agent@littledata.io"',
+  'git config --global user.name "Littledata Agent"',
+  'mkdir -p "$(dirname "$REPO_DIR")" /work/.claw',
+  'if [ ! -d "$REPO_DIR/.git" ]; then',
+  '  git clone "$REMOTE_URL" "$REPO_DIR"',
+  '  if git -C "$REPO_DIR" ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then',
+  '    git -C "$REPO_DIR" checkout -B "$BRANCH" "origin/$BRANCH"',
+  '    if ! git -C "$REPO_DIR" pull --ff-only origin "$BRANCH"; then',
+  '      LOCAL_TREE=$(git -C "$REPO_DIR" rev-parse HEAD^{tree})',
+  '      REMOTE_TREE=$(git -C "$REPO_DIR" rev-parse "origin/$BRANCH^{tree}")',
+  '      [ "$LOCAL_TREE" = "$REMOTE_TREE" ] || exit 1',
+  '      git -C "$REPO_DIR" reset --hard "origin/$BRANCH"',
+  "    fi",
+  "  else",
+  '    git -C "$REPO_DIR" checkout -B "$BRANCH" "origin/$DEFAULT_BRANCH"',
+  "  fi",
+  '  BASE=$(git -C "$REPO_DIR" merge-base HEAD "origin/$DEFAULT_BRANCH" 2>/dev/null || git -C "$REPO_DIR" rev-parse "origin/$DEFAULT_BRANCH")',
+  '  git -C "$REPO_DIR" update-ref refs/openclaw/base "$BASE"',
+  "else",
+  '  git -C "$REPO_DIR" remote set-url origin "$REMOTE_URL"',
+  '  git -C "$REPO_DIR" fetch --prune origin',
+  '  if git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$BRANCH"; then',
+  '    git -C "$REPO_DIR" checkout "$BRANCH"',
+  '  elif git -C "$REPO_DIR" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then',
+  '    git -C "$REPO_DIR" checkout -B "$BRANCH" "origin/$BRANCH"',
+  "  else",
+  '    git -C "$REPO_DIR" checkout -B "$BRANCH" "origin/$DEFAULT_BRANCH"',
+  "  fi",
+  '  if [ -z "$(git -C "$REPO_DIR" status --porcelain)" ] && git -C "$REPO_DIR" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then',
+  '    if ! git -C "$REPO_DIR" pull --ff-only origin "$BRANCH"; then',
+  '      LOCAL_TREE=$(git -C "$REPO_DIR" rev-parse HEAD^{tree})',
+  '      REMOTE_TREE=$(git -C "$REPO_DIR" rev-parse "origin/$BRANCH^{tree}")',
+  '      [ "$LOCAL_TREE" = "$REMOTE_TREE" ] || exit 1',
+  '      git -C "$REPO_DIR" reset --hard "origin/$BRANCH"',
+  "    fi",
+  "  fi",
+  '  if ! git -C "$REPO_DIR" show-ref --verify --quiet refs/openclaw/base; then',
+  '    BASE=$(git -C "$REPO_DIR" merge-base HEAD "origin/$DEFAULT_BRANCH" 2>/dev/null || git -C "$REPO_DIR" rev-parse "origin/$DEFAULT_BRANCH")',
+  '    git -C "$REPO_DIR" update-ref refs/openclaw/base "$BASE"',
+  "  fi",
   "fi",
 ].join("\n");
 
@@ -268,16 +315,17 @@ function redactToken(result: DockerResult, token: string): DockerResult {
 
 async function runAuthenticatedDockerOperation(
   role: GitHubAppRole,
-  repository: string,
+  repository: string | string[],
   pluginConfig: Record<string, unknown> | undefined,
   buildArgs: (authenticationArgs: string[]) => string[],
   timeoutMs: number,
 ): Promise<DockerResult> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const token = await getGitHubAppToken(role, repository, pluginConfig);
+    const repositories = Array.isArray(repository) ? repository : [repository];
+    const token = await getGitHubAppTokenForRepositories(role, repositories, pluginConfig);
     const result = redactToken(dockerSync(buildArgs(githubEnvironmentArgs(token)), { timeoutMs }), token);
     if (result.status === 0 || !isAuthenticationFailure(result) || attempt === 1) return result;
-    invalidateGitHubAppToken(role, repository);
+    for (const scopedRepository of repositories) invalidateGitHubAppToken(role, scopedRepository);
   }
   return { status: 1, stdout: "", stderr: "GitHub authentication retry failed" };
 }
@@ -311,16 +359,17 @@ export interface StartResult {
  * @param logger - logger
  * @returns the container name + whether it was reused
  */
-export function startOrReuseContainer(
+export async function startOrReuseContainer(
   spec: ContainerStartSpec,
   logger: { info: (m: string) => void; warn: (m: string) => void },
-): StartResult {
+  pluginConfig?: Record<string, unknown>,
+): Promise<StartResult> {
   const name = containerNameForIssue(spec.issueIdentifier);
 
   if (isContainerRunning(name)) {
     logger.info(`[container] reusing warm container ${name}`);
     // Ensure the (possibly new) target repos exist in the warm container too.
-    provisionRepos(name, spec.targetRepos, spec.branch, logger);
+    await provisionRepos(name, spec.targetRepos, spec.branch, logger, pluginConfig);
     return { name, reused: true };
   }
   if (containerExists(name)) {
@@ -333,7 +382,7 @@ export function startOrReuseContainer(
   if (run.status !== 0) {
     throw new Error(`docker run failed for ${name}: ${run.stderr.slice(0, 500)}`);
   }
-  const provisioned = provisionRepos(name, spec.targetRepos, spec.branch, logger);
+  const provisioned = await provisionRepos(name, spec.targetRepos, spec.branch, logger, pluginConfig);
   if (spec.targetRepos.length && !provisioned.length) {
     // Empty container: every clone failed (e.g. the repo name has no matching
     // /repos-ro/<name>). Don't leave a hollow container to run codex in — tear it
@@ -341,7 +390,7 @@ export function startOrReuseContainer(
     destroyContainer(name);
     throw new Error(
       `no repos could be provisioned in ${name} (requested: ${spec.targetRepos.join(", ")}) — ` +
-        `check that each is a real repo under the read-only repos mount`,
+      `check the GitHub App installation and repository configuration`,
     );
   }
   logger.info(`[container] created ${name} with repos=${provisioned.join(",")}`);
@@ -376,6 +425,7 @@ export function buildContainerSpec(
     targetRepos,
     branch,
     reposRoot: (pluginConfig?.reposRoot as string) ?? join(home, "repos"),
+    repositorySource: pluginConfig?.repositorySource === "github-app" ? "github-app" : "local",
     clawHostDir: join(hostRoot, ".claw"),
     codexAuthFile: join(home, ".codex", "auth.json"),
     memory: (pluginConfig?.containerMemory as string) ?? "6g",
@@ -396,13 +446,13 @@ export function buildContainerSpec(
  * @param logger - logger
  * @returns the running container name, or null on failure
  */
-export function ensureContainerAlive(
+export async function ensureContainerAlive(
   identifier: string,
   repos: string[],
   branch: string,
   pluginConfig: Record<string, unknown> | undefined,
   logger: { info: (m: string) => void; warn: (m: string) => void },
-): string | null {
+): Promise<string | null> {
   const name = containerNameForIssue(identifier);
   if (isContainerRunning(name)) return name;
   if (containerExists(name)) {
@@ -411,7 +461,7 @@ export function ensureContainerAlive(
     const started = dockerSync(["start", name], { timeoutMs: 30_000 });
     if (started.status === 0 && isContainerRunning(name)) {
       logger.info(`[container] restarted stopped container ${name}`);
-      provisionRepos(name, repos, branch, logger); // idempotent — no-op if already cloned
+      await provisionRepos(name, repos, branch, logger, pluginConfig); // idempotent refresh
       return name;
     }
     logger.warn(`[container] failed to restart ${name} (exit ${started.status}) — recreating`);
@@ -419,7 +469,7 @@ export function ensureContainerAlive(
   }
   try {
     const spec = buildContainerSpec(identifier, repos, branch, pluginConfig, Date.now());
-    const res = startOrReuseContainer(spec, logger);
+    const res = await startOrReuseContainer(spec, logger, pluginConfig);
     logger.info(`[container] revived ${res.name} (recreated)`);
     return res.name;
   } catch (err) {
@@ -433,18 +483,44 @@ export function ensureContainerAlive(
  * Returns the names of repos that are actually present (have a .git dir) after
  * the attempt, so callers can detect a fully-empty provisioning.
  */
-export function provisionRepos(
+export async function provisionRepos(
   name: string,
   repos: string[],
   branch: string,
   logger: { warn: (m: string) => void },
-): string[] {
+  pluginConfig?: Record<string, unknown>,
+): Promise<string[]> {
   if (!repos.length) return [];
-  const r = dockerSync(
-    ["exec", "-e", `REPOS=${repos.join(" ")}`, "-e", `BRANCH=${branch}`, name, "sh", "-c", PROVISION_SCRIPT],
-    { timeoutMs: 120_000 },
-  );
-  if (r.status !== 0) logger.warn(`[container] provision on ${name} exit ${r.status}: ${r.stderr.slice(0, 300)}`);
+  if (pluginConfig?.repositorySource === "github-app") {
+    for (const repo of repos) {
+      const repository = resolveGitHubRepository(repo, pluginConfig);
+      const r = await runAuthenticatedDockerOperation(
+        "coding",
+        repository,
+        pluginConfig,
+        (authenticationArgs) => [
+          "exec",
+          ...authenticationArgs,
+          "-e", `BRANCH=${branch}`,
+          "-e", `REPO_DIR=${repoWorkdir(repo)}`,
+          "-e", `REMOTE_URL=https://github.com/${repository}.git`,
+          "-e", `DEFAULT_BRANCH=${resolveGitHubDefaultBranch(repo, pluginConfig)}`,
+          name,
+          "sh", "-c", PROVISION_GITHUB_REPO_SCRIPT,
+        ],
+        10 * 60_000,
+      );
+      if (r.status !== 0) {
+        logger.warn(`[container] GitHub provision on ${name}/${repo} exit ${r.status}: ${r.stderr.slice(0, 500)}`);
+      }
+    }
+  } else {
+    const r = dockerSync(
+      ["exec", "-e", `REPOS=${repos.join(" ")}`, "-e", `BRANCH=${branch}`, name, "sh", "-c", PROVISION_SCRIPT],
+      { timeoutMs: 120_000 },
+    );
+    if (r.status !== 0) logger.warn(`[container] provision on ${name} exit ${r.status}: ${r.stderr.slice(0, 300)}`);
+  }
   // Verify what actually landed — `set -eu` aborts the whole script on the first
   // failed clone, so a non-zero status doesn't tell us which repos made it.
   const present = repos.filter((repo) => {
@@ -459,7 +535,19 @@ export function provisionRepos(
 }
 
 /** Clone one more repo into a warm container on demand (cross-repo). */
-export function cloneRepo(name: string, repo: string, branch: string): DockerResult {
+export async function cloneRepo(
+  name: string,
+  repo: string,
+  branch: string,
+  pluginConfig?: Record<string, unknown>,
+): Promise<DockerResult> {
+  if (pluginConfig?.repositorySource === "github-app") {
+    await provisionRepos(name, [repo], branch, { warn: () => {} }, pluginConfig);
+    const present = dockerSync(["exec", name, "test", "-d", `${repoWorkdir(repo)}/.git`]);
+    return present.status === 0
+      ? { status: 0, stdout: repoWorkdir(repo), stderr: "" }
+      : { status: present.status, stdout: "", stderr: `repository ${repo} was not cloned` };
+  }
   return dockerSync(
     ["exec", "-e", `REPO=${repo}`, "-e", `BRANCH=${branch}`, name, "sh", "-c", CLONE_ONE_SCRIPT],
     { timeoutMs: 120_000 },
@@ -597,6 +685,45 @@ export function execInContainer(
     { timeoutMs },
   );
   return { exitCode: r.status ?? -1, stdout: r.stdout, stderr: r.stderr };
+}
+
+/**
+ * Run an arbitrary command with a short-lived GitHub App token available only
+ * to that `docker exec`. The token and PEM are never written into the container.
+ * @param role - coding or reviewer identity
+ * @param name - container name
+ * @param repoNames - configured repository keys to scope the token to
+ * @param command - shell command
+ * @param cwd - in-container working directory
+ * @param timeoutMs - maximum runtime
+ * @param pluginConfig - OpenClaw plugin configuration
+ * @returns captured command result with credentials redacted
+ */
+export async function execAuthenticatedInContainer(
+  role: GitHubAppRole,
+  name: string,
+  repoNames: string[],
+  command: string,
+  cwd: string,
+  timeoutMs: number,
+  pluginConfig?: Record<string, unknown>,
+): Promise<ContainerCommandResult> {
+  const repositories = repoNames.map((repo) => resolveGitHubRepository(repo, pluginConfig));
+  const r = await runAuthenticatedDockerOperation(
+    role,
+    repositories,
+    pluginConfig,
+    (authenticationArgs) => [
+      "exec",
+      ...authenticationArgs,
+      "-w", cwd,
+      "-e", `AGENT_CMD=${command}`,
+      name,
+      "sh", "-c", 'eval "$AGENT_CMD"',
+    ],
+    timeoutMs,
+  );
+  return { exitCode: r.status, stdout: r.stdout, stderr: r.stderr };
 }
 
 /**
@@ -802,6 +929,9 @@ export interface ExecCodexOpts {
   inactivityMs: number;
   linearApi?: LinearAgentApi;
   agentSessionId?: string;
+  githubRole?: GitHubAppRole;
+  githubRepositories?: string[];
+  pluginConfig?: Record<string, unknown>;
   onUpdate?: OnProgressUpdate;
   logger: { info: (m: string) => void; warn: (m: string) => void; error: (m: string) => void };
 }
@@ -816,7 +946,30 @@ export interface ExecCodexOpts {
 export async function execCodexInContainer(opts: ExecCodexOpts): Promise<CliResult> {
   const { containerName, workdir, prompt, model, effort, timeoutMs, inactivityMs, linearApi, agentSessionId, onUpdate, logger } = opts;
   const inner = buildCodexInner(workdir, model, effort);
-  const args = ["exec", "-e", `PROMPT=${prompt}`, containerName, "sh", "-c", inner];
+  let installationToken = "";
+  let authenticationArgs: string[] = [];
+  if (
+    opts.pluginConfig?.repositorySource === "github-app" &&
+    opts.githubRole &&
+    opts.githubRepositories?.length
+  ) {
+    const repositories = opts.githubRepositories.map((repo) => resolveGitHubRepository(repo, opts.pluginConfig));
+    try {
+      installationToken = await getGitHubAppTokenForRepositories(
+        opts.githubRole,
+        repositories,
+        opts.pluginConfig,
+      );
+      authenticationArgs = githubEnvironmentArgs(installationToken);
+    } catch (err) {
+      return {
+        success: false,
+        output: `Could not authenticate the ${opts.githubRole} GitHub App for this turn: ${String(err)}`,
+        error: "github_authentication_failed",
+      };
+    }
+  }
+  const args = ["exec", ...authenticationArgs, "-e", `PROMPT=${prompt}`, containerName, "sh", "-c", inner];
   const progressHeader = `[container:${containerName}] ${workdir}\n$ ${inner.slice(0, 300)}\n\nPrompt: ${prompt.slice(0, 300)}`;
 
   if (linearApi && agentSessionId) {
@@ -858,7 +1011,8 @@ export async function execCodexInContainer(opts: ExecCodexOpts): Promise<CliResu
     progress.emitHeader();
 
     const rl = createInterface({ input: child.stdout! });
-    rl.on("line", (line) => {
+    rl.on("line", (rawLine) => {
+      const line = installationToken ? rawLine.replaceAll(installationToken, "[REDACTED]") : rawLine;
       if (!line.trim()) return;
       watchdog.tick();
       let event: any;
@@ -877,12 +1031,18 @@ export async function execCodexInContainer(opts: ExecCodexOpts): Promise<CliResu
         const cmd = item.command ?? "unknown";
         const exitCode = item.exit_code ?? "?";
         const out = item.aggregated_output ?? item.output ?? "";
-        const trunc = out.length > 500 ? out.slice(0, 500) + "..." : out;
+        const trunc = formatCodexCommandOutput(cmd, out, 500);
         commands.push(`\`${String(cmd).slice(0, 150)}\` → exit ${exitCode}${trunc ? "\n```\n" + trunc + "\n```" : ""}`);
       }
       for (const activity of mapCodexEventToActivity(event)) {
         if (linearApi && agentSessionId) {
-          linearApi.emitActivity(agentSessionId, activity).catch(() => {});
+          linearApi.emitActivity(
+            agentSessionId,
+            activity,
+            event?.type === "item.started" && event?.item?.type === "command_execution"
+              ? { ephemeral: true }
+              : undefined,
+          ).catch(() => {});
         }
         progress.push(formatActivityLogLine(activity));
       }
@@ -890,7 +1050,8 @@ export async function execCodexInContainer(opts: ExecCodexOpts): Promise<CliResu
 
     child.stderr?.on("data", (chunk) => {
       watchdog.tick();
-      stderrOut += chunk.toString();
+      const text = chunk.toString();
+      stderrOut += installationToken ? text.replaceAll(installationToken, "[REDACTED]") : text;
     });
 
     child.on("close", (code) => {

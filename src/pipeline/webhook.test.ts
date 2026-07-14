@@ -309,6 +309,7 @@ import {
   _configureDedupTtls,
   _getDedupTtlMs,
   _addActiveRunForTesting,
+  _removeActiveRunForTesting,
   _markAsProcessedForTesting,
 } from "./webhook.js";
 
@@ -1140,6 +1141,53 @@ describe("AgentSessionEvent.prompted full flow", () => {
     expect(setActiveSessionMock).toHaveBeenCalledWith(
       expect.objectContaining({ agentSessionId: "sess-resume", issueIdentifier: "ENG-RESUME" }),
     );
+  });
+
+  it("discards a queued continuation when a newer STOP arrives", async () => {
+    const pausedDispatch = {
+      issueId: "issue-stop-race",
+      issueIdentifier: "ENG-STOP-RACE",
+      issueTitle: "Stop race",
+      worktreePath: "/tmp/ENG-STOP-RACE",
+      branch: "core-eng-stop-race",
+      tier: "medium",
+      model: "test-model",
+      status: "paused",
+      dispatchedAt: new Date().toISOString(),
+      agentSessionId: "sess-stop-race",
+      attempt: 0,
+      containerName: "openclaw-linear-ENG-STOP-RACE",
+      containerRepos: ["api"],
+      phaseIndex: 0,
+    };
+    getActiveDispatchMock.mockReturnValue(pausedDispatch);
+    _addActiveRunForTesting("issue-stop-race");
+
+    await postWebhook({
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "sess-stop-race",
+        issue: { id: "issue-stop-race", identifier: "ENG-STOP-RACE" },
+      },
+      agentActivity: { content: { type: "prompt", body: "push and review" } },
+      webhookId: "wh-stop-race-prompt",
+    });
+
+    await postWebhook({
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "sess-stop-race",
+        issue: { id: "issue-stop-race", identifier: "ENG-STOP-RACE" },
+      },
+      agentActivity: { signal: "stop", content: { type: "prompt", body: "stop" } },
+      webhookId: "wh-stop-race-stop",
+    });
+    _removeActiveRunForTesting("issue-stop-race");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(runStatePlanMock).not.toHaveBeenCalled();
   });
 
   it("responds 200 and ignores when session/issue data is missing", async () => {

@@ -2,7 +2,7 @@
  * Host-side GitHub App authentication for trusted repository operations.
  *
  * Private keys never enter worker containers. The gateway signs a short-lived
- * app JWT, exchanges it for an installation token restricted to one repository
+ * app JWT, exchanges it for an installation token restricted to the repositories
  * and the role's minimum permissions, and injects that token only into the
  * trusted git/gh process that needs it.
  */
@@ -66,9 +66,21 @@ export function resolveGitHubAppConfig(role, pluginConfig) {
  * @returns the opaque installation token
  */
 export async function getGitHubAppToken(role, repository, pluginConfig) {
-    const normalized = normalizeRepository(repository);
+    return getGitHubAppTokenForRepositories(role, [repository], pluginConfig);
+}
+/**
+ * Mint or reuse a short-lived installation token scoped to a repository set.
+ * @param role - coding or reviewer App identity
+ * @param repositories - canonical owner/repo names; empty means all installed repos
+ * @param pluginConfig - OpenClaw plugin configuration
+ * @returns the opaque installation token
+ */
+export async function getGitHubAppTokenForRepositories(role, repositories, pluginConfig) {
+    const normalized = [...new Set(repositories.map(normalizeRepository))]
+        .sort((a, b) => a.localeCompare(b));
     const config = resolveGitHubAppConfig(role, pluginConfig);
-    const cacheKey = `${role}:${config.appId}:${config.installationId}:${normalized.toLowerCase()}`;
+    const scope = normalized.length ? normalized.join(",").toLowerCase() : "*";
+    const cacheKey = `${role}:${config.appId}:${config.installationId}:${scope}`;
     const cached = tokenCache.get(cacheKey);
     if (cached && cached.expiresAtMs - Date.now() > TOKEN_REFRESH_SKEW_MS)
         return cached.token;
@@ -94,6 +106,13 @@ export function invalidateGitHubAppToken(role, repository) {
             tokenCache.delete(key);
     }
 }
+/** Drop every cached token for one App role. */
+export function invalidateGitHubAppRoleTokens(role) {
+    for (const key of tokenCache.keys()) {
+        if (key.startsWith(`${role}:`))
+            tokenCache.delete(key);
+    }
+}
 /** Clear all in-memory installation tokens (tests and controlled shutdown). */
 export function clearGitHubAppTokenCache() {
     tokenCache.clear();
@@ -111,10 +130,10 @@ export function parseGitHubRepositoryRemote(remote) {
         throw new Error(`Unsupported GitHub remote: ${remote}`);
     return normalizeRepository(`${match[1]}/${match[2]}`);
 }
-async function createInstallationToken(role, repository, config) {
+async function createInstallationToken(role, repositories, config) {
     const privateKey = readPrivateKey(config.privateKeyPath);
     const jwt = createAppJwt(config.appId, privateKey);
-    const repositoryName = repository.split("/")[1];
+    const repositoryNames = repositories.map((repository) => repository.split("/")[1]);
     const response = await fetch(`https://api.github.com/app/installations/${config.installationId}/access_tokens`, {
         method: "POST",
         headers: {
@@ -124,7 +143,7 @@ async function createInstallationToken(role, repository, config) {
             "X-GitHub-Api-Version": "2022-11-28",
         },
         body: JSON.stringify({
-            repositories: [repositoryName],
+            ...(repositoryNames.length ? { repositories: repositoryNames } : {}),
             permissions: githubAppPermissions(role),
         }),
     });

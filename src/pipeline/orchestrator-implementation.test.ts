@@ -27,9 +27,15 @@ vi.mock("./dispatch-state.js", () => ({
   updateDispatchProgress: updateDispatchProgressMock,
 }));
 
-import { runStatePlan } from "./orchestrator.js";
+import { runStatePlan, summarizeImplementationFailure } from "./orchestrator.js";
 
 describe("plan-implement no-change guard", () => {
+  it("removes encoded tool payloads from implementation failures", () => {
+    const encoded = Buffer.from("x".repeat(1_000)).toString("base64");
+    expect(summarizeImplementationFailure(`Spine failed:\n\`\`\`\n${encoded}\n\`\`\``))
+      .toBe("Spine failed: [tool output omitted]");
+  });
+
   beforeEach(() => {
     runAgentMock.mockReset().mockResolvedValue({
       success: true,

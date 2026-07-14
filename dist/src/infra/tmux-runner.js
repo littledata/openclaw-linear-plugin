@@ -184,7 +184,9 @@ export async function runInTmux(opts) {
                 const activities = mapEvent(event);
                 for (const activity of activities) {
                     if (linearApi && agentSessionId) {
-                        linearApi.emitActivity(agentSessionId, activity).catch((err) => {
+                        linearApi.emitActivity(agentSessionId, activity, event?.type === "item.started" && event?.item?.type === "command_execution"
+                            ? { ephemeral: true }
+                            : undefined).catch((err) => {
                             logger.warn(`Failed to emit tmux activity: ${err}`);
                         });
                     }

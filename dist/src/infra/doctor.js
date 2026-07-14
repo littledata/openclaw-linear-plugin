@@ -14,6 +14,8 @@ import { listWorktrees } from "./codex-worktree.js";
 import { loadCodingConfig, resolveCodingBackend } from "../tools/code-tool.js";
 import { getWebhookStatus, provisionWebhook, REQUIRED_RESOURCE_TYPES } from "./webhook-provision.js";
 import { createAgentProfilesFile } from "./shared-profiles.js";
+import { listGitHubInstallationRepositories } from "./github-repository-catalog.js";
+import { resolveGitHubAppConfig } from "./github-app-auth.js";
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -381,9 +383,13 @@ export async function checkFilesAndDirs(pluginConfig, fix = false) {
     else {
         checks.push(warn(`Worktree base dir does not exist: ${wtBaseDir}`, "Will be created on first dispatch"));
     }
+    const remoteRepositories = pluginConfig?.repositorySource === "github-app";
     // Base git repo
     const baseRepo = resolveBaseRepo(pluginConfig);
-    if (existsSync(baseRepo)) {
+    if (remoteRepositories) {
+        checks.push(pass("GitHub App repository mode: no host base checkout required"));
+    }
+    else if (existsSync(baseRepo)) {
         try {
             execFileSync("git", ["rev-parse", "--git-dir"], {
                 cwd: baseRepo,
@@ -400,7 +406,7 @@ export async function checkFilesAndDirs(pluginConfig, fix = false) {
         checks.push(fail(`Base repo does not exist: ${baseRepo}`, undefined, "Set codexBaseRepo in plugin config to your git repository path"));
     }
     // CLAUDE.md in base repo
-    if (existsSync(baseRepo)) {
+    if (!remoteRepositories && existsSync(baseRepo)) {
         const claudeMdPath = join(baseRepo, "CLAUDE.md");
         if (existsSync(claudeMdPath)) {
             try {
@@ -440,7 +446,7 @@ export async function checkFilesAndDirs(pluginConfig, fix = false) {
         }
     }
     // AGENTS.md in base repo
-    if (existsSync(baseRepo)) {
+    if (!remoteRepositories && existsSync(baseRepo)) {
         const agentsMdPath = join(baseRepo, "AGENTS.md");
         if (existsSync(agentsMdPath)) {
             try {
@@ -474,7 +480,7 @@ export async function checkFilesAndDirs(pluginConfig, fix = false) {
     }
     // Multi-repo path validation
     const repos = pluginConfig?.repos;
-    if (repos && typeof repos === "object") {
+    if (!remoteRepositories && repos && typeof repos === "object") {
         for (const [name, repoPath] of Object.entries(repos)) {
             if (typeof repoPath !== "string")
                 continue;
@@ -536,6 +542,37 @@ export async function checkFilesAndDirs(pluginConfig, fix = false) {
     }
     catch (err) {
         checks.push(fail("Failed to load prompts", err instanceof Error ? err.message : String(err)));
+    }
+    return checks;
+}
+// ---------------------------------------------------------------------------
+// GitHub App installations
+// ---------------------------------------------------------------------------
+export async function checkGitHubApps(pluginConfig) {
+    const checks = [];
+    if (pluginConfig?.repositorySource !== "github-app") {
+        checks.push(warn("Repository source is still local host mirrors", undefined, { fix: "Run: openclaw openclaw-linear github-apps migrate" }));
+        return checks;
+    }
+    try {
+        resolveGitHubAppConfig("coding", pluginConfig);
+        const coding = await listGitHubInstallationRepositories("coding", pluginConfig);
+        checks.push(coding.length
+            ? pass(`Coding GitHub App: ${coding.length} repositories`)
+            : fail("Coding GitHub App has no installed repositories"));
+        resolveGitHubAppConfig("reviewer", pluginConfig);
+        const reviewer = await listGitHubInstallationRepositories("reviewer", pluginConfig);
+        checks.push(reviewer.length
+            ? pass(`Reviewer GitHub App: ${reviewer.length} repositories`)
+            : fail("Reviewer GitHub App has no installed repositories"));
+        const reviewerNames = new Set(reviewer.map((repository) => repository.fullName.toLowerCase()));
+        const missing = coding.filter((repository) => !reviewerNames.has(repository.fullName.toLowerCase()));
+        checks.push(missing.length
+            ? warn(`${missing.length} coding repositories are unavailable to the reviewer App`)
+            : pass("Coding and reviewer repository access is aligned"));
+    }
+    catch (err) {
+        checks.push(fail("GitHub App authentication failed", err instanceof Error ? err.message : String(err), "Check both App IDs, installation IDs, PEM paths, permissions, and 0600 key modes."));
     }
     return checks;
 }
@@ -747,6 +784,7 @@ export async function runDoctor(opts) {
     sections.push({ name: "Agent Configuration", checks: checkAgentConfig(opts.pluginConfig, opts.fix) });
     // 3. Coding tools
     sections.push({ name: "Coding Tools", checks: checkCodingTools(opts.pluginConfig) });
+    sections.push({ name: "GitHub Apps", checks: await checkGitHubApps(opts.pluginConfig) });
     // 4. Files & dirs
     sections.push({
         name: "Files & Directories",

@@ -27,9 +27,10 @@ export interface RepoResolution {
  * Supports both plain string paths (backward compat) and objects.
  */
 export interface RepoEntry {
-  path: string;
+  path?: string;
   github?: string;      // "owner/repo" format
   hostname?: string;    // defaults to "github.com"
+  defaultBranch?: string;
 }
 
 /**
@@ -45,9 +46,10 @@ export function getRepoEntries(pluginConfig?: Record<string, unknown>): Record<s
       result[name] = { path: value };
     } else if (value && typeof value === "object") {
       result[name] = {
-        path: (value as any).path as string,
+        path: typeof (value as any).path === "string" ? (value as any).path : undefined,
         github: (value as any).github as string | undefined,
         hostname: (value as any).hostname as string | undefined,
+        defaultBranch: (value as any).defaultBranch as string | undefined,
       };
     }
   }
@@ -92,6 +94,14 @@ export function buildCandidateRepositories(
       hostname: e.hostname ?? "github.com",
       repositoryFullName: e.github!,
     }));
+}
+
+/** Resolve a configured repository's default branch. */
+export function resolveGitHubDefaultBranch(
+  repoName: string,
+  pluginConfig?: Record<string, unknown>,
+): string {
+  return getRepoEntries(pluginConfig)[repoName]?.defaultBranch || "main";
 }
 
 /**
@@ -193,7 +203,7 @@ function getRepoMap(pluginConfig?: Record<string, unknown>): Record<string, stri
   const entries = getRepoEntries(pluginConfig);
   const result: Record<string, string> = {};
   for (const [name, entry] of Object.entries(entries)) {
-    result[name] = entry.path;
+    if (entry.path) result[name] = entry.path;
   }
   return result;
 }

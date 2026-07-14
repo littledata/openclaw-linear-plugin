@@ -47,6 +47,8 @@
       "executionMode": { "type": "string", "enum": ["worktree", "container"], "description": "Worker isolation mode. 'worktree' (default): git worktree off a shared local clone. 'container': a per-session Docker container that clones the repo fresh (removes shared git state → safe for concurrent dispatches on the same repo).", "default": "worktree" },
       "workerImage": { "type": "string", "description": "Docker image for container execution mode (built from docker/worker.Dockerfile).", "default": "openclaw-linear-worker:latest" },
       "githubOwner": { "type": "string", "description": "Default GitHub organization for repo entries that omit an explicit github owner/repo identity." },
+      "repositorySource": { "type": "string", "enum": ["local", "github-app"], "description": "Repository source for ticket containers. 'github-app' discovers installed repositories and clones/pulls them directly with short-lived App tokens; 'local' retains the legacy read-only host mirror.", "default": "local" },
+      "repositoryCatalogCacheSec": { "type": "number", "description": "Seconds to cache the GitHub App installation repository list before refreshing it.", "default": 300 },
       "githubApps": {
         "type": "object",
         "additionalProperties": false,
@@ -121,17 +123,17 @@
       "worktreeBaseDir": { "type": "string", "description": "Base directory for persistent git worktrees (default: ~/.openclaw/worktrees)" },
       "repos": {
         "type": "object",
-        "description": "Multi-repo map — each key is a repo name, value is a path string or object with path + GitHub identity",
+        "description": "Optional repository overrides. In github-app mode the live installation catalog supplies entries automatically; paths are only needed in legacy local mode.",
         "additionalProperties": {
           "oneOf": [
             { "type": "string", "description": "Filesystem path (backward compat)" },
             {
               "type": "object",
-              "required": ["path"],
               "properties": {
-                "path": { "type": "string", "description": "Absolute filesystem path to git repo" },
+                "path": { "type": "string", "description": "Absolute filesystem path to git repo (legacy local mode)" },
                 "github": { "type": "string", "description": "GitHub owner/repo (e.g. 'calltelemetry/cisco-cdr')" },
-                "hostname": { "type": "string", "description": "Git host (default: 'github.com')", "default": "github.com" }
+                "hostname": { "type": "string", "description": "Git host (default: 'github.com')", "default": "github.com" },
+                "defaultBranch": { "type": "string", "description": "Default branch from the GitHub installation catalog" }
               }
             }
           ]

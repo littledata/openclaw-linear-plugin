@@ -15,7 +15,7 @@
 import { jsonResult } from "openclaw/plugin-sdk/core";
 import { getCurrentSession, getActiveSessionByAgentId, getIssueIdentifierForAgentRun, } from "../pipeline/active-session.js";
 import { getContainerRecord, touchContainer } from "../infra/container-registry.js";
-import { ensureContainerAlive, execInContainer, writeFileToContainer, readFileFromContainer, codeSearchInContainer, containerGitStatus, cloneRepo, repoWorkdir, WORK_ROOT, } from "../infra/container-runner.js";
+import { ensureContainerAlive, execInContainer, execAuthenticatedInContainer, writeFileToContainer, readFileFromContainer, codeSearchInContainer, containerGitStatus, cloneRepo, repoWorkdir, WORK_ROOT, } from "../infra/container-runner.js";
 /** Cap tool output so a runaway command can't flood the agent's context. */
 const MAX_OUTPUT = 24_000;
 function clip(s) {
@@ -27,7 +27,7 @@ function clip(s) {
  * Resolve the container for the active issue, spawning/reviving it as needed.
  * Returns the live container name + the issue identifier, or an error string.
  */
-function resolveContainer(api, ctx) {
+async function resolveContainer(api, ctx) {
     const pluginConfig = api.pluginConfig;
     const boundIdentifier = getIssueIdentifierForAgentRun(ctx.sessionId, ctx.sessionKey, ctx.agentId);
     const session = (boundIdentifier ? null : ctx.agentId ? getActiveSessionByAgentId(ctx.agentId) : null) ??
@@ -41,12 +41,17 @@ function resolveContainer(api, ctx) {
     if (!rec) {
         return { error: `No container is registered for ${identifier}. It should have been created at dispatch.` };
     }
-    const name = ensureContainerAlive(identifier, rec.repos, rec.branch, pluginConfig, api.logger);
+    const name = await ensureContainerAlive(identifier, rec.repos, rec.branch, pluginConfig, api.logger);
     if (!name) {
         return { error: `Could not start the container for ${identifier}.` };
     }
     touchContainer(identifier);
-    return { containerName: name, identifier };
+    return { containerName: name, identifier, repos: rec.repos };
+}
+function githubRoleForAgent(agentId) {
+    return agentId && ["apex", "warden", "proof", "helm", "lumen"].includes(agentId)
+        ? "reviewer"
+        : "coding";
 }
 /**
  * Build the per-ticket container toolset for the agent.
@@ -73,14 +78,17 @@ export function createContainerTools(api, rawCtx) {
             required: ["command"],
         },
         execute: async (_id, params) => {
-            const c = resolveContainer(api, ctx);
+            const c = await resolveContainer(api, ctx);
             if ("error" in c)
                 return jsonResult({ success: false, error: c.error });
             const command = params.command ?? "";
             const cwd = params.workdir || WORK_ROOT;
             const timeoutMs = Math.min(Math.max((params.timeoutSec ?? 600) * 1000, 1000), 3_600_000);
             api.logger.info(`container_exec [${c.identifier}] ${cwd}$ ${command.slice(0, 200)}`);
-            const r = execInContainer(c.containerName, command, cwd, timeoutMs);
+            const pluginConfig = api.pluginConfig;
+            const r = pluginConfig?.repositorySource === "github-app"
+                ? await execAuthenticatedInContainer(githubRoleForAgent(ctx.agentId), c.containerName, c.repos, command, cwd, timeoutMs, pluginConfig)
+                : execInContainer(c.containerName, command, cwd, timeoutMs);
             return jsonResult({
                 success: r.exitCode === 0,
                 exitCode: r.exitCode,
@@ -104,7 +112,7 @@ export function createContainerTools(api, rawCtx) {
             required: ["path", "content"],
         },
         execute: async (_id, params) => {
-            const c = resolveContainer(api, ctx);
+            const c = await resolveContainer(api, ctx);
             if ("error" in c)
                 return jsonResult({ success: false, error: c.error });
             if (!params.path)
@@ -126,7 +134,7 @@ export function createContainerTools(api, rawCtx) {
             required: ["path"],
         },
         execute: async (_id, params) => {
-            const c = resolveContainer(api, ctx);
+            const c = await resolveContainer(api, ctx);
             if ("error" in c)
                 return jsonResult({ success: false, error: c.error });
             if (!params.path)
@@ -149,7 +157,7 @@ export function createContainerTools(api, rawCtx) {
             required: ["repo", "patch"],
         },
         execute: async (_id, params) => {
-            const c = resolveContainer(api, ctx);
+            const c = await resolveContainer(api, ctx);
             if ("error" in c)
                 return jsonResult({ success: false, error: c.error });
             if (!params.repo || !params.patch)
@@ -169,7 +177,7 @@ export function createContainerTools(api, rawCtx) {
         promptSnippet: "container_status — git status of the container's repos",
         parameters: { type: "object", properties: {}, required: [] },
         execute: async () => {
-            const c = resolveContainer(api, ctx);
+            const c = await resolveContainer(api, ctx);
             if ("error" in c)
                 return jsonResult({ success: false, error: c.error });
             const rec = getContainerRecord(c.identifier);
@@ -200,14 +208,15 @@ export function createContainerTools(api, rawCtx) {
             required: ["repo"],
         },
         execute: async (_id, params) => {
-            const c = resolveContainer(api, ctx);
+            const c = await resolveContainer(api, ctx);
             if ("error" in c)
                 return jsonResult({ success: false, error: c.error });
             if (!params.repo)
                 return jsonResult({ success: false, error: "repo is required" });
             const rec = getContainerRecord(c.identifier);
             const branch = rec?.branch ?? "main";
-            const r = cloneRepo(c.containerName, params.repo, branch);
+            const pluginConfig = api.pluginConfig;
+            const r = await cloneRepo(c.containerName, params.repo, branch, pluginConfig);
             return jsonResult({ success: r.status === 0, exitCode: r.status ?? -1, stderr: clip(r.stderr), path: repoWorkdir(params.repo) });
         },
     };
@@ -229,7 +238,7 @@ export function createContainerTools(api, rawCtx) {
             required: ["query"],
         },
         execute: async (_id, params) => {
-            const c = resolveContainer(api, ctx);
+            const c = await resolveContainer(api, ctx);
             if ("error" in c)
                 return jsonResult({ success: false, error: c.error });
             if (!params.query)

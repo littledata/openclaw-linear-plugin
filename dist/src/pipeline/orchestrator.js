@@ -148,6 +148,9 @@ async function runRole(ctx, dispatch, role, phase, extra, issue) {
             inactivityMs,
             linearApi: ctx.linearApi,
             agentSessionId: dispatch.agentSessionId,
+            githubRole: phase === "implement" ? "coding" : "reviewer",
+            githubRepositories: repos,
+            pluginConfig: ctx.pluginConfig,
             logger: ctx.api.logger,
         });
         return { success: r.success, output: r.output };
@@ -292,6 +295,9 @@ async function runContainerImplement(ctx, dispatch, issue, assignments, reworkNo
         "Implement the change fully, then VERIFY it by running the project's build/tests inside the",
         `container. Commit your work in each changed repo (git add -A && git commit) on branch`,
         `\`${dispatch.branch}\`. Do NOT open a pull request — that happens after review.`,
+        "Do NOT push or launch another Codex/agent/reviewer. Return control after committing;",
+        "the orchestrator runs Apex and publishes the reviewed branch.",
+        "Never base64-encode repository files or read them one-by-one with git show.",
         dispatch.grillGuidance ? `\n## Clarified requirements\n${dispatch.grillGuidance}` : "",
     ]
         .filter(Boolean)
@@ -361,7 +367,7 @@ async function runImplementPhase(ctx, dispatch, issue, resumeGuidance) {
                 const { success, output } = await runRole(ctx, dispatch, role, "implement", a.task, issue);
                 attemptOutputs.push(`## ${role.label}\n${output}`);
                 if (!success) {
-                    attemptFailure = `${role.label} implementation failed: ${output.slice(-300)}`;
+                    attemptFailure = `${role.label} implementation failed: ${summarizeImplementationFailure(output)}`;
                     // Keep going to self-review — codex may have partially applied changes.
                 }
             }
@@ -376,6 +382,10 @@ async function runImplementPhase(ctx, dispatch, issue, resumeGuidance) {
             appendLog(dispatch.worktreePath, { ts: new Date().toISOString(), phase: "worker", attempt, agent: assignments.map((a) => a.role).join("+"), prompt: "", outputPreview: attemptOutputs.join("\n\n").slice(0, 500), success: !lastReason, durationMs: 0 });
         }
         catch { /* best effort */ }
+        // STOP may land while the worker is in-flight. Do not run the no-change
+        // guard (or leak the worker's final tool output into Linear) after that.
+        if (isCancelled(dispatch.issueId))
+            return { success: false, reason: "halted" };
         // No-change guard: never review an untouched workspace, even when an agent
         // reports success. containerGitStatus includes both working-tree changes and
         // commits made since provisioning, so a clean committed implementation passes.
@@ -421,6 +431,26 @@ async function runImplementPhase(ctx, dispatch, issue, resumeGuidance) {
         }
     }
     return { success: false, reason: lastReason || "implementation did not pass self-review" };
+}
+/**
+ * Reduce a failed worker transcript to a short, human-readable reason. Codex
+ * transcripts contain command output; the last command can be a multi-megabyte
+ * base64 payload, which must never become a Linear failure message.
+ * @param output - raw worker output
+ * @returns bounded failure summary with encoded/tool payloads removed
+ */
+export function summarizeImplementationFailure(output) {
+    const explicit = output.match(/(?:Codex (?:failed|timed out|killed)[^\n]*|inactivity watchdog[^\n]*|exit \d+)/i)?.[0];
+    if (explicit)
+        return explicit.slice(0, 300);
+    const cleaned = output
+        .replace(/```[\s\S]*?```/g, " [tool output omitted] ")
+        .replace(/\b[A-Za-z0-9+/]{160,}={0,2}\b/g, "[encoded tool output omitted]")
+        .replace(/\s+/g, " ")
+        .trim();
+    if (!cleaned)
+        return "worker exited without a readable error";
+    return cleaned.slice(-300);
 }
 /**
  * Build the rework instruction for a container-agent retry, or undefined on the

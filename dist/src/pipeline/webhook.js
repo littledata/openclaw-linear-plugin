@@ -11,6 +11,7 @@ import { recommendRepos } from "./recommend-repos.js";
 import { startOrReuseContainer, buildContainerSpec, stopContainerRun, containerNameForIssue, checkoutPullRequestInContainer } from "../infra/container-runner.js";
 import { setContainerRecord, getContainerRecord } from "../infra/container-registry.js";
 import { resolveRepos, getRepoEntries, resolveReposByNames, buildCandidateRepositories, detectMentionedRepos } from "../infra/multi-repo.js";
+import { hydrateGitHubRepositoryCatalog } from "../infra/github-repository-catalog.js";
 import { repoSelectSignal, optionsSignal } from "./select-signal.js";
 import { savePendingRepoSelection, getPendingRepoSelection, clearPendingRepoSelection, parseRepoSelection, } from "./repo-selection-state.js";
 import { getGrill, saveGrill, clearGrill } from "./grill-state.js";
@@ -72,6 +73,11 @@ const resumingRuns = new Set();
 // authoritative across restarts, but this avoids an async lookup before the
 // active-run/dedup gates on ordinary prompted webhooks.
 const pausedIssues = new Set();
+// Incremented for every STOP received for an issue. A continuation can be
+// queued while the previous turn is still unwinding; if another STOP arrives
+// before that continuation claims the dispatch, the generation mismatch keeps
+// the older continuation from clearing the newer cancellation request.
+const pauseGenerations = new Map();
 /**
  * issue id → a Linear AgentSession created by one of our own non-delegation
  * handlers. This only bridges the race between createSessionOnIssue() and its
@@ -113,6 +119,7 @@ export function _resetForTesting() {
     activeRuns.clear();
     resumingRuns.clear();
     pausedIssues.clear();
+    pauseGenerations.clear();
     recentlyProcessed.clear();
     recentlyEmittedActivities.clear();
     _resetProfilesCacheForTesting();
@@ -153,6 +160,10 @@ function wasRecentlyEmitted(body) {
 /** @internal — test-only; add an issue ID to the activeRuns set. */
 export function _addActiveRunForTesting(issueId) {
     activeRuns.add(issueId);
+}
+/** @internal — test-only; releases an active-run claim. */
+export function _removeActiveRunForTesting(issueId) {
+    activeRuns.delete(issueId);
 }
 /** @internal — test-only; pre-registers a key as recently processed. */
 export function _markAsProcessedForTesting(key) {
@@ -677,6 +688,7 @@ export async function handleLinearWebhook(api, req, res) {
             const { requestCancel } = await import("./cancellation.js");
             requestCancel(issue.id);
             pausedIssues.add(issue.id);
+            pauseGenerations.set(issue.id, (pauseGenerations.get(issue.id) ?? 0) + 1);
             const codexKilled = stopContainerRun(containerNameForIssue(stopIdentifier));
             const halted = abortedRuns > 0 || codexKilled;
             // Keep the dispatch record: it owns the selected repos, current phase,
@@ -688,11 +700,13 @@ export async function handleLinearWebhook(api, req, res) {
             clearLegacyResumeState(issue.id);
             const stopApi = createLinearApi(api);
             if (stopApi) {
+                const stopBody = halted
+                    ? `🛑 Paused — halted the running turn for ${stopIdentifier}. Reply in this session to continue with the same context and workspace.`
+                    : `🛑 Pause received for ${stopIdentifier}. Reply in this session to continue with the same context and workspace.`;
+                trackEmittedActivity(stopBody);
                 await stopApi.emitActivity(session.id, {
                     type: "response",
-                    body: halted
-                        ? `🛑 Paused — halted the running turn for ${stopIdentifier}. Reply in this session to continue with the same context and workspace.`
-                        : `🛑 Pause received for ${stopIdentifier}. Reply in this session to continue with the same context and workspace.`,
+                    body: stopBody,
                 }).catch(() => { });
             }
             return true;
@@ -1961,7 +1975,7 @@ function shouldAskRepoSelection(resolution, pluginConfig) {
     return resolution.source === "config_default";
 }
 async function handleDispatch(api, linearApi, issue, opts) {
-    const pluginConfig = api.pluginConfig;
+    const pluginConfig = await hydrateGitHubRepositoryCatalog(api.pluginConfig);
     const statePath = pluginConfig?.dispatchStatePath;
     const worktreeBaseDir = pluginConfig?.worktreeBaseDir;
     const baseRepo = pluginConfig?.codexBaseRepo ?? join(process.env.HOME ?? homedir(), "ai-workspace");
@@ -2326,7 +2340,7 @@ async function handleDispatch(api, linearApi, issue, opts) {
     let containerName;
     try {
         const nowMs = Date.now();
-        const start = startOrReuseContainer(buildContainerSpec(identifier, targetRepoNames, dispatchBranch, pluginConfig, nowMs), api.logger);
+        const start = await startOrReuseContainer(buildContainerSpec(identifier, targetRepoNames, dispatchBranch, pluginConfig, nowMs), api.logger, pluginConfig);
         containerName = start.name;
         // Record the container so the agent's container tools + the idle reaper can
         // find it. Reuse preserves the original createdAt; a fresh create stamps now.
@@ -2576,7 +2590,8 @@ async function routePausedPrompt(api, session, issue, activityBody, pluginConfig
         return true;
     }
     api.logger.info(`AgentSession prompted: ${session.id} — resuming paused dispatch ${identifier}`);
-    void resumePausedDispatch(api, linearApi, session, issue, userMessage, pluginConfig)
+    const pauseGeneration = pauseGenerations.get(issue.id) ?? 0;
+    void resumePausedDispatch(api, linearApi, session, issue, userMessage, pauseGeneration, pluginConfig)
         .catch((err) => api.logger.error(`Paused dispatch resume failed for ${identifier}: ${err}`));
     return true;
 }
@@ -2603,9 +2618,10 @@ async function waitForRunToSettle(issueId, timeoutMs = 30_000) {
  * @param session - prompted Linear Agent Session
  * @param issue - Linear issue reference from the webhook
  * @param userMessage - continuation instructions from the user
+ * @param expectedPauseGeneration - STOP generation observed by this prompt
  * @param pluginConfig - plugin configuration
  */
-async function resumePausedDispatch(api, linearApi, session, issue, userMessage, pluginConfig) {
+async function resumePausedDispatch(api, linearApi, session, issue, userMessage, expectedPauseGeneration, pluginConfig) {
     const issueId = issue.id;
     const identifier = (issue.identifier ?? issue.id);
     if (resumingRuns.has(issueId)) {
@@ -2622,6 +2638,10 @@ async function resumePausedDispatch(api, linearApi, session, issue, userMessage,
             }).catch(() => { });
             return;
         }
+        if ((pauseGenerations.get(issueId) ?? 0) !== expectedPauseGeneration) {
+            api.logger.info(`Paused dispatch ${identifier} received a newer STOP while its continuation was queued; discarding that continuation`);
+            return;
+        }
         const statePath = pluginConfig?.dispatchStatePath;
         const state = await readDispatchState(statePath);
         const persisted = getActiveDispatch(state, identifier);
@@ -2633,6 +2653,11 @@ async function resumePausedDispatch(api, linearApi, session, issue, userMessage,
             api.logger.info(`Paused dispatch ${identifier} belongs to a different Linear session`);
             return;
         }
+        // Re-check after the persistent-state reads as well. STOP writes the newer
+        // generation synchronously before its async state update, so this closes the
+        // remaining race immediately before clearCancel/status=working.
+        if ((pauseGenerations.get(issueId) ?? 0) !== expectedPauseGeneration)
+            return;
         const details = await linearApi.getIssueDetails(issueId).catch(() => issue);
         const workflowState = {
             name: details?.state?.name ?? "In Progress",

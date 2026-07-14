@@ -329,6 +329,10 @@ export function buildRolePrompt(role: RoleDef, opts: RolePromptOpts): string {
       "Read CLAUDE.md / AGENTS.md first, follow project conventions, run the tests,",
       "and commit your work with a clear message. Return a concise summary of what",
       "you changed and the test results. Do NOT touch the Linear issue.",
+      "Do NOT push, open a PR, launch another Codex/agent, or attempt Apex review yourself.",
+      "Return control after the commit; the orchestrator owns push, PR creation, and Apex review.",
+      "Start discovery with one bounded shell call combining git status/log/diff, targeted rg, and",
+      "small sed excerpts. Never base64-encode repository files or run one git show per file.",
     );
   } else if (opts.phase === "review") {
     lines.push(
