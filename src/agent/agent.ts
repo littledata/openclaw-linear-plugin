@@ -3,8 +3,9 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { mkdirSync, readFileSync } from "node:fs";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import type { LinearAgentApi, ActivityContent } from "../api/linear-api.js";
+import type { LinearAgentApi, ActivityContent, ActivityEmitOptions } from "../api/linear-api.js";
 import { InactivityWatchdog, resolveWatchdogConfig } from "./watchdog.js";
+import { bindAgentRunToIssue, unbindAgentRunFromIssue } from "../pipeline/active-session.js";
 
 // ---------------------------------------------------------------------------
 // Agent directory resolution (config-based, not ext API which ignores agentId)
@@ -42,6 +43,25 @@ export interface AgentRunResult {
 export interface AgentStreamCallbacks {
   linearApi: LinearAgentApi;
   agentSessionId: string;
+}
+
+/** Format structured tool data as readable activity content with a safe size cap. */
+export function formatToolActivityValue(value: unknown, maxChars: number): string {
+  let text: string;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try { text = JSON.stringify(JSON.parse(trimmed), null, 2); } catch { text = trimmed; }
+    } else {
+      text = trimmed;
+    }
+  } else if (value === undefined) {
+    text = "";
+  } else {
+    try { text = JSON.stringify(value, null, 2); } catch { text = String(value); }
+  }
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}\n…(${text.length - maxChars} more characters)`;
 }
 
 /**
@@ -82,6 +102,8 @@ export async function runAgent(params: {
   streaming?: AgentStreamCallbacks;
   /** Group key (issue id) so an external STOP can abort this run. */
   abortKey?: string;
+  /** Issue identifier whose Docker sandbox this embedded run may access. */
+  issueIdentifier?: string;
   /**
    * Read-only mode: agent keeps read tools (read, glob, grep, web_search,
    * web_fetch) but all write-capable tools are denied via config policy.
@@ -90,26 +112,42 @@ export async function runAgent(params: {
   readOnly?: boolean;
   /** Additional tools to deny (merged with config + readOnly denies) */
   toolsDeny?: string[];
+  /**
+   * Extra system prompt prepended to the agent's instructions. Used to bind a
+   * specialist ROLE (e.g. Spine/Warden) and its skill to this run. Merged with
+   * the read-only notice when readOnly is also set. Embedded runner only —
+   * ignored on the subprocess fallback (which has no system-prompt injection).
+   */
+  extraSystemPrompt?: string;
 }): Promise<AgentRunResult> {
   const maxAttempts = 2;
+  if (params.issueIdentifier) {
+    bindAgentRunToIssue(params.sessionId, params.agentId, params.issueIdentifier);
+  }
 
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const result = await runAgentOnce(params);
+  try {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const result = await runAgentOnce(params);
 
-    if (result.success || !result.watchdogKilled || attempt === maxAttempts - 1) {
-      return result;
+      if (result.success || !result.watchdogKilled || attempt === maxAttempts - 1) {
+        return result;
+      }
+
+      params.api.logger.warn(
+        `Agent ${params.agentId} killed by watchdog, retrying (attempt ${attempt + 1}/${maxAttempts})`,
+      );
+
+      // Emit Linear activity about the retry if streaming
+      if (params.streaming) {
+        params.streaming.linearApi.emitActivity(params.streaming.agentSessionId, {
+          type: "error",
+          body: `Agent killed by inactivity watchdog — no I/O for the configured threshold. Retrying...`,
+        }).catch(() => {});
+      }
     }
-
-    params.api.logger.warn(
-      `Agent ${params.agentId} killed by watchdog, retrying (attempt ${attempt + 1}/${maxAttempts})`,
-    );
-
-    // Emit Linear activity about the retry if streaming
-    if (params.streaming) {
-      params.streaming.linearApi.emitActivity(params.streaming.agentSessionId, {
-        type: "error",
-        body: `Agent killed by inactivity watchdog — no I/O for the configured threshold. Retrying...`,
-      }).catch(() => {});
+  } finally {
+    if (params.issueIdentifier) {
+      unbindAgentRunFromIssue(params.sessionId, params.agentId);
     }
   }
 
@@ -151,8 +189,9 @@ async function runAgentOnce(params: {
   readOnly?: boolean;
   toolsDeny?: string[];
   abortKey?: string;
+  extraSystemPrompt?: string;
 }): Promise<AgentRunResult> {
-  const { api, agentId, sessionId, streaming, readOnly, toolsDeny, abortKey } = params;
+  const { api, agentId, sessionId, streaming, readOnly, toolsDeny, abortKey, extraSystemPrompt } = params;
 
   // Inject current timestamp into every LLM request
   const message = `${buildDateContext()}\n\n${params.message}`;
@@ -166,7 +205,7 @@ async function runAgentOnce(params: {
   // Try embedded runner first (has streaming callbacks)
   if (streaming) {
     try {
-      return await runEmbedded(api, agentId, sessionId, message, timeoutMs, streaming, wdConfig.inactivityMs, readOnly, toolsDeny, abortKey);
+      return await runEmbedded(api, agentId, sessionId, message, timeoutMs, streaming, wdConfig.inactivityMs, readOnly, toolsDeny, abortKey, extraSystemPrompt);
     } catch (err) {
       // Read-only mode MUST NOT fall back to subprocess — subprocess runs a
       // full agent with no way to enforce the tool deny policy.
@@ -199,7 +238,7 @@ async function runAgentOnce(params: {
 //   group:web (web_search, web_fetch) — external context
 //   group:memory (memory_search/get)  — knowledge retrieval
 //   sessions_list, sessions_history   — read-only introspection
-const READ_ONLY_DENY: string[] = [
+export const READ_ONLY_DENY: string[] = [
   // group:fs = read + write + edit + apply_patch — but we need read,
   // so deny the write-capable members individually.
   "write", "edit", "apply_patch",
@@ -226,6 +265,7 @@ async function runEmbedded(
   readOnly?: boolean,
   toolsDeny?: string[],
   abortKey?: string,
+  extraSystemPrompt?: string,
 ): Promise<AgentRunResult> {
   // Load config so we can resolve agent dirs and providers correctly.
   const origConfig = await api.runtime.config.loadConfig();
@@ -282,10 +322,14 @@ async function runEmbedded(
 
   api.logger.info(`Embedded agent run: agent=${agentId} session=${sessionId} runId=${runId} provider=${provider} model=${model} workspaceDir=${workspaceDir} agentDir=${agentDir}`);
 
-  const emit = (content: ActivityContent) => {
-    streaming.linearApi.emitActivity(streaming.agentSessionId, content).catch((err) => {
-      api.logger.warn(`Activity emit failed: ${err}`);
-    });
+  // Serialize writes so an ephemeral start cannot race its completed card.
+  let activityQueue: Promise<void> = Promise.resolve();
+  const emit = (content: ActivityContent, opts?: ActivityEmitOptions) => {
+    activityQueue = activityQueue
+      .then(() => streaming.linearApi.emitActivity(streaming.agentSessionId, content, opts))
+      .catch((err) => {
+        api.logger.warn(`Activity emit failed: ${err}`);
+      });
   };
 
   // --- Inactivity watchdog ---
@@ -308,12 +352,23 @@ async function runEmbedded(
     },
   });
 
-  // Track last emitted tool to avoid duplicates
-  let lastToolAction = "";
-  // Derive a friendly label from cli_ tool names: cli_codex→"Codex", cli_claude→"Claude"
-  const cliLabel = (name: string) => name.startsWith("cli_") ? name.slice(4).charAt(0).toUpperCase() + name.slice(5) : name;
+  const pendingTools = new Map<string, { name: string; parameter?: string }>();
+  const completedResults = new Map<string, Array<{ result: unknown; isError: boolean }>>();
 
   watchdog.start();
+
+  // Compose the extra system prompt: the specialist ROLE brief (if any) plus
+  // the read-only notice (if readOnly). Either, both, or neither may apply.
+  const readOnlyNotice = [
+    "READ-ONLY MODE: You may read and search files but you MUST NOT",
+    "write, edit, create, or delete any files. Do not use host bash/exec.",
+    "Repository shell commands are allowed only through the container_* tools",
+    "provided for this ticket's Docker sandbox.",
+    "Your only output is your text response.",
+  ].join(" ");
+  const composedSystemPrompt = [extraSystemPrompt, readOnly ? readOnlyNotice : undefined]
+    .filter(Boolean)
+    .join("\n\n");
 
   const result = await api.runtime.agent.runEmbeddedPiAgent({
     sessionId,
@@ -328,15 +383,11 @@ async function runEmbedded(
     provider,
     model,
     abortSignal: controller.signal,
-    shouldEmitToolResult: () => true,
-    shouldEmitToolOutput: () => true,
-    ...(readOnly ? {
-      extraSystemPrompt: [
-        "READ-ONLY MODE: You may read and search files but you MUST NOT",
-        "write, edit, create, or delete any files. Do not run shell commands.",
-        "Your only output is your text response.",
-      ].join(" "),
-    } : {}),
+    // Project the structured lifecycle below. OpenClaw's aggregate summaries
+    // would otherwise create extra, uncorrelated Linear rows.
+    shouldEmitToolResult: () => false,
+    shouldEmitToolOutput: () => false,
+    ...(composedSystemPrompt ? { extraSystemPrompt: composedSystemPrompt } : {}),
 
     // Stream reasoning/thinking to Linear
     onReasoningStream: (payload) => {
@@ -347,16 +398,13 @@ async function runEmbedded(
       }
     },
 
-    // Stream tool results to Linear
-    onToolResult: (payload) => {
+    // OpenClaw supplies the actual result immediately before the matching
+    // `phase=result` event. The latter carries the toolCallId needed to pair it.
+    onAgentToolResult: ({ toolName, result, isError }) => {
       watchdog.tick();
-      const text = payload.text?.trim();
-      if (text) {
-        // Truncate tool results for activity display
-        const truncated = text.length > 300 ? text.slice(0, 300) + "..." : text;
-        const prefix = lastToolAction.startsWith("cli_") ? `[${cliLabel(lastToolAction)}] ` : "";
-        emit({ type: "action", action: `${prefix}${lastToolAction || "Tool result"}`, parameter: truncated });
-      }
+      const queued = completedResults.get(toolName) ?? [];
+      queued.push({ result, isError });
+      completedResults.set(toolName, queued);
     },
 
     // Raw agent events — capture tool starts/ends/updates
@@ -368,54 +416,34 @@ async function runEmbedded(
 
       const phase = String(data.phase ?? "");
       const toolName = String(data.name ?? "tool");
+      const toolCallId = String(data.toolCallId ?? "");
       const meta = typeof data.meta === "string" ? data.meta : "";
-      const rawInput = data.input;
-      const input = typeof rawInput === "string" ? rawInput : "";
+      const rawArgs = data.args ?? data.input;
 
-      // Parse structured input for richer detail on cli_* tools
-      let inputObj: Record<string, any> | null = null;
-      if (rawInput && typeof rawInput === "object") {
-        inputObj = rawInput as Record<string, any>;
-      } else if (input.startsWith("{")) {
-        try { inputObj = JSON.parse(input); } catch {}
-      }
-
-      // Tool execution start — emit action with tool name + available context
+      // Transient live card. The persistent completion carries args + result.
       if (phase === "start") {
-        lastToolAction = toolName;
-
-        // cli_codex / cli_claude / cli_gemini: emit a thought + action so the
-        // user immediately sees what the agent is dispatching and why.
-        if (toolName.startsWith("cli_") && inputObj) {
-          const tag = cliLabel(toolName);
-          const prompt = String(inputObj.prompt ?? "").slice(0, 250);
-          const workDir = inputObj.workingDir ? ` in ${inputObj.workingDir}` : "";
-          emit({ type: "thought", body: `[${tag}] Starting${workDir}: "${prompt}"\n\n${toolName}\nin progress` });
-          emit({ type: "action", action: `[${tag}] Running${workDir}`, parameter: prompt });
-        } else {
-          const detail = input || meta || toolName;
-          emit({ type: "action", action: `Running ${toolName}`, parameter: detail.slice(0, 300) });
-        }
+        const parameter = formatToolActivityValue(rawArgs ?? meta, 4_000) || undefined;
+        if (toolCallId) pendingTools.set(toolCallId, { name: toolName, parameter });
+        emit({ type: "action", action: toolName, parameter }, { ephemeral: true });
       }
 
-      // Tool execution update — partial progress (keeps Linear UI alive for long tools)
-      if (phase === "update") {
-        const detail = meta || input || "in progress";
-        const prefix = toolName.startsWith("cli_") ? `[${cliLabel(toolName)}] ` : "";
-        emit({ type: "action", action: `${prefix}${toolName}`, parameter: detail.slice(0, 300) });
-      }
+      if (phase === "result") {
+        const pending = toolCallId ? pendingTools.get(toolCallId) : undefined;
+        const queued = completedResults.get(toolName) ?? [];
+        const completed = queued.shift();
+        if (queued.length) completedResults.set(toolName, queued);
+        else completedResults.delete(toolName);
+        if (toolCallId) pendingTools.delete(toolCallId);
 
-      // Tool execution completed successfully
-      if (phase === "result" && !data.isError) {
-        const detail = meta ? meta.slice(0, 300) : "completed";
-        const prefix = toolName.startsWith("cli_") ? `[${cliLabel(toolName)}] ` : "";
-        emit({ type: "action", action: `${prefix}${toolName} done`, parameter: detail });
-      }
-
-      // Tool execution result with error
-      if (phase === "result" && data.isError) {
-        const prefix = toolName.startsWith("cli_") ? `[${cliLabel(toolName)}] ` : "";
-        emit({ type: "action", action: `${prefix}${toolName} failed`, parameter: (meta || "error").slice(0, 300) });
+        const isError = completed?.isError ?? Boolean(data.isError);
+        const rawResult = completed?.result ?? data.result ?? meta ?? (isError ? "failed" : "completed");
+        const formattedResult = formatToolActivityValue(rawResult, 12_000) || (isError ? "failed" : "completed");
+        emit({
+          type: "action",
+          action: pending?.name ?? toolName,
+          parameter: pending?.parameter,
+          result: isError ? `Failed\n\n${formattedResult}` : formattedResult,
+        });
       }
     },
 
@@ -426,6 +454,8 @@ async function runEmbedded(
       // The final response will be posted as a comment
     },
   });
+
+  await activityQueue;
 
   watchdog.stop();
   if (abortKey) {

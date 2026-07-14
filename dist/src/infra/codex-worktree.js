@@ -1,8 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, statSync, readdirSync, mkdirSync } from "node:fs";
+import { existsSync, statSync, readdirSync, mkdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { ensureGitignore } from "../pipeline/artifacts.js";
+import { getGitHubAppToken, githubAuthenticationEnvironment, invalidateGitHubAppToken, parseGitHubRepositoryRemote, } from "./github-app-auth.js";
 const DEFAULT_BASE_REPO = path.join(homedir(), "ai-workspace");
 const DEFAULT_WORKTREE_BASE_DIR = path.join(homedir(), ".openclaw", "worktrees");
 function resolveBaseDir(baseDir) {
@@ -61,17 +62,50 @@ export function createWorktree(issueIdentifier, opts) {
     // Idempotent: if worktree already exists, return it
     if (existsSync(worktreePath)) {
         try {
-            // Verify it's a valid git worktree
+            // Verify it's a valid git worktree...
             git(["rev-parse", "--git-dir"], worktreePath);
-            ensureGitignore(worktreePath);
-            return { path: worktreePath, branch, resumed: true };
+            // ...AND that it belongs to the requested base repo. A stale worktree
+            // from a PRIOR dispatch (created against a different repo before
+            // repo-selection chose this one) must NOT be silently reused, or the
+            // agent works in the wrong repo (observed: ld-shopify work reusing a
+            // transaction-monitor-2 worktree).
+            const commonDir = git(["rev-parse", "--git-common-dir"], worktreePath).trim();
+            const absCommon = path.isAbsolute(commonDir) ? commonDir : path.resolve(worktreePath, commonDir);
+            if (path.resolve(absCommon) === path.resolve(repo, ".git")) {
+                ensureGitignore(worktreePath);
+                return { path: worktreePath, branch, resumed: true };
+            }
+            // Different repo → remove from its owning repo, then fall through to recreate.
+            const ownerRepo = path.dirname(path.resolve(absCommon));
+            try {
+                git(["worktree", "remove", "--force", worktreePath], ownerRepo);
+            }
+            catch {
+                try {
+                    rmSync(worktreePath, { recursive: true, force: true });
+                }
+                catch { /* best effort */ }
+            }
+            try {
+                git(["worktree", "prune"], ownerRepo);
+            }
+            catch { /* best effort */ }
+            try {
+                git(["worktree", "prune"], repo);
+            }
+            catch { /* best effort */ }
         }
         catch {
             // Directory exists but isn't a valid worktree — remove and recreate
             try {
                 git(["worktree", "remove", "--force", worktreePath], repo);
             }
-            catch { /* best effort */ }
+            catch {
+                try {
+                    rmSync(worktreePath, { recursive: true, force: true });
+                }
+                catch { /* best effort */ }
+            }
         }
     }
     // Check if branch already exists (resume scenario)
@@ -86,6 +120,34 @@ export function createWorktree(issueIdentifier, opts) {
     git(["worktree", "add", "-b", branch, worktreePath], repo);
     ensureGitignore(worktreePath);
     return { path: worktreePath, branch, resumed: false };
+}
+/**
+ * Wipe an issue's workspace for a "start fresh" resume decision: remove the
+ * worktree directory and (best-effort) delete the dispatch branch from every
+ * candidate repo so the next dispatch starts from a clean HEAD. Never throws.
+ * @param issueIdentifier - the Linear issue identifier (worktree dir key)
+ * @param opts - baseDir (worktree root), branch (to delete), repos (repo paths to prune/branch-delete)
+ */
+export function wipeIssueWorkspace(issueIdentifier, opts) {
+    const baseDir = resolveBaseDir(opts?.baseDir);
+    const issueDir = path.join(baseDir, issueIdentifier);
+    try {
+        if (existsSync(issueDir))
+            rmSync(issueDir, { recursive: true, force: true });
+    }
+    catch { /* best effort */ }
+    for (const repo of opts?.repos ?? []) {
+        try {
+            git(["worktree", "prune"], repo);
+        }
+        catch { /* best effort */ }
+        if (opts?.branch) {
+            try {
+                git(["branch", "-D", opts.branch], repo);
+            }
+            catch { /* branch may not exist here */ }
+        }
+    }
 }
 /**
  * Create worktrees for multiple repos.
@@ -222,8 +284,13 @@ export function removeWorktree(worktreePath, opts) {
 }
 /**
  * Push the worktree branch and create a GitHub PR via `gh`.
+ * @param worktreePath - local git worktree path
+ * @param title - pull request title and fallback commit message
+ * @param body - pull request body
+ * @param pluginConfig - OpenClaw plugin configuration
+ * @returns the created pull request URL
  */
-export function createPullRequest(worktreePath, title, body) {
+export async function createPullRequest(worktreePath, title, body, pluginConfig) {
     // Commit any uncommitted changes first
     const status = getWorktreeStatus(worktreePath);
     if (status.hasUncommitted) {
@@ -236,11 +303,28 @@ export function createPullRequest(worktreePath, title, body) {
     }
     // Get branch name
     const branch = git(["rev-parse", "--abbrev-ref", "HEAD"], worktreePath);
-    // Push branch
-    git(["push", "-u", "origin", branch], worktreePath);
-    // Create PR via gh CLI
-    const prUrl = execFileSync("gh", ["pr", "create", "--title", title, "--body", body, "--head", branch], { cwd: worktreePath, encoding: "utf8", timeout: 30_000 }).trim();
-    return { prUrl };
+    const repository = parseGitHubRepositoryRemote(git(["remote", "get-url", "origin"], worktreePath));
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        const token = await getGitHubAppToken("coding", repository, pluginConfig);
+        const env = { ...process.env, ...githubAuthenticationEnvironment(token) };
+        try {
+            execFileSync("git", ["push", "-u", "origin", branch], {
+                cwd: worktreePath,
+                env,
+                encoding: "utf8",
+                timeout: 120_000,
+            });
+            const prUrl = execFileSync("gh", ["pr", "create", "--repo", repository, "--title", title, "--body", body, "--head", branch], { cwd: worktreePath, env, encoding: "utf8", timeout: 30_000 }).trim();
+            return { prUrl };
+        }
+        catch (err) {
+            if (attempt === 1 || !/bad credentials|authentication failed|http 401|401 unauthorized|token (?:has )?expired/i.test(String(err))) {
+                throw err;
+            }
+            invalidateGitHubAppToken("coding", repository);
+        }
+    }
+    throw new Error("GitHub authentication retry failed");
 }
 /**
  * List all worktrees in the configured base directory.

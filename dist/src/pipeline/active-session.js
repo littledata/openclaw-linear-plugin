@@ -15,6 +15,39 @@
 import { readDispatchState } from "./dispatch-state.js";
 // Keyed by issue ID — one active session per issue at a time.
 const sessions = new Map();
+// Embedded specialist runs use their own agent/session ids while operating on
+// an issue-owned container. Bind those trusted runtime identities explicitly so
+// container tools never guess from a global "current session" under concurrency.
+const agentRunIssueBySession = new Map();
+const agentRunIssuesByAgent = new Map();
+/** Bind an embedded agent run to the Linear issue whose container it may use. */
+export function bindAgentRunToIssue(sessionId, agentId, issueIdentifier) {
+    agentRunIssueBySession.set(sessionId, issueIdentifier);
+    const runs = agentRunIssuesByAgent.get(agentId) ?? new Map();
+    runs.set(sessionId, issueIdentifier);
+    agentRunIssuesByAgent.set(agentId, runs);
+}
+/** Remove a completed embedded-run binding. */
+export function unbindAgentRunFromIssue(sessionId, agentId) {
+    agentRunIssueBySession.delete(sessionId);
+    const runs = agentRunIssuesByAgent.get(agentId);
+    if (!runs)
+        return;
+    runs.delete(sessionId);
+    if (!runs.size)
+        agentRunIssuesByAgent.delete(agentId);
+}
+/** Resolve a trusted tool context to its explicitly-bound issue identifier. */
+export function getIssueIdentifierForAgentRun(sessionId, sessionKey, agentId) {
+    if (sessionId && agentRunIssueBySession.has(sessionId))
+        return agentRunIssueBySession.get(sessionId);
+    if (sessionKey && agentRunIssueBySession.has(sessionKey))
+        return agentRunIssueBySession.get(sessionKey);
+    if (!agentId)
+        return null;
+    const identifiers = new Set(agentRunIssuesByAgent.get(agentId)?.values() ?? []);
+    return identifiers.size === 1 ? identifiers.values().next().value ?? null : null;
+}
 const issueAgentAffinity = new Map();
 let _affinityTtlMs = 30 * 60_000; // 30 minutes default
 /**
@@ -152,5 +185,7 @@ export function _getAffinityTtlMs() {
 /** @internal — test-only; clears all affinity state and resets TTL. */
 export function _resetAffinityForTesting() {
     issueAgentAffinity.clear();
+    agentRunIssueBySession.clear();
+    agentRunIssuesByAgent.clear();
     _affinityTtlMs = 30 * 60_000;
 }

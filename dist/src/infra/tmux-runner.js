@@ -252,5 +252,9 @@ export function killActiveSession(issueId) {
     catch {
         // best effort — session may already be gone
     }
+    // Drop the mapping immediately. runInTmux's own finally also deletes it, but
+    // that races the next webhook — leaving a dead session here would route a
+    // post-STOP message into the steering handler ("can't steer this run").
+    activeSessions.delete(issueId);
     return session.sessionName;
 }

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { homedir } from "node:os";
 import path from "node:path";
-import { resolveRepos, isMultiRepo, validateRepoPath, getRepoEntries, buildCandidateRepositories, type RepoResolution } from "./multi-repo.ts";
+import { resolveRepos, isMultiRepo, validateRepoPath, getRepoEntries, buildCandidateRepositories, detectMentionedRepos, resolveGitHubRepository, type RepoResolution } from "./multi-repo.ts";
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
@@ -52,7 +52,7 @@ describe("resolveRepos", () => {
     const result = resolveRepos("Plain description", [], config);
     expect(result.source).toBe("config_default");
     expect(result.repos).toHaveLength(1);
-    expect(result.repos[0].name).toBe("default");
+    expect(result.repos[0].name).toBe("myproject");
     expect(result.repos[0].path).toBe("/tmp/test/myproject");
   });
 
@@ -66,19 +66,31 @@ describe("resolveRepos", () => {
     expect(result.repos[0].name).toBe("api");
   });
 
-  it("returns single repo from codexBaseRepo when no repos config", () => {
+  it("returns single repo named after codexBaseRepo basename when no repos config", () => {
+    // Name must be a REAL repo name (used to clone /repos-ro/<name>), so it's the
+    // basename of codexBaseRepo — never the synthetic "default".
     const result = resolveRepos("Nothing special", []);
     expect(result.source).toBe("config_default");
     expect(result.repos).toHaveLength(1);
-    expect(result.repos[0].name).toBe("default");
+    expect(result.repos[0].name).toBe("ai-workspace");
     expect(result.repos[0].path).toBe(path.join(homedir(), "ai-workspace"));
   });
 
-  it("handles empty description + no labels (single repo fallback)", () => {
-    const result = resolveRepos("", []);
+  it("uses codexBaseRepo basename as the fallback repo name", () => {
+    const result = resolveRepos("", [], { codexBaseRepo: "/root/repos/transaction-monitor-2" });
     expect(result.source).toBe("config_default");
     expect(result.repos).toHaveLength(1);
-    expect(result.repos[0].name).toBe("default");
+    expect(result.repos[0].name).toBe("transaction-monitor-2");
+    expect(result.repos[0].path).toBe("/root/repos/transaction-monitor-2");
+  });
+
+  it("prefers the matching configured entry's path for the basename fallback", () => {
+    const result = resolveRepos("", [], {
+      codexBaseRepo: "/root/repos/transaction-monitor-2",
+      repos: { "transaction-monitor-2": { path: "/custom/tmv2", github: "littledata/tmv2" } },
+    });
+    expect(result.repos[0].name).toBe("transaction-monitor-2");
+    expect(result.repos[0].path).toBe("/custom/tmv2");
   });
 
   it("trims whitespace in repo names from markers", () => {
@@ -254,6 +266,59 @@ describe("resolveRepos with team mapping", () => {
   it("falls back to config_default when no teamKey provided", () => {
     const result = resolveRepos("Plain description", [], config);
     expect(result.source).toBe("config_default");
+  });
+});
+
+describe("detectMentionedRepos", () => {
+  const repos = ["ld-shopify", "ld-shopify-admin", "transaction-monitor-2", "shopify-tracker"];
+
+  it("finds a repo named in a comment", () => {
+    expect(detectMentionedRepos("the bug is in ld-shopify, per George", repos)).toEqual(["ld-shopify"]);
+  });
+
+  it("does NOT match a shorter name inside a longer repo name", () => {
+    // "ld-shopify-admin" must not also register "ld-shopify"
+    expect(detectMentionedRepos("fix the ld-shopify-admin settings page", repos)).toEqual(["ld-shopify-admin"]);
+  });
+
+  it("ignores near-mentions that are not the exact repo name (e.g. TMv2)", () => {
+    expect(detectMentionedRepos("honored server-side in TMv2 but not the browser", repos)).toEqual([]);
+  });
+
+  it("is case-insensitive and de-duplicates", () => {
+    expect(detectMentionedRepos("LD-Shopify here, and ld-shopify again", repos)).toEqual(["ld-shopify"]);
+  });
+
+  it("returns multiple when several distinct repos are named", () => {
+    expect(detectMentionedRepos("touches ld-shopify and shopify-tracker", repos).sort()).toEqual(
+      ["ld-shopify", "shopify-tracker"],
+    );
+  });
+
+  it("returns [] for empty text or no match", () => {
+    expect(detectMentionedRepos("", repos)).toEqual([]);
+    expect(detectMentionedRepos("nothing relevant here", repos)).toEqual([]);
+  });
+});
+
+describe("resolveGitHubRepository", () => {
+  it("prefers an explicit owner/repo identity", () => {
+    expect(resolveGitHubRepository("api", {
+      githubOwner: "fallback",
+      repos: { api: { path: "/repos/api", github: "littledata/special-api" } },
+    })).toBe("littledata/special-api");
+  });
+
+  it("uses githubOwner for legacy string repo entries", () => {
+    expect(resolveGitHubRepository("transaction-monitor-2", {
+      githubOwner: "littledata",
+      repos: { "transaction-monitor-2": "/repos/transaction-monitor-2" },
+    })).toBe("littledata/transaction-monitor-2");
+  });
+
+  it("fails closed when neither an explicit identity nor owner is configured", () => {
+    expect(() => resolveGitHubRepository("api", { repos: { api: "/repos/api" } }))
+      .toThrow("No GitHub identity configured");
   });
 });
 

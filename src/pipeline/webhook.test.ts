@@ -9,6 +9,7 @@ const {
   runFullPipelineMock,
   resumePipelineMock,
   spawnWorkerMock,
+  runStatePlanMock,
   resolveLinearTokenMock,
   mockLinearApiInstance,
   loadAgentProfilesMock,
@@ -38,6 +39,8 @@ const {
   createWorktreeMock,
   createMultiWorktreeMock,
   prepareWorkspaceMock,
+  startOrReuseContainerMock,
+  checkoutPullRequestInContainerMock,
   resolveReposMock,
   isMultiRepoMock,
   ensureClawDirMock,
@@ -60,6 +63,7 @@ const {
   runFullPipelineMock: vi.fn().mockResolvedValue(undefined),
   resumePipelineMock: vi.fn().mockResolvedValue(undefined),
   spawnWorkerMock: vi.fn().mockResolvedValue(undefined),
+  runStatePlanMock: vi.fn().mockResolvedValue(undefined),
   resolveLinearTokenMock: vi.fn().mockReturnValue({
     accessToken: "test-token",
     refreshToken: "test-refresh",
@@ -74,6 +78,8 @@ const {
     getViewerId: vi.fn().mockResolvedValue("viewer-1"),
     createSessionOnIssue: vi.fn().mockResolvedValue({ sessionId: "sess-new" }),
     updateIssue: vi.fn().mockResolvedValue(undefined),
+    getRecentComments: vi.fn().mockResolvedValue([]),
+    listAgentSessions: vi.fn().mockResolvedValue([]),
     getTeamLabels: vi.fn().mockResolvedValue([]),
     getTeamStates: vi.fn().mockResolvedValue([
       { id: "st-1", name: "Backlog", type: "backlog" },
@@ -115,6 +121,8 @@ const {
   createWorktreeMock: vi.fn().mockReturnValue({ path: "/tmp/worktree", branch: "codex/ENG-123", resumed: false }),
   createMultiWorktreeMock: vi.fn().mockReturnValue({ parentPath: "/tmp/multi", worktrees: [] }),
   prepareWorkspaceMock: vi.fn().mockReturnValue({ pulled: true, submodulesInitialized: false, errors: [] }),
+  startOrReuseContainerMock: vi.fn().mockReturnValue({ name: "openclaw-linear-ENG-123", reused: false }),
+  checkoutPullRequestInContainerMock: vi.fn().mockResolvedValue({ status: 0, stdout: "", stderr: "" }),
   resolveReposMock: vi.fn().mockReturnValue({ repos: [{ name: "main", path: "/home/claw/ai-workspace" }], source: "config_default" }),
   isMultiRepoMock: vi.fn().mockReturnValue(false),
   ensureClawDirMock: vi.fn(),
@@ -201,9 +209,54 @@ vi.mock("../infra/codex-worktree.js", () => ({
   prepareWorkspace: prepareWorkspaceMock,
 }));
 
+vi.mock("../infra/container-runner.js", () => ({
+  startOrReuseContainer: startOrReuseContainerMock,
+  buildContainerSpec: vi.fn((identifier: string, targetRepos: string[], branch: string) => ({
+    issueIdentifier: identifier,
+    image: "openclaw-linear-worker:latest",
+    targetRepos,
+    branch,
+    reposRoot: "/root/repos",
+    clawHostDir: `/root/.openclaw/containers/${identifier}/.claw`,
+    createdAtMs: 0,
+  })),
+  destroyContainer: vi.fn(),
+  stopContainerRun: vi.fn().mockReturnValue(false),
+  containerNameForIssue: (id: string) => `openclaw-linear-${id}`,
+  checkoutPullRequestInContainer: checkoutPullRequestInContainerMock,
+}));
+
+vi.mock("../infra/container-registry.js", () => ({
+  setContainerRecord: vi.fn(),
+  getContainerRecord: vi.fn().mockReturnValue(undefined),
+  removeContainerRecord: vi.fn(),
+}));
+
+vi.mock("./orchestrator.js", () => ({
+  runStatePlan: runStatePlanMock,
+}));
+
 vi.mock("../infra/multi-repo.js", () => ({
   resolveRepos: resolveReposMock,
   isMultiRepo: isMultiRepoMock,
+  getRepoEntries: vi.fn((config?: Record<string, any>) => {
+    const repos = config?.repos ?? {};
+    return Object.fromEntries(Object.entries(repos).map(([name, value]) => [
+      name,
+      typeof value === "string" ? { path: value } : value,
+    ]));
+  }),
+  resolveReposByNames: vi.fn((names: string[], config?: Record<string, any>) => ({
+    repos: names.map((name) => ({
+      name,
+      path: typeof config?.repos?.[name] === "string"
+        ? config.repos[name]
+        : config?.repos?.[name]?.path ?? `/home/claw/repos/${name}`,
+    })),
+    source: "repo_selection",
+  })),
+  buildCandidateRepositories: vi.fn().mockReturnValue([]),
+  detectMentionedRepos: vi.fn().mockReturnValue([]),
 }));
 
 vi.mock("./artifacts.js", () => ({
@@ -253,7 +306,7 @@ import {
   _markAsProcessedForTesting,
 } from "./webhook.js";
 
-function createApi(): OpenClawPluginApi {
+function createApi(pluginConfig: Record<string, unknown> = {}): OpenClawPluginApi {
   return {
     logger: {
       info: vi.fn(),
@@ -262,7 +315,7 @@ function createApi(): OpenClawPluginApi {
       debug: vi.fn(),
     },
     runtime: {},
-    pluginConfig: {},
+    pluginConfig,
   } as unknown as OpenClawPluginApi;
 }
 
@@ -285,8 +338,12 @@ async function withServer(
   }
 }
 
-async function postWebhook(payload: unknown, path = "/linear/webhook") {
-  const api = createApi();
+async function postWebhook(
+  payload: unknown,
+  path = "/linear/webhook",
+  pluginConfig: Record<string, unknown> = {},
+) {
+  const api = createApi(pluginConfig);
   let status = 0;
   let body = "";
   // Track when the handler finishes (important: handleLinearWebhook does
@@ -332,9 +389,12 @@ afterEach(() => {
   runFullPipelineMock.mockReset().mockResolvedValue(undefined);
   resumePipelineMock.mockReset().mockResolvedValue(undefined);
   spawnWorkerMock.mockReset().mockResolvedValue(undefined);
+  runStatePlanMock.mockReset().mockResolvedValue(undefined);
   mockLinearApiInstance.emitActivity.mockReset().mockResolvedValue(undefined);
   mockLinearApiInstance.createComment.mockReset().mockResolvedValue("comment-id");
   mockLinearApiInstance.getIssueDetails.mockReset().mockResolvedValue(null);
+  mockLinearApiInstance.getRecentComments.mockReset().mockResolvedValue([]);
+  mockLinearApiInstance.listAgentSessions.mockReset().mockResolvedValue([]);
   mockLinearApiInstance.getViewerId.mockReset().mockResolvedValue("viewer-1");
   mockLinearApiInstance.createSessionOnIssue.mockReset().mockResolvedValue({ sessionId: "sess-new" });
   mockLinearApiInstance.updateIssue.mockReset().mockResolvedValue(undefined);
@@ -380,6 +440,8 @@ afterEach(() => {
   assessTierMock.mockReset().mockResolvedValue({ tier: "medium", model: "anthropic/claude-sonnet-4-6", reasoning: "moderate complexity" });
   createWorktreeMock.mockReset().mockReturnValue({ path: "/tmp/worktree", branch: "codex/ENG-123", resumed: false });
   prepareWorkspaceMock.mockReset().mockReturnValue({ pulled: true, submodulesInitialized: false, errors: [] });
+  startOrReuseContainerMock.mockReset().mockReturnValue({ name: "openclaw-linear-ENG-123", reused: false });
+  checkoutPullRequestInContainerMock.mockReset().mockResolvedValue({ status: 0, stdout: "", stderr: "" });
   resolveReposMock.mockReset().mockReturnValue({ repos: [{ name: "main", path: "/home/claw/ai-workspace" }], source: "config_default" });
   isMultiRepoMock.mockReset().mockReturnValue(false);
   ensureClawDirMock.mockReset();
@@ -1803,9 +1865,9 @@ describe("Issue.update dispatch flow", () => {
     await new Promise((r) => setTimeout(r, 300));
     const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
     expect(infoCalls.some((msg: string) => msg.includes("assigned to our app user"))).toBe(true);
-    // handleDispatch should have run tier assessment and created worktree
+    // handleDispatch should have run tier assessment and started the container
     expect(assessTierMock).toHaveBeenCalled();
-    expect(createWorktreeMock).toHaveBeenCalled();
+    expect(startOrReuseContainerMock).toHaveBeenCalled();
   });
 
   it("dispatches when delegated to our viewer", async () => {
@@ -2424,6 +2486,86 @@ describe("handleCloseIssue via close_issue intent", () => {
 // ---------------------------------------------------------------------------
 
 describe("handleDispatch via Issue.update assignment", () => {
+  it("enters review directly and checks out the attached PR without resume, repo selection, or grilling", async () => {
+    const pullRequestUrl = "https://github.com/littledata/ld-shopify/pull/1740";
+    const pluginConfig = {
+      orchestrationMode: "stateplan",
+      repoSelectionMode: "always",
+      grillMode: "on",
+      repos: {
+        "ld-shopify": {
+          path: "/root/repos/ld-shopify",
+          github: "littledata/ld-shopify",
+        },
+        "transaction-monitor-2": {
+          path: "/root/repos/transaction-monitor-2",
+          github: "littledata/transaction-monitor-2",
+        },
+      },
+    };
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: "issue-review",
+      identifier: "CORE-1740",
+      title: "Disabled Events Per Market",
+      description: "Existing implementation is ready for review.",
+      state: { name: "In Code Review", type: "started" },
+      team: { id: "team-review" },
+      labels: { nodes: [] },
+      comments: { nodes: [] },
+      attachments: {
+        nodes: [{ url: pullRequestUrl, title: "CORE-1740/Disabled-Events-Per-Market", sourceType: "github" }],
+      },
+      project: null,
+    });
+    mockLinearApiInstance.listAgentSessions.mockResolvedValue([{
+      id: "session-old",
+      createdAt: "2026-07-13T10:00:00.000Z",
+      updatedAt: "2026-07-13T10:30:00.000Z",
+      plan: "Existing Apex implementation plan",
+      pullRequests: [{ url: pullRequestUrl, title: "CORE-1740/Disabled-Events-Per-Market" }],
+      activities: [],
+    }]);
+    mockLinearApiInstance.getRecentComments.mockResolvedValue([{
+      body: "## Apex plan\nThe implementation plan is already complete.",
+    }]);
+
+    const result = await postWebhook({
+      type: "Issue",
+      action: "update",
+      data: {
+        id: "issue-review",
+        identifier: "CORE-1740",
+        assigneeId: "viewer-1",
+      },
+      updatedFrom: { assigneeId: null },
+    }, "/linear/webhook", pluginConfig);
+
+    expect(result.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    expect(startOrReuseContainerMock).toHaveBeenCalled();
+    expect(checkoutPullRequestInContainerMock).toHaveBeenCalledWith(
+      "openclaw-linear-ENG-123",
+      "ld-shopify",
+      pullRequestUrl,
+      1740,
+      pluginConfig,
+    );
+    expect(runStatePlanMock).toHaveBeenCalledOnce();
+    const [, registeredDispatch] = registerDispatchMock.mock.calls[0];
+    const [, , plan] = runStatePlanMock.mock.calls[0];
+    expect(registeredDispatch.containerRepos).toEqual(["ld-shopify"]);
+    expect(registeredDispatch.reviewPullRequests).toEqual([
+      expect.objectContaining({ repoName: "ld-shopify", url: pullRequestUrl, number: 1740 }),
+    ]);
+    expect(plan.stateLabel).toContain("code-review");
+    expect(plan.phases.every((phase: { type: string }) => phase.type === "review")).toBe(true);
+    expect(runAgentMock).not.toHaveBeenCalled();
+    expect(
+      mockLinearApiInstance.emitActivity.mock.calls.some(([, activity]: any[]) => activity?.type === "elicitation"),
+    ).toBe(false);
+  });
+
   it("registers dispatch and spawns worker pipeline", async () => {
     mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
     mockLinearApiInstance.getIssueDetails.mockResolvedValue({
@@ -2452,27 +2594,26 @@ describe("handleDispatch via Issue.update assignment", () => {
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 500));
     expect(assessTierMock).toHaveBeenCalled();
-    expect(createWorktreeMock).toHaveBeenCalled();
-    expect(prepareWorkspaceMock).toHaveBeenCalled();
+    expect(startOrReuseContainerMock).toHaveBeenCalled();
     expect(registerDispatchMock).toHaveBeenCalled();
     expect(setActiveSessionMock).toHaveBeenCalled();
-    expect(spawnWorkerMock).toHaveBeenCalled();
+    expect(runStatePlanMock).toHaveBeenCalled();
   });
 
-  it("handles worktree creation failure", async () => {
+  it("handles container start failure", async () => {
     mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
     mockLinearApiInstance.getIssueDetails.mockResolvedValue({
       id: "issue-wt-fail",
       identifier: "ENG-WF",
-      title: "Worktree Fail",
+      title: "Container Fail",
       description: "desc",
       state: { name: "In Progress", type: "started" },
       team: { id: "team-wf" },
       labels: { nodes: [] },
       comments: { nodes: [] },
     });
-    createWorktreeMock.mockImplementation(() => {
-      throw new Error("git worktree add failed");
+    startOrReuseContainerMock.mockImplementation(() => {
+      throw new Error("docker run failed");
     });
 
     const result = await postWebhook({
@@ -4273,15 +4414,7 @@ describe("Issue.create triage .catch callbacks", () => {
 // ---------------------------------------------------------------------------
 
 describe("handleDispatch multi-repo and .catch/.finally", () => {
-  it("covers multi-repo worktree creation path", async () => {
-    isMultiRepoMock.mockReturnValue(true);
-    createMultiWorktreeMock.mockReturnValue({
-      parentPath: "/tmp/multi-wt",
-      worktrees: [
-        { repoName: "api", path: "/tmp/multi-wt/api", branch: "codex/ENG-MULTI", resumed: false },
-        { repoName: "spa", path: "/tmp/multi-wt/spa", branch: "codex/ENG-MULTI", resumed: true },
-      ],
-    });
+  it("covers multi-repo container path (one container, both repos)", async () => {
     resolveReposMock.mockReturnValue({
       repos: [
         { name: "api", path: "/home/claw/api" },
@@ -4315,13 +4448,15 @@ describe("handleDispatch multi-repo and .catch/.finally", () => {
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 500));
-    expect(createMultiWorktreeMock).toHaveBeenCalled();
-    expect(prepareWorkspaceMock).toHaveBeenCalledTimes(2);
+    // One container provisioned with BOTH target repos.
+    expect(startOrReuseContainerMock).toHaveBeenCalled();
+    const spec = startOrReuseContainerMock.mock.calls[0][0];
+    expect(spec.targetRepos).toEqual(["api", "spa"]);
     expect(registerDispatchMock).toHaveBeenCalled();
   });
 
-  it("covers spawnWorker .catch and .finally when worker fails", async () => {
-    spawnWorkerMock.mockRejectedValue(new Error("pipeline v2 crash"));
+  it("covers pipeline .catch and .finally when the orchestrator fails", async () => {
+    runStatePlanMock.mockRejectedValue(new Error("pipeline v2 crash"));
     mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
     mockLinearApiInstance.getIssueDetails.mockResolvedValue({
       id: "issue-spawn-fail",
@@ -4385,7 +4520,7 @@ describe("handleDispatch multi-repo and .catch/.finally", () => {
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 500));
-    expect(spawnWorkerMock).toHaveBeenCalled();
+    expect(runStatePlanMock).toHaveBeenCalled();
   });
 
   it("covers dispatch tier label application with matching label", async () => {
@@ -4587,13 +4722,13 @@ describe("handleDispatch multi-repo and .catch/.finally", () => {
     expect(registerDispatchMock).toHaveBeenCalled();
   });
 
-  it("covers handleDispatch workspace prep errors", async () => {
-    prepareWorkspaceMock.mockReturnValue({ pulled: false, submodulesInitialized: false, errors: ["git pull failed"] });
+  it("covers handleDispatch reusing a warm container", async () => {
+    startOrReuseContainerMock.mockReturnValue({ name: "openclaw-linear-ENG-PE", reused: true });
     mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
     mockLinearApiInstance.getIssueDetails.mockResolvedValue({
       id: "issue-prep-err",
       identifier: "ENG-PE",
-      title: "Prep Error",
+      title: "Warm Reuse",
       description: "desc",
       state: { name: "In Progress", type: "started" },
       team: { id: "team-pe" },
@@ -4615,12 +4750,13 @@ describe("handleDispatch multi-repo and .catch/.finally", () => {
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 500));
-    const warnCalls = (result.api.logger.warn as any).mock.calls.map((c: any[]) => c[0]);
-    expect(warnCalls.some((msg: string) => msg.includes("workspace prep had errors"))).toBe(true);
+    expect(startOrReuseContainerMock).toHaveBeenCalled();
+    const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    expect(infoCalls.some((msg: string) => msg.includes("container reused"))).toBe(true);
   });
 
-  it("covers spawnWorker .catch with writeDispatchMemory failure (best effort)", async () => {
-    spawnWorkerMock.mockRejectedValue(new Error("pipeline crash"));
+  it("covers pipeline .catch with writeDispatchMemory failure (best effort)", async () => {
+    runStatePlanMock.mockRejectedValue(new Error("pipeline crash"));
     resolveOrchestratorWorkspaceMock.mockImplementation(() => { throw new Error("workspace resolve fail"); });
     mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
     mockLinearApiInstance.getIssueDetails.mockResolvedValue({

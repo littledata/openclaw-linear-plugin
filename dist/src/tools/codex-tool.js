@@ -8,8 +8,10 @@ import { runInTmux } from "../infra/tmux-runner.js";
 const CODEX_BIN = "codex";
 /**
  * Parse a JSONL line from `codex exec --json` and map it to a Linear activity.
+ * Exported so the container runner (codex via `docker exec`) reuses the exact
+ * same event→activity mapping as the host path.
  */
-function mapCodexEventToActivity(event) {
+export function mapCodexEventToActivity(event) {
     const eventType = event?.type;
     const item = event?.item;
     if (item?.type === "reasoning") {

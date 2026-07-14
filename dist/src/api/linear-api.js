@@ -5,6 +5,31 @@ import { refreshLinearToken } from "./auth.js";
 import { withResilience } from "../infra/resilience.js";
 export const LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql";
 export const AUTH_PROFILES_PATH = join(homedir(), ".openclaw", "auth-profiles.json");
+/** Convert Linear's JSON Agent Plan payload into readable context text. */
+export function formatAgentPlan(plan) {
+    if (typeof plan === "string")
+        return plan.trim() || null;
+    if (Array.isArray(plan)) {
+        const lines = plan
+            .filter((step) => !!step && typeof step === "object")
+            .map((step) => {
+            const content = typeof step.content === "string" ? step.content.trim() : "";
+            const status = typeof step.status === "string" ? step.status : "";
+            return content ? `- ${status ? `[${status}] ` : ""}${content}` : "";
+        })
+            .filter(Boolean);
+        return lines.length ? lines.join("\n") : null;
+    }
+    if (plan && typeof plan === "object") {
+        try {
+            return JSON.stringify(plan);
+        }
+        catch {
+            return null;
+        }
+    }
+    return null;
+}
 /**
  * Resolve a Linear access token from multiple sources in priority order:
  * 1. pluginConfig.accessToken (static config)
@@ -160,12 +185,47 @@ export class LinearAgentApi {
         }
         return payload.data;
     }
-    async emitActivity(agentSessionId, content) {
-        await this.gql(`mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
+    /**
+     * Emit an agent activity into a session. Optionally attach a Linear signal
+     * (e.g. `select`) with metadata so an elicitation renders clickable options.
+     * If the server rejects the signal fields (Agent APIs are a Developer Preview
+     * and may drift), retries once with content only so the prompt still reaches
+     * the user as free text.
+     * @param agentSessionId - the target agent session id
+     * @param content - the activity content (thought/action/response/elicitation/error)
+     * @param opts - optional signal + signalMetadata (siblings of content in the API)
+     */
+    async emitActivity(agentSessionId, content, opts) {
+        const mutation = `mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
         agentActivityCreate(input: $input) {
           success
         }
-      }`, { input: { agentSessionId, content } });
+      }`;
+        const input = { agentSessionId, content };
+        if (opts?.signal)
+            input.signal = opts.signal;
+        if (opts?.signalMetadata)
+            input.signalMetadata = opts.signalMetadata;
+        if (opts?.ephemeral !== undefined)
+            input.ephemeral = opts.ephemeral;
+        if (input.signal || input.signalMetadata) {
+            try {
+                await this.gql(mutation, { input });
+                return;
+            }
+            catch {
+                // Signal fields fell over — retry with a plain activity below.
+            }
+            await this.gql(mutation, {
+                input: {
+                    agentSessionId,
+                    content,
+                    ...(opts?.ephemeral !== undefined ? { ephemeral: opts.ephemeral } : {}),
+                },
+            });
+            return;
+        }
+        await this.gql(mutation, { input });
     }
     async updateSession(agentSessionId, input) {
         await this.gql(`mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
@@ -242,6 +302,7 @@ export class LinearAgentApi {
           project { id name }
           parent { id identifier }
           relations { nodes { type relatedIssue { id identifier title } } }
+          attachments(first: 50) { nodes { url title sourceType } }
         }
       }`, { id: issueId });
         return data.issue;
@@ -338,6 +399,102 @@ export class LinearAgentApi {
         }
       }`, { id: projectId });
         return data.project.issues.nodes;
+    }
+    /**
+     * List prior agent sessions on an issue, newest first, with their per-session
+     * plan/summary, PR links, and full activity feed. Used by the resume gate so a
+     * new session can read everything previous runs did. Best-effort — returns []
+     * if the query fails (schema drift / permissions).
+     * @param issueId - the Linear issue id
+     * @param opts - optional { activityLimit } cap on activities per session (default 60)
+     * @returns prior sessions, newest first
+     */
+    async listAgentSessions(issueId, opts) {
+        const activityLimit = opts?.activityLimit ?? 60;
+        try {
+            const data = await this.gql(`query IssueAgentSessions($id: String!, $activityLimit: Int!) {
+          issue(id: $id) {
+            agentSessions {
+              nodes {
+                id
+                createdAt
+                status
+                summary
+                plan
+                url
+                pullRequests {
+                  nodes {
+                    pullRequest { url title sourceBranch targetBranch status }
+                  }
+                }
+                activities(first: $activityLimit) {
+                  nodes {
+                    createdAt
+                    signal
+                    content {
+                      __typename
+                      ... on AgentActivityThoughtContent { type body }
+                      ... on AgentActivityActionContent { type action parameter result }
+                      ... on AgentActivityResponseContent { type body }
+                      ... on AgentActivityPromptContent { type body }
+                      ... on AgentActivityErrorContent { type body }
+                      ... on AgentActivityElicitationContent { type body }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }`, { id: issueId, activityLimit });
+            const nodes = data.issue?.agentSessions?.nodes ?? [];
+            return nodes
+                .map((s) => ({
+                id: s.id,
+                createdAt: s.createdAt,
+                status: s.status ?? null,
+                summary: s.summary ?? null,
+                plan: formatAgentPlan(s.plan),
+                url: s.url ?? null,
+                pullRequests: (s.pullRequests?.nodes ?? []).map((node) => node.pullRequest).filter(Boolean),
+                activities: (s.activities?.nodes ?? []).map((activity) => {
+                    const { __typename: _typename, ...content } = activity.content;
+                    return { ...activity, content: content };
+                }),
+            }))
+                .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)); // newest first
+        }
+        catch (err) {
+            return [];
+        }
+    }
+    /**
+     * Fetch recent comments on an issue with author names. Used by the resume gate:
+     * on this workspace the durable record of prior work (Apex plans, review
+     * verdicts, and the user's steering) lives in comments, not agent-session API
+     * objects. Best-effort — returns [] on failure.
+     * @param issueId - the Linear issue id
+     * @param count - how many of the most recent comments to fetch (default 60)
+     * @returns comments oldest→newest with author name (null for system comments)
+     */
+    async getRecentComments(issueId, count = 60) {
+        try {
+            const data = await this.gql(`query IssueComments($id: String!, $count: Int!) {
+          issue(id: $id) {
+            comments(last: $count) {
+              nodes { id body createdAt user { name } }
+            }
+          }
+        }`, { id: issueId, count });
+            return (data.issue?.comments?.nodes ?? []).map((c) => ({
+                id: c.id,
+                body: c.body ?? "",
+                author: c.user?.name ?? null,
+                createdAt: c.createdAt ?? "",
+            }));
+        }
+        catch {
+            return [];
+        }
     }
     async getTeamStates(teamId) {
         const data = await this.gql(`query TeamStates($id: String!) {

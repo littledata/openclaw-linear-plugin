@@ -1,50 +1,154 @@
 import { describe, it, expect } from "vitest";
-import { buildDockerRunArgs, WORKER_SCRIPT } from "./container-runner.js";
+import {
+  containerNameForIssue,
+  repoWorkdir,
+  buildRunArgs,
+  buildCodexInner,
+  PROVISION_SCRIPT,
+  CHECKOUT_PR_SCRIPT,
+  PUBLISH_PR_REVIEW_SCRIPT,
+  checkoutPullRequestInContainer,
+  publishPullRequestReviewInContainer,
+  parseContainerRows,
+  selectExpired,
+  ISSUE_LABEL,
+  CREATED_LABEL,
+  REPOS_RO_MOUNT,
+  CLAW_MOUNT,
+  type ContainerStartSpec,
+} from "./container-runner.js";
 
-describe("WORKER_SCRIPT", () => {
-  it("clones, checks out the branch, and runs codex exec", () => {
-    expect(WORKER_SCRIPT).toContain('git clone --depth 50 "$REMOTE_URL"');
-    expect(WORKER_SCRIPT).toContain('git checkout -B "$BRANCH"');
-    expect(WORKER_SCRIPT).toContain("codex exec --full-auto --json --ephemeral");
-    // Dynamic values referenced as env vars, never interpolated literals.
-    expect(WORKER_SCRIPT).toContain('"$PROMPT"');
+describe("containerNameForIssue", () => {
+  it("derives a docker-safe name from the identifier", () => {
+    expect(containerNameForIssue("CORE-1740")).toBe("openclaw-linear-CORE-1740");
+  });
+  it("sanitizes unsafe characters", () => {
+    expect(containerNameForIssue("team/weird id!")).toBe("openclaw-linear-team-weird-id-");
   });
 });
 
-describe("buildDockerRunArgs", () => {
-  const base = {
+describe("repoWorkdir", () => {
+  it("maps a repo name to its in-container path", () => {
+    expect(repoWorkdir("ld-shopify")).toBe("/work/ld-shopify");
+  });
+});
+
+describe("buildRunArgs", () => {
+  const base: ContainerStartSpec = {
+    issueIdentifier: "CORE-1740",
     image: "openclaw-linear-worker:latest",
-    remoteUrl: "https://github.com/littledata/foo.git",
-    branch: "CORE-1/Fix-Bar",
-    prompt: "implement the thing",
+    targetRepos: ["ld-shopify"],
+    branch: "CORE-1740/Fix",
+    reposRoot: "/root/repos",
+    clawHostDir: "/root/.claw/CORE-1740",
+    createdAtMs: 1_000,
   };
 
-  it("builds a --rm run with the image and the worker script", () => {
-    const args = buildDockerRunArgs(base);
+  it("runs detached with a deterministic name, labels, and the RO repos + claw mounts", () => {
+    const args = buildRunArgs(base);
     expect(args[0]).toBe("run");
-    expect(args).toContain("--rm");
-    expect(args).toContain("openclaw-linear-worker:latest");
-    expect(args[args.length - 3]).toBe("bash");
-    expect(args[args.length - 2]).toBe("-c");
+    expect(args).toContain("-d");
+    expect(args).toContain("openclaw-linear-CORE-1740");
+    expect(args).toContain(`${ISSUE_LABEL}=CORE-1740`);
+    expect(args).toContain(`${CREATED_LABEL}=1000`);
+    expect(args).toContain(`/root/repos:${REPOS_RO_MOUNT}:ro`);
+    expect(args).toContain(`/root/.claw/CORE-1740:${CLAW_MOUNT}`);
+    // keepalive entrypoint
+    expect(args.slice(-2)).toEqual(["sleep", "infinity"]);
   });
 
-  it("passes dynamic values as env vars (injection-safe)", () => {
-    const args = buildDockerRunArgs(base);
-    expect(args).toContain("REMOTE_URL=https://github.com/littledata/foo.git");
-    expect(args).toContain("BRANCH=CORE-1/Fix-Bar");
-    expect(args).toContain("PROMPT=implement the thing");
+  it("mounts only Codex auth and never ambient GitHub credentials", () => {
+    const args = buildRunArgs({
+      ...base,
+      codexAuthFile: "/root/.codex/auth.json",
+      memory: "4g",
+      cpus: "2",
+    });
+    expect(args).toContain("/root/.codex/auth.json:/root/.codex/auth.json:ro");
+    expect(args.join(" ")).not.toContain(".git-credentials");
+    expect(args.join(" ")).not.toContain("GH_TOKEN=");
+    expect(args).toContain("--memory");
+    expect(args).toContain("4g");
+    expect(args).toContain("--cpus");
+  });
+});
+
+describe("PROVISION_SCRIPT", () => {
+  it("uses --shared (cross-fs safe) and reads REPOS/BRANCH from env", () => {
+    expect(PROVISION_SCRIPT).toContain('git clone --shared "/repos-ro/$r" "/work/$r"');
+    expect(PROVISION_SCRIPT).toContain('checkout -B "$BRANCH"');
+    expect(PROVISION_SCRIPT).toContain("for r in $REPOS");
+  });
+});
+
+describe("CHECKOUT_PR_SCRIPT", () => {
+  it("fetches the exact GitHub pull ref and checks out a dedicated review branch", () => {
+    expect(CHECKOUT_PR_SCRIPT).toContain('fetch --force "$REMOTE_URL" "pull/$PR_NUMBER/head"');
+    expect(CHECKOUT_PR_SCRIPT).toContain('checkout -B "review/pr-$PR_NUMBER" FETCH_HEAD');
+    expect(CHECKOUT_PR_SCRIPT).toContain('reset --hard FETCH_HEAD');
   });
 
-  it("omits model/effort env when not provided; includes them when set", () => {
-    expect(buildDockerRunArgs(base).some(a => a.startsWith("MODEL="))).toBe(false);
-    const withModel = buildDockerRunArgs({ ...base, model: "gpt-5.6-sol", reasoningEffort: "high" });
-    expect(withModel).toContain("MODEL=gpt-5.6-sol");
-    expect(withModel).toContain("EFFORT=high");
+  it("rejects a PR URL from a repository other than the configured target", async () => {
+    await expect(checkoutPullRequestInContainer(
+      "openclaw-linear-CORE-1740",
+      "ld-shopify",
+      "https://github.com/attacker/ld-shopify/pull/10",
+      10,
+      { githubOwner: "littledata", repos: { "ld-shopify": "/repos/ld-shopify" } },
+    )).resolves.toMatchObject({ status: 2, stderr: expect.stringContaining("does not match") });
+  });
+});
+
+describe("PUBLISH_PR_REVIEW_SCRIPT", () => {
+  it("publishes a formal GitHub review and stable check run", () => {
+    expect(PUBLISH_PR_REVIEW_SCRIPT).toContain('gh pr review "$PR_URL" "$REVIEW_EVENT" --body "$REVIEW_BODY"');
+    expect(PUBLISH_PR_REVIEW_SCRIPT).toContain('name="OpenClaw Review"');
+    expect(PUBLISH_PR_REVIEW_SCRIPT).toContain('conclusion="$CHECK_CONCLUSION"');
   });
 
-  it("adds read-only auth mounts when paths are given", () => {
-    const args = buildDockerRunArgs({ ...base, codexAuthDir: "/root/.codex", gitCredentialsFile: "/root/.git-credentials" });
-    expect(args).toContain("/root/.codex:/root/.codex:ro");
-    expect(args).toContain("/root/.git-credentials:/root/.git-credentials:ro");
+  it("rejects review publication outside the configured repository", async () => {
+    await expect(publishPullRequestReviewInContainer(
+      "openclaw-linear-CORE-1740",
+      "ld-shopify",
+      "https://github.com/attacker/ld-shopify/pull/10",
+      "review",
+      true,
+      { githubOwner: "littledata", repos: { "ld-shopify": "/repos/ld-shopify" } },
+    )).resolves.toMatchObject({ status: 2, stderr: expect.stringContaining("does not match") });
+  });
+});
+
+describe("buildCodexInner", () => {
+  it("uses the sandbox-bypass flag and the prompt env var", () => {
+    const cmd = buildCodexInner("/work/ld-shopify", "gpt-5.6-sol", "high");
+    expect(cmd).toContain("--dangerously-bypass-approvals-and-sandbox");
+    expect(cmd).toContain("-m gpt-5.6-sol");
+    expect(cmd).toContain("-c model_reasoning_effort=high");
+    expect(cmd).toContain("-C /work/ld-shopify");
+    expect(cmd).toContain('"$PROMPT"');
+  });
+  it("omits model/effort flags when not given", () => {
+    const cmd = buildCodexInner("/work/x");
+    expect(cmd).not.toContain("-m ");
+    expect(cmd).not.toContain("model_reasoning_effort");
+  });
+});
+
+describe("parseContainerRows + selectExpired", () => {
+  it("parses name|createdAt rows", () => {
+    const rows = parseContainerRows("openclaw-linear-A|1000\nopenclaw-linear-B|5000\n");
+    expect(rows).toEqual([
+      { name: "openclaw-linear-A", createdAtMs: 1000 },
+      { name: "openclaw-linear-B", createdAtMs: 5000 },
+    ]);
+  });
+  it("selects only rows past the TTL", () => {
+    const rows = parseContainerRows("A|0\nB|9000\n");
+    // now=10000, ttl=5000 → A (age 10000) expired, B (age 1000) not
+    expect(selectExpired(rows, 10_000, 5_000)).toEqual(["A"]);
+  });
+  it("treats an unparseable createdAt as expired (reap orphans)", () => {
+    const rows = parseContainerRows("A|notanumber\n");
+    expect(selectExpired(rows, 10_000, 5_000)).toEqual(["A"]);
   });
 });

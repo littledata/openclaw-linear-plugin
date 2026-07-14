@@ -3,14 +3,17 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { LinearAgentApi, resolveLinearToken } from "../api/linear-api.js";
-import { spawnWorker, buildProjectContext, type HookContext } from "./pipeline.js";
+import { buildProjectContext, type HookContext } from "./pipeline.js";
 import { setActiveSession, clearActiveSession, getIssueAffinity, _configureAffinityTtl, _resetAffinityForTesting } from "./active-session.js";
 import { readDispatchState, getActiveDispatch, registerDispatch, updateDispatchStatus, completeDispatch, removeActiveDispatch, type ActiveDispatch } from "./dispatch-state.js";
 import { createManagedFlowForDispatch } from "./taskflow-bridge.js";
 import { createNotifierFromConfig, type NotifyFn } from "../infra/notify.js";
 import { assessTier } from "./tier-assess.js";
-import { createWorktree, createMultiWorktree, prepareWorkspace } from "../infra/codex-worktree.js";
-import { resolveRepos, isMultiRepo, getRepoEntries, resolveReposByNames, type RepoResolution } from "../infra/multi-repo.js";
+import { recommendRepos } from "./recommend-repos.js";
+import { startOrReuseContainer, buildContainerSpec, destroyContainer, stopContainerRun, containerNameForIssue, checkoutPullRequestInContainer } from "../infra/container-runner.js";
+import { setContainerRecord, getContainerRecord, removeContainerRecord } from "../infra/container-registry.js";
+import { resolveRepos, getRepoEntries, resolveReposByNames, buildCandidateRepositories, detectMentionedRepos, type RepoResolution } from "../infra/multi-repo.js";
+import { repoSelectSignal, optionsSignal, RESUME_SELECT } from "./select-signal.js";
 import {
   savePendingRepoSelection,
   getPendingRepoSelection,
@@ -18,6 +21,11 @@ import {
   parseRepoSelection,
 } from "./repo-selection-state.js";
 import { getGrill, saveGrill, clearGrill } from "./grill-state.js";
+import { runStatePlan } from "./orchestrator.js";
+import { resolveStatePlan, orchestrationMode, isReviewOnlyPlan } from "./state-plan.js";
+import { gatherPriorWork, analyzeResume } from "./prior-work.js";
+import { collectReviewPullRequests, resolveReviewTargets, type ReviewTarget } from "./review-context.js";
+import { getResume, saveResume, clearResume, parseResumeDecision, markResumeHandled, wasResumeHandledRecently, clearResumeHandled } from "./resume-state.js";
 import { runGrillStep } from "./grill.js";
 import { ensureClawDir, writeManifest, writeDispatchMemory, resolveOrchestratorWorkspace } from "./artifacts.js";
 import { readPlanningState, isInPlanningMode, getPlanningSession, endPlanningSession } from "./planning-state.js";
@@ -27,7 +35,7 @@ import { emitDiagnostic } from "../infra/observability.js";
 import { classifyIntent, type Intent } from "./intent-classify.js";
 import { extractGuidance, formatGuidanceAppendix, cacheGuidanceForTeam, getCachedGuidanceForTeam, isGuidanceEnabled, _resetGuidanceCacheForTesting } from "./guidance.js";
 import { loadAgentProfiles, buildMentionPattern, resolveAgentFromAlias, validateProfiles, _resetProfilesCacheForTesting, type AgentProfile } from "../infra/shared-profiles.js";
-import { getActiveTmuxSession, killActiveSession } from "../infra/tmux-runner.js";
+import { getActiveTmuxSession } from "../infra/tmux-runner.js";
 import { capturePane } from "../infra/tmux.js";
 import { loadCodingConfig, resolveToolName } from "../tools/code-tool.js";
 
@@ -715,18 +723,25 @@ export async function handleLinearWebhook(
     if (stopSignal === "stop") {
       const stopIdentifier = issue.identifier ?? issue.id;
       api.logger.info(`AgentSession prompted: STOP signal for ${stopIdentifier}`);
-      // Abort in-flight EMBEDDED runs (worker/auditor) — the common case — plus
-      // any tmux-based (codex exec) session. A tmux-only kill misses embedded runs.
+      // Abort in-flight EMBEDDED runs (reviewers) AND the codex process inside
+      // the container. The container is LEFT RUNNING (warm) so the next message
+      // can continue in the same workspace.
       const { abortRunsFor } = await import("../agent/agent.js");
       const abortedRuns = abortRunsFor(issue.id);
-      const killed = killActiveSession(issue.id);
-      const halted = abortedRuns > 0 || killed;
+      // Flag the state-driven orchestrator to stop advancing between phases —
+      // killing the current sub-run alone lets its loop spawn the next one.
+      const { requestCancel } = await import("./cancellation.js");
+      requestCancel(issue.id);
+      const codexKilled = stopContainerRun(containerNameForIssue(stopIdentifier));
+      const halted = abortedRuns > 0 || codexKilled;
       activeRuns.delete(issue.id);
       try {
         await removeActiveDispatch(stopIdentifier, pluginConfig?.dispatchStatePath as string | undefined);
       } catch { /* best effort */ }
       clearPendingRepoSelection(issue.id);
       clearGrill(issue.id);
+      clearResume(issue.id);
+      clearResumeHandled(issue.id); // next engagement should re-ask resume/fresh
       const stopApi = createLinearApi(api);
       if (stopApi) {
         await stopApi.emitActivity(session.id, {
@@ -769,9 +784,83 @@ export async function handleLinearWebhook(
         const grillApi = createLinearApi(api);
         if (grillApi) {
           api.logger.info(`AgentSession prompted: ${issue.identifier ?? issue.id} — grill answer #${grillPending.qa.length} recorded, resuming`);
-          void handleDispatch(api, grillApi, issue, { existingSessionId: grillPending.agentSessionId ?? session.id })
-            .catch((err) => api.logger.error(`grill resume failed: ${err}`));
+          void handleDispatch(api, grillApi, issue, {
+            existingSessionId: grillPending.agentSessionId ?? session.id,
+            resumeResolved: true,
+            // Carry the settled repo(s) so the repo-selection gate isn't re-asked
+            // between interview questions.
+            repoOverride: grillPending.repos?.length ? grillPending.repos : undefined,
+          }).catch((err) => api.logger.error(`grill resume failed: ${err}`));
         }
+        return true;
+      }
+    }
+
+    // ── Resume-or-fresh: the user answered the resume gate ──
+    // Runs BEFORE the activeRuns "ignore feedback" gate — the gate holds
+    // activeRuns while parked, same as /grill-me.
+    const resumePending = getResume(issue.id);
+    if (resumePending) {
+      const reply = typeof activityBody === "string" ? activityBody.trim() : "";
+      if (reply) {
+        const decision = parseResumeDecision(reply);
+        const rApi = createLinearApi(api);
+        if (!decision) {
+          if (rApi) await rApi.emitActivity(session.id, { type: "elicitation", body: 'Reply **resume** to continue the prior work, or **fresh** to start over.' }, RESUME_SELECT).catch(() => {});
+          return true;
+        }
+        clearResume(issue.id);
+        markResumeHandled(issue.id); // suppress the gate for re-triggers this engagement
+        activeRuns.delete(issue.id); // release the gate claim so the resume re-claims
+        if (!rApi) return true;
+
+        if (decision === "fresh") {
+          api.logger.info(`AgentSession prompted: ${issue.identifier ?? issue.id} resume-gate → FRESH`);
+          await rApi.emitActivity(session.id, { type: "thought", body: "Starting fresh — discarding the prior container and re-planning." }).catch(() => {});
+          try {
+            // Fresh = throw away the warm container; the re-dispatch recreates it.
+            destroyContainer(containerNameForIssue(issue.identifier ?? issue.id));
+            removeContainerRecord(issue.identifier ?? issue.id);
+          } catch (err) {
+            api.logger.warn(`resume-fresh container destroy failed: ${err}`);
+          }
+          void handleDispatch(api, rApi, issue, {
+            existingSessionId: resumePending.agentSessionId ?? session.id,
+            resumeResolved: true,
+          }).catch((err) => api.logger.error(`resume-fresh dispatch failed: ${err}`));
+          return true;
+        }
+
+        // decision === "resume": re-derive the correct repo(s) + a continuation
+        // brief from the prior context, then dispatch straight into the pipeline.
+        api.logger.info(`AgentSession prompted: ${issue.identifier ?? issue.id} resume-gate → RESUME`);
+        await rApi.emitActivity(session.id, { type: "thought", body: "Resuming — reviewing prior work to confirm the right repo and continue the plan." }).catch(() => {});
+        const repoNames = Object.keys(getRepoEntries(pluginConfig));
+        // The semantic analysis normally runs BEFORE the elicitation so the user
+        // sees the model's actual understanding and the chosen repos are already
+        // settled. Re-analyse only for parked state written by an older version.
+        const analysis = resumePending.analyzedBrief || resumePending.analyzedRepos?.length
+          ? {
+              repos: resumePending.analyzedRepos ?? [],
+              brief: resumePending.analyzedBrief ?? "",
+            }
+          : await analyzeResume(
+              api,
+              { identifier: issue.identifier ?? issue.id, title: issue.title ?? issue.identifier ?? issue.id, description: issue.description },
+              repoNames,
+              resumePending.fullContext,
+              resolveAgentId(api),
+            );
+        if (analysis.repos.length) {
+          await rApi.emitActivity(session.id, { type: "thought", body: `Resuming in: ${analysis.repos.join(", ")}` }).catch(() => {});
+        }
+        void handleDispatch(api, rApi, issue, {
+          existingSessionId: resumePending.agentSessionId ?? session.id,
+          resumeResolved: true,
+          grillDone: true, // skip grill — we have the repo + continuation brief
+          repoOverride: analysis.repos.length ? analysis.repos : undefined,
+          grillGuidance: analysis.brief || undefined,
+        }).catch((err) => api.logger.error(`resume dispatch failed: ${err}`));
         return true;
       }
     }
@@ -830,13 +919,17 @@ export async function handleLinearWebhook(
     // ── Interactive repo selection: resume a parked dispatch on the user's reply ──
     const pendingRepoSel = getPendingRepoSelection(issue.id);
     if (pendingRepoSel) {
-      const selected = parseRepoSelection(userMessage, pendingRepoSel.candidates);
+      // Numbers map to the displayed shortlist; names may be ANY configured repo
+      // (so a narrowed picker never traps a free-text reply for an off-list repo).
+      const allConfigured = Object.keys(getRepoEntries(api.pluginConfig as Record<string, unknown> | undefined));
+      const parseCandidates = [...new Set([...pendingRepoSel.candidates, ...allConfigured])];
+      const selected = parseRepoSelection(userMessage, parseCandidates);
       if (selected.length === 0) {
         const listText = pendingRepoSel.candidates.map((c, i) => `${i + 1}. ${c}`).join("\n");
         await linearApi.emitActivity(session.id, {
           type: "elicitation",
           body: `I didn't recognize that selection. Reply with the repo number(s) or name(s), or "all":\n\n${listText}`,
-        }).catch(() => {});
+        }, repoSelectSignal(pendingRepoSel.candidates)).catch(() => {});
         return true;
       }
       clearPendingRepoSelection(issue.id);
@@ -845,6 +938,7 @@ export async function handleLinearWebhook(
       void handleDispatch(api, linearApi, issue, {
         repoOverride: selected,
         existingSessionId: pendingRepoSel.agentSessionId ?? session.id,
+        resumeResolved: true, // resume stage already passed earlier in this chain
       }).catch((err) => api.logger.error(`repo-selection resume failed: ${err}`));
       return true;
     }
@@ -2148,7 +2242,7 @@ async function handleDispatch(
   api: OpenClawPluginApi,
   linearApi: LinearAgentApi,
   issue: any,
-  opts?: { repoOverride?: string[]; existingSessionId?: string; grillGuidance?: string; grillDone?: boolean },
+  opts?: { repoOverride?: string[]; existingSessionId?: string; grillGuidance?: string; grillDone?: boolean; resumeResolved?: boolean },
 ): Promise<void> {
   const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
   const statePath = pluginConfig?.dispatchStatePath as string | undefined;
@@ -2230,51 +2324,127 @@ async function handleDispatch(
   const commentCount = enrichedIssue.comments?.nodes?.length ?? 0;
   const dispatchTeamKey = enrichedIssue?.team?.key as string | undefined;
 
+  // Resolve the workflow plan BEFORE any implementation preflight. Review-only
+  // states must go straight to their linked PRs; they never resume an old build,
+  // ask for a repo, or run /grill-me.
+  const workflowState = {
+    name: enrichedIssue?.state?.name ?? "",
+    type: enrichedIssue?.state?.type ?? "",
+  };
+  const resolvedStatePlan = resolveStatePlan(workflowState, pluginConfig);
+  const reviewOnly = orchestrationMode(pluginConfig) === "stateplan" && isReviewOnlyPlan(resolvedStatePlan);
+  let reviewTargets: ReviewTarget[] = [];
+
   // Repo/guidance the grill interview (or an explicit override) may supply.
   let repoOverride = opts?.repoOverride;
   let grillGuidance = opts?.grillGuidance;
 
-  // ── /grill-me interview gate ──────────────────────────────────────────
-  // When grillMode is on, interview the user (one question at a time) BEFORE
-  // spawning the worker — first to establish WHICH repo(s) the work belongs in,
-  // then to clarify requirements. activeRuns stays claimed while parked so the
-  // created-handler still skips its conversational run (single session); the
-  // `prompted` handler records each answer and resumes this dispatch.
-  if (((pluginConfig?.grillMode as string) ?? "off") === "on" && !opts?.grillDone) {
-    const grill = getGrill(issue.id);
-    const repoNames = Object.keys(getRepoEntries(pluginConfig));
-    const step = await runGrillStep(
-      api,
-      { identifier, title: enrichedIssue.title ?? identifier, description: enrichedIssue.description },
-      repoNames,
-      grill?.qa ?? [],
-      resolveAgentId(api),
+  if (reviewOnly) {
+    const priorSessions = await linearApi.listAgentSessions(issue.id).catch(() => []);
+    const recentComments = await linearApi.getRecentComments(issue.id, 60).catch(() => []);
+    const pullRequests = collectReviewPullRequests(
+      enrichedIssue.attachments?.nodes ?? [],
+      priorSessions,
+      recentComments,
     );
-    if (!step.ready && step.question) {
-      let gsid = opts?.existingSessionId ?? linearSessionByIssue.get(issue.id);
-      if (!gsid) {
-        try { const sr = await linearApi.createSessionOnIssue(issue.id); gsid = sr.sessionId ?? undefined; } catch { /* best effort */ }
-      }
-      if (gsid) await linearApi.emitActivity(gsid, { type: "elicitation", body: step.question }).catch(() => {});
-      saveGrill({
-        issueId: issue.id,
-        issueIdentifier: identifier,
-        agentSessionId: gsid,
-        qa: grill?.qa ?? [],
-        pendingQuestion: step.question,
-        createdAt: grill?.createdAt ?? new Date().toISOString(),
-      });
-      api.logger.info(`@dispatch: ${identifier} grill-me — asked question ${(grill?.qa.length ?? 0) + 1}, awaiting reply (activeRuns held)`);
-      return; // NOTE: activeRuns left set on purpose — released by the prompted resume
+    const resolved = resolveReviewTargets(pullRequests, pluginConfig);
+    reviewTargets = resolved.targets;
+
+    let blockReason = "";
+    if (!pullRequests.length) {
+      blockReason = `No GitHub pull request is attached to **${identifier}**. Link the PR in Linear, then re-assign the issue for review.`;
+    } else if (resolved.unmatched.length) {
+      blockReason = [
+        `I found linked PRs, but their repositories are not configured for this agent:`,
+        ...resolved.unmatched.map((pr) => `- ${pr.repository}: ${pr.url}`),
+        `Add the matching \`repos.<name>.github\` entry, then retry.`,
+      ].join("\n");
     }
-    // Interview complete → carry the chosen repo(s) + implementation brief in.
-    clearGrill(issue.id);
-    if (step.repos?.length) repoOverride = step.repos;
-    if (step.guidance) grillGuidance = step.guidance;
-    api.logger.info(`@dispatch: ${identifier} grill-me complete — repos=${(step.repos ?? []).join(",") || "(default)"}, guidance=${grillGuidance ? "yes" : "none"}`);
+
+    if (blockReason) {
+      let sessionId = opts?.existingSessionId ?? linearSessionByIssue.get(issue.id);
+      if (!sessionId) {
+        try {
+          const created = await linearApi.createSessionOnIssue(issue.id);
+          sessionId = created.sessionId ?? undefined;
+        } catch { /* comment fallback below */ }
+      }
+      if (sessionId) {
+        await linearApi.emitActivity(sessionId, { type: "response", body: `⛔ Review could not start.\n\n${blockReason}` }).catch(() => {});
+      } else {
+        await createCommentWithDedup(linearApi, issue.id, `## ⛔ Review could not start\n\n${blockReason}`).catch(() => {});
+      }
+      activeRuns.delete(issue.id);
+      return;
+    }
+
+    repoOverride = [...new Set(reviewTargets.map((target) => target.repoName))];
+    api.logger.info(
+      `@dispatch: ${identifier} review-only state — ${reviewTargets.length} linked PR(s), repos=${repoOverride.join(",")}`,
+    );
   }
 
-  // Resolve repos for this dispatch (grill/explicit override → body markers → labels → team mapping → config default)
+  // ── Resume-or-fresh gate ──────────────────────────────────────────────
+  // If this issue already has prior agent work (previous sessions/comments),
+  // recap it and ask the user to RESUME (continue the prior plan) or start
+  // FRESH — BEFORE grilling or building a worktree. Runs only in stateplan mode
+  // and only once per dispatch chain (opts.resumeResolved guards re-entry).
+  if (
+    orchestrationMode(pluginConfig) === "stateplan" &&
+    !reviewOnly &&
+    !opts?.resumeResolved &&
+    !opts?.grillDone &&
+    !getResume(issue.id) &&
+    !wasResumeHandledRecently(issue.id)
+  ) {
+    const excludeSessionId = opts?.existingSessionId ?? linearSessionByIssue.get(issue.id);
+    const prior = await gatherPriorWork(linearApi, issue.id, { excludeSessionId });
+    if (prior.hasPriorWork) {
+      let rsid = excludeSessionId;
+      if (!rsid) {
+        try { const sr = await linearApi.createSessionOnIssue(issue.id); rsid = sr.sessionId ?? undefined; } catch { /* best effort */ }
+      }
+      const repoNames = Object.keys(getRepoEntries(pluginConfig));
+      const analysis = await analyzeResume(
+        api,
+        {
+          identifier,
+          title: enrichedIssue.title ?? identifier,
+          description: enrichedIssue.description,
+        },
+        repoNames,
+        prior.fullContext,
+        resolveAgentId(api),
+      );
+      const counts = [
+        prior.sessionCount ? `${prior.sessionCount} prior session(s)` : "",
+        prior.commentCount ? `${prior.commentCount} planning/steering note(s)` : "",
+      ].filter(Boolean).join(", ");
+      const understanding = analysis.brief || prior.summary;
+      const ask = `I found prior work on **${identifier}**${counts ? ` (${counts})` : ""}.\n\n**My understanding of where it stands:**\n\n${understanding}\n\nReply **resume** to continue from that plan, or **fresh** to start over.`;
+      if (rsid) await linearApi.emitActivity(rsid, { type: "elicitation", body: ask }, RESUME_SELECT).catch(() => {});
+      saveResume({
+        issueId: issue.id,
+        issueIdentifier: identifier,
+        agentSessionId: rsid,
+        fullContext: prior.fullContext,
+        analyzedRepos: analysis.repos,
+        analyzedBrief: analysis.brief,
+        createdAt: new Date().toISOString(),
+      });
+      api.logger.info(`@dispatch: ${identifier} resume-gate — ${prior.sessionCount} prior session(s), awaiting resume/fresh reply (activeRuns held)`);
+      return; // activeRuns left set on purpose — released by the prompted resume
+    }
+  }
+  // Past the resume stage for this engagement — mark it so re-entries (grill /
+  // repo-selection replies, or a stray Issue.update re-delegation) don't re-ask.
+  // Idempotent + sliding: refreshed on each re-entry while work is active.
+  if (orchestrationMode(pluginConfig) === "stateplan" && !reviewOnly) markResumeHandled(issue.id);
+
+  // NOTE: the /grill-me interview gate runs AFTER repo resolution (below), so the
+  // repo is settled first and grilling never re-asks which repo.
+
+  // Resolve repos for this dispatch (explicit override → body markers → labels → team mapping → config default)
   let repoResolution: RepoResolution;
   if (repoOverride?.length) {
     repoResolution = resolveReposByNames(repoOverride, pluginConfig);
@@ -2283,10 +2453,58 @@ async function handleDispatch(
     repoResolution = resolveRepos(enrichedIssue.description, labels, pluginConfig, dispatchTeamKey);
     api.logger.info(`@dispatch: ${identifier} team=${dispatchTeamKey ?? "none"} repos=${repoResolution.repos.map(r => r.name).join(",")} source=${repoResolution.source}`);
 
-    // Interactive repo selection: if enabled and the repo is ambiguous, ask the
-    // user which repo(s) to use and park the dispatch until they reply.
-    if (shouldAskRepoSelection(repoResolution, pluginConfig)) {
-      const candidates = Object.keys(getRepoEntries(pluginConfig));
+    // Config-default means nothing pinned the repo (no marker/label/team-mapping).
+    // We NEVER silently fall back to codexBaseRepo/TMv2. If the text names exactly
+    // one configured repo, use it; otherwise ask the model which repo(s) this
+    // concerns and ALWAYS present a picker led by that recommendation.
+    let mentionShortlist: string[] = [];
+    let recoOrder: string[] = []; // LLM-ranked repos, most relevant first
+    let recoReasoning = "";
+    if (repoResolution.source === "config_default") {
+      try {
+        const repoNames = Object.keys(getRepoEntries(pluginConfig));
+        const commentText = (await linearApi.getRecentComments(issue.id, 40).catch(() => []))
+          .map((c) => c.body)
+          .join("\n");
+        const mentioned = detectMentionedRepos(`${enrichedIssue.description ?? ""}\n${commentText}`, repoNames);
+        if (mentioned.length === 1) {
+          repoResolution = resolveReposByNames(mentioned, pluginConfig);
+          api.logger.info(`@dispatch: ${identifier} repos=${mentioned[0]} source=text_mention (rescued from config_default)`);
+        } else {
+          // Ambiguous (0 or >1 exact mentions) → ask the model to recommend, then ask
+          // the user. Never dispatch a blind default.
+          mentionShortlist = mentioned;
+          const reco = await recommendRepos(api, {
+            identifier,
+            title: enrichedIssue.title ?? "",
+            description: enrichedIssue.description,
+            context: commentText,
+            repoNames,
+          }).catch(() => ({ repos: [], reasoning: "" }));
+          recoOrder = reco.repos;
+          recoReasoning = reco.reasoning;
+          api.logger.info(`@dispatch: ${identifier} config_default ambiguous — reco=[${recoOrder.join(",")}] mentions=[${mentioned.join(",")}]`);
+        }
+      } catch (err) {
+        api.logger.warn(`@dispatch: ${identifier} repo mention-detection failed: ${err}`);
+      }
+    }
+
+    // Interactive repo selection. We ask when config-default couldn't resolve to a
+    // single repo (so we never default to TMv2), or when the configured mode asks.
+    const configuredRepoNames = Object.keys(getRepoEntries(pluginConfig));
+    const mustAskRepo =
+      shouldAskRepoSelection(repoResolution, pluginConfig) ||
+      (repoResolution.source === "config_default" && configuredRepoNames.length >= 2);
+    if (mustAskRepo) {
+      // Show ALL configured repos, but hoist the recommended ones (model reco, then
+      // text mentions) to the top so the user can still pick anything if the model
+      // guessed wrong.
+      const preferred = [...recoOrder, ...mentionShortlist].filter(
+        (v, i, a) => a.indexOf(v) === i && configuredRepoNames.includes(v),
+      );
+      let candidates = [...preferred, ...configuredRepoNames.filter((r) => !preferred.includes(r))];
+      let recommended: string | undefined = recoOrder[0] ?? mentionShortlist[0];
       let selectionSessionId = opts?.existingSessionId;
       if (!selectionSessionId) {
         try {
@@ -2296,12 +2514,48 @@ async function handleDispatch(
           api.logger.warn(`@dispatch: could not create session for repo selection: ${err}`);
         }
       }
-      const listText = candidates.map((c, i) => `${i + 1}. ${c}`).join("\n");
-      const promptBody = `Which repository should I work on for **${identifier}**? Reply with the number(s) or name(s) (comma-separated), or "all".\n\n${listText}`;
+      // No model recommendation? Fall back to Linear's ML repository suggestions
+      // (best-effort) to order the list + flag a recommended pick.
+      if (!recommended) {
+        try {
+          const candRepos = buildCandidateRepositories(pluginConfig);
+          if (selectionSessionId && candRepos.length) {
+            const suggestions = await linearApi.getRepositorySuggestions(issue.id, selectionSessionId, candRepos);
+            if (suggestions.length) {
+              const nameByGithub = new Map<string, string>();
+              for (const [name, e] of Object.entries(getRepoEntries(pluginConfig))) {
+                if (e.github) nameByGithub.set(e.github, name);
+              }
+              const ranked = suggestions
+                .map((s) => nameByGithub.get(s.repositoryFullName))
+                .filter((n): n is string => typeof n === "string" && candidates.includes(n));
+              if (ranked.length) {
+                recommended = ranked[0];
+                candidates = [...ranked, ...candidates.filter((c) => !ranked.includes(c))];
+                api.logger.info(`@dispatch: ${identifier} repo suggestions → recommended=${recommended}`);
+              }
+            }
+          }
+        } catch (err) {
+          api.logger.warn(`@dispatch: ${identifier} repo suggestions failed: ${err}`);
+        }
+      }
+      const recoSet = new Set(preferred.length ? preferred : recommended ? [recommended] : []);
+      const listText = candidates
+        .map((c, i) => `${i + 1}. ${c}${recoSet.has(c) ? " _(recommended)_" : ""}`)
+        .join("\n");
+      const reasoningLine = recoReasoning ? `\n\n🧭 ${recoReasoning}` : "";
+      const promptIntro = `Which repository should I work on for **${identifier}**?${reasoningLine}\n\nTap an option below, or reply with the number(s)/name(s) (comma-separated), or "all".`;
       if (selectionSessionId) {
-        await linearApi.emitActivity(selectionSessionId, { type: "elicitation", body: promptBody }).catch(() => {});
+        // Linear renders select options (and its own textual mirror), so do not
+        // duplicate the same full repository list in our elicitation body.
+        await linearApi.emitActivity(
+          selectionSessionId,
+          { type: "elicitation", body: promptIntro },
+          repoSelectSignal(candidates, recoSet),
+        ).catch(() => {});
       } else {
-        await createCommentWithDedup(linearApi, issue.id, promptBody).catch(() => {});
+        await createCommentWithDedup(linearApi, issue.id, `${promptIntro}\n\n${listText}`).catch(() => {});
       }
       savePendingRepoSelection({
         issueId: issue.id,
@@ -2314,6 +2568,47 @@ async function handleDispatch(
       activeRuns.delete(issue.id); // release the claim while parked for the user's reply
       return;
     }
+  }
+
+  // ── /grill-me interview gate ──────────────────────────────────────────
+  // Runs AFTER repo resolution so the repo is already settled — the grill only
+  // clarifies requirements and NEVER re-asks which repo. The chosen repo(s) are
+  // persisted in grill state and carried on each resume so the repo-selection gate
+  // above doesn't re-trigger mid-interview. activeRuns stays claimed while parked so
+  // the created-handler still skips its conversational run (single session); the
+  // `prompted` handler records each answer and resumes this dispatch.
+  if (!reviewOnly && ((pluginConfig?.grillMode as string) ?? "off") === "on" && !opts?.grillDone) {
+    const chosenRepos = repoResolution.repos.map((r) => r.name);
+    const grill = getGrill(issue.id);
+    const step = await runGrillStep(
+      api,
+      { identifier, title: enrichedIssue.title ?? identifier, description: enrichedIssue.description },
+      chosenRepos,
+      grill?.qa ?? [],
+      resolveAgentId(api),
+    );
+    if (!step.ready && step.question) {
+      let gsid = opts?.existingSessionId ?? linearSessionByIssue.get(issue.id);
+      if (!gsid) {
+        try { const sr = await linearApi.createSessionOnIssue(issue.id); gsid = sr.sessionId ?? undefined; } catch { /* best effort */ }
+      }
+      if (gsid) await linearApi.emitActivity(gsid, { type: "elicitation", body: step.question }, optionsSignal(step.options ?? [])).catch(() => {});
+      saveGrill({
+        issueId: issue.id,
+        issueIdentifier: identifier,
+        agentSessionId: gsid,
+        qa: grill?.qa ?? [],
+        pendingQuestion: step.question,
+        repos: chosenRepos, // carry the settled repo(s) across grill turns
+        createdAt: grill?.createdAt ?? new Date().toISOString(),
+      });
+      api.logger.info(`@dispatch: ${identifier} grill-me — asked question ${(grill?.qa.length ?? 0) + 1}, awaiting reply (activeRuns held)`);
+      return; // NOTE: activeRuns left set on purpose — released by the prompted resume
+    }
+    // Interview complete → carry the implementation brief into the worker.
+    clearGrill(issue.id);
+    if (step.guidance) grillGuidance = step.guidance;
+    api.logger.info(`@dispatch: ${identifier} grill-me complete — guidance=${grillGuidance ? "yes" : "none"}`);
   }
 
   // 4. Assess complexity tier
@@ -2334,55 +2629,62 @@ async function handleDispatch(
     agentId: resolveAgentId(api),
   });
 
-  // 5. Create persistent worktree(s)
-  let worktreePath: string;
-  let worktreeBranch: string;
-  let worktreeResumed: boolean;
-  let worktrees: Array<{ repoName: string; path: string; branch: string }> | undefined;
-
-  // Branch name from the configurable `branchTemplate` (default: codex/{identifier}).
+  // 5. Create (or reuse) the per-issue container. Repos are cloned writable
+  //    inside it from the read-only /root/repos mount; code lives at /work/<repo>.
+  //    worktreePath below is the HOST artifact root (.claw); no git worktrees.
+  const targetRepoNames = repoResolution.repos.map((r) => r.name);
   const dispatchBranch = resolveBranchName(identifier, enrichedIssue.title, pluginConfig);
-
+  const home = process.env.HOME ?? homedir();
+  const containersBase =
+    (pluginConfig?.containersBaseDir as string) ??
+    (worktreeBaseDir as string | undefined) ??
+    join(home, ".openclaw", "containers");
+  const hostRoot = join(containersBase, identifier.replace(/[^a-zA-Z0-9_.-]/g, "-"));
+  const worktreePath = hostRoot;
+  const worktreeBranch = dispatchBranch;
+  let containerName: string;
   try {
-    if (isMultiRepo(repoResolution)) {
-      const multi = createMultiWorktree(identifier, repoResolution.repos, { baseDir: worktreeBaseDir, branch: dispatchBranch });
-      worktreePath = multi.parentPath;
-      worktreeBranch = dispatchBranch;
-      worktreeResumed = multi.worktrees.some(w => w.resumed);
-      worktrees = multi.worktrees.map(w => ({ repoName: w.repoName, path: w.path, branch: w.branch }));
-      api.logger.info(`@dispatch: multi-repo worktrees ${worktreeResumed ? "resumed" : "created"} at ${worktreePath} (${repoResolution.repos.map(r => r.name).join(", ")})`);
-    } else {
-      const single = createWorktree(identifier, { baseRepo, baseDir: worktreeBaseDir, branch: dispatchBranch });
-      worktreePath = single.path;
-      worktreeBranch = single.branch;
-      worktreeResumed = single.resumed;
-      api.logger.info(`@dispatch: worktree ${worktreeResumed ? "resumed" : "created"} at ${worktreePath}`);
+    const nowMs = Date.now();
+    const start = startOrReuseContainer(
+      buildContainerSpec(identifier, targetRepoNames, dispatchBranch, pluginConfig, nowMs),
+      api.logger,
+    );
+    containerName = start.name;
+    // Record the container so the agent's container tools + the idle reaper can
+    // find it. Reuse preserves the original createdAt; a fresh create stamps now.
+    const existing = getContainerRecord(identifier);
+    setContainerRecord({
+      issueIdentifier: identifier,
+      containerName: start.name,
+      repos: targetRepoNames,
+      branch: dispatchBranch,
+      createdAtMs: start.reused && existing ? existing.createdAtMs : nowMs,
+      lastUsedMs: nowMs,
+    });
+    for (const target of reviewTargets) {
+      const checkout = await checkoutPullRequestInContainer(
+        start.name,
+        target.repoName,
+        target.url,
+        target.number,
+        pluginConfig,
+      );
+      if (checkout.status !== 0) {
+        throw new Error(
+          `could not check out ${target.url} in ${target.repoName}: ${checkout.stderr.slice(0, 300)}`,
+        );
+      }
+      api.logger.info(`@dispatch: ${identifier} checked out ${target.url} in ${target.repoName}`);
     }
+    api.logger.info(`@dispatch: ${identifier} container ${start.reused ? "reused" : "created"} (${start.name}) repos=${targetRepoNames.join(",")}`);
   } catch (err) {
-    api.logger.error(`@dispatch: worktree creation failed: ${err}`);
+    api.logger.error(`@dispatch: container start failed: ${err}`);
     activeRuns.delete(issue.id); // release the early claim on failure
     await createCommentWithDedup(linearApi,
       issue.id,
-      `**Dispatch failed** — couldn't create the worktree.\n\n> ${String(err).slice(0, 200)}\n\n**What to try:**\n- Check that the base repo exists\n- Re-assign this issue to try again\n- Check logs: \`journalctl --user -u openclaw-gateway --since "5 min ago"\``,
+      `**Dispatch failed** — couldn't prepare the ticket container.\n\n> ${String(err).slice(0, 300)}\n\n**What to try:**\n- Re-assign this issue to retry\n- Check the gateway logs`,
     );
     return;
-  }
-
-  // 5b. Prepare workspace(s)
-  if (worktrees) {
-    for (const wt of worktrees) {
-      const prep = prepareWorkspace(wt.path, wt.branch);
-      if (prep.errors.length > 0) {
-        api.logger.warn(`@dispatch: workspace prep for ${wt.repoName} had errors: ${prep.errors.join("; ")}`);
-      }
-    }
-  } else {
-    const prep = prepareWorkspace(worktreePath, worktreeBranch);
-    if (prep.errors.length > 0) {
-      api.logger.warn(`@dispatch: workspace prep had errors: ${prep.errors.join("; ")}`);
-    } else {
-      api.logger.info(`@dispatch: workspace prepared — pulled=${prep.pulled}, submodules=${prep.submodulesInitialized}`);
-    }
   }
 
   // 6. Reuse the Linear session — an explicit opt, or the one Linear auto-created
@@ -2437,20 +2739,33 @@ async function handleDispatch(
     agentSessionId,
     attempt: 0,
     project: enrichedIssue?.project?.id,
-    worktrees,
+    containerName,
+    containerRepos: targetRepoNames,
+    reviewPullRequests: reviewTargets,
     grillGuidance,
   };
   const dispatchWithFlow = createManagedFlowForDispatch(api, initialDispatch);
   await registerDispatch(identifier, dispatchWithFlow, statePath);
 
-  // 7b. Linear state transition: set issue to "In Progress" (best-effort)
-  if (enrichedIssue?.team?.id) {
+  // 7b. Linear state transition: set issue to "In Progress" (best-effort).
+  // In stateplan mode the orchestrator OWNS all state transitions (it advances
+  // the ticket per config, only on success), so we do NOT auto-move here —
+  // doing so previously landed on the first "started" state (e.g. "Design
+  // Review"), which is exactly the spurious move we want to avoid.
+  if (orchestrationMode(pluginConfig) === "stateplan") {
+    api.logger.info(`@dispatch: ${identifier} — stateplan mode, leaving state to the orchestrator`);
+  } else if (enrichedIssue?.team?.id) {
     try {
       const teamStates = await linearApi.getTeamStates(enrichedIssue.team.id);
-      const inProgress = teamStates.find((s: any) => s.type === "started");
+      // Prefer a state literally named "In Progress"; only then fall back to
+      // the first "started" state so we don't accidentally pick "Design Review".
+      const inProgress =
+        teamStates.find((s: any) => s.name.toLowerCase() === "in progress") ??
+        teamStates.find((s: any) => /in progress|in-progress|doing/i.test(s.name)) ??
+        teamStates.find((s: any) => s.type === "started");
       if (inProgress) {
         await linearApi.updateIssue(issue.id, { stateId: inProgress.id });
-        api.logger.info(`@dispatch: ${identifier} → ${inProgress.name} (In Progress)`);
+        api.logger.info(`@dispatch: ${identifier} → ${inProgress.name}`);
       }
     } catch (err) {
       api.logger.warn(`@dispatch: ${identifier} — failed to set In Progress state: ${err}`);
@@ -2473,7 +2788,9 @@ async function handleDispatch(
   if (agentSessionId) {
     await linearApi.emitActivity(agentSessionId, {
       type: "thought",
-      body: `Starting work on ${identifier} (${assessment.tier} complexity) on branch \`${worktreeBranch}\`.`,
+      body: reviewOnly
+        ? `Starting ${resolvedStatePlan?.stateLabel ?? "review"} for ${identifier} against ${reviewTargets.length} linked PR(s).`
+        : `Starting work on ${identifier} (${assessment.tier} complexity) on branch \`${worktreeBranch}\`.`,
     }).catch(() => {});
   }
 
@@ -2517,8 +2834,27 @@ async function handleDispatch(
     status: "dispatched",
   });
 
-  // spawnWorker handles: dispatched→working→auditing→done/rework/stuck
-  spawnWorker(hookCtx, dispatch)
+  // Container-only: every actionable dispatch runs the state-driven orchestrator
+  // inside its container. States with no configured plan (e.g. Done/Canceled) do
+  // nothing. The legacy worktree-based single worker has been retired.
+  const wfState = workflowState;
+  const plan = resolvedStatePlan;
+  if (!plan) {
+    api.logger.info(`@dispatch: no state-plan for ${identifier} (state="${wfState.name}") — nothing to run`);
+    if (agentSessionId) {
+      await linearApi.emitActivity(agentSessionId, {
+        type: "response",
+        body: `No pipeline is configured for the "${wfState.name}" state — nothing to do here.`,
+      }).catch(() => {});
+    }
+    activeRuns.delete(issue.id);
+    try { await removeActiveDispatch(identifier, statePath); } catch { /* best effort */ }
+    return;
+  }
+  api.logger.info(`@dispatch: state-plan "${plan.stateLabel}" for ${identifier} (state="${wfState.name}")`);
+  const pipelinePromise: Promise<void> = runStatePlan(hookCtx, dispatch, plan);
+
+  pipelinePromise
     .catch(async (err) => {
       api.logger.error(`@dispatch: pipeline v2 failed for ${identifier}: ${err}`);
       await updateDispatchStatus(identifier, "failed", statePath);
