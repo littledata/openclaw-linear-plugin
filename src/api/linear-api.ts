@@ -616,9 +616,9 @@ export class LinearAgentApi {
 
   /**
    * List prior agent sessions on an issue, newest first, with their per-session
-   * plan/summary, PR links, and full activity feed. Used by the resume gate so a
-   * new session can read everything previous runs did. Best-effort — returns []
-   * if the query fails (schema drift / permissions).
+   * plan/summary, PR links, and bounded activity feed. Used to hydrate a newly
+   * delegated session with a compact handoff from earlier runs. Best-effort —
+   * returns [] if the query fails (schema drift / permissions).
    * @param issueId - the Linear issue id
    * @param opts - optional { activityLimit } cap on activities per session (default 60)
    * @returns prior sessions, newest first
@@ -718,10 +718,10 @@ export class LinearAgentApi {
   }
 
   /**
-   * Fetch recent comments on an issue with author names. Used by the resume gate:
-   * on this workspace the durable record of prior work (Apex plans, review
-   * verdicts, and the user's steering) lives in comments, not agent-session API
-   * objects. Best-effort — returns [] on failure.
+   * Fetch recent comments on an issue with author names. The durable handoff for
+   * this workspace includes Apex plans, review verdicts, and user steering from
+   * comments in addition to agent-session summaries. Best-effort — returns []
+   * on failure.
    * @param issueId - the Linear issue id
    * @param count - how many of the most recent comments to fetch (default 60)
    * @returns comments oldest→newest with author name (null for system comments)

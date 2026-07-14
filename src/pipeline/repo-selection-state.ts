@@ -21,6 +21,10 @@ export interface PendingRepoSelection {
   /** Repo names in the exact order presented to the user (for numeric replies). */
   candidates: string[];
   agentSessionId?: string;
+  /** Bounded prior-session handoff to carry through the selection round-trip. */
+  guidance?: string;
+  /** Whether prior planning already made the startup interview redundant. */
+  skipGrill?: boolean;
   createdAt: string;
 }
 

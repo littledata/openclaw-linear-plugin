@@ -1,50 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { parseResumeDecision, isHandledFresh, RESUME_HANDLED_TTL_MS } from "./resume-state.js";
-import { parseResumeAnalysis, isSubstantiveComment } from "./prior-work.js";
+import { parsePriorContextAnalysis, isSubstantiveComment } from "./prior-work.js";
 
-describe("parseResumeDecision", () => {
-  it("recognizes resume phrasings", () => {
-    for (const s of ["resume", "Resume please", "continue", "yes", "pick up where we left off"]) {
-      expect(parseResumeDecision(s)).toBe("resume");
-    }
-  });
-  it("recognizes fresh phrasings", () => {
-    for (const s of ["fresh", "start fresh", "restart", "start over", "from scratch", "reset it"]) {
-      expect(parseResumeDecision(s)).toBe("fresh");
-    }
-  });
-  it("prefers fresh when both hinted (explicit restart wins)", () => {
-    expect(parseResumeDecision("don't resume, start fresh")).toBe("fresh");
-  });
-  it("returns null when unrecognized", () => {
-    expect(parseResumeDecision("what are my options?")).toBeNull();
-  });
-});
-
-describe("isHandledFresh", () => {
-  const now = 1_000_000_000_000;
-  it("is fresh within the TTL", () => {
-    expect(isHandledFresh(now - 60_000, now)).toBe(true);
-    expect(isHandledFresh(now, now)).toBe(true);
-  });
-  it("is stale past the TTL", () => {
-    expect(isHandledFresh(now - RESUME_HANDLED_TTL_MS - 1, now)).toBe(false);
-  });
-  it("is not fresh when no mark exists", () => {
-    expect(isHandledFresh(undefined, now)).toBe(false);
-  });
-  it("honours a custom TTL", () => {
-    expect(isHandledFresh(now - 5_000, now, 1_000)).toBe(false);
-    expect(isHandledFresh(now - 500, now, 1_000)).toBe(true);
-  });
-});
-
-describe("parseResumeAnalysis", () => {
+describe("parsePriorContextAnalysis", () => {
   const repos = ["ld-shopify", "transaction-monitor-2", "ld-shopify-admin"];
 
   it("parses repos (validated + canonicalized) + brief", () => {
     const out = '{"repos":["LD-SHOPIFY"],"brief":"Finish the disabledEvents UI slice."}';
-    expect(parseResumeAnalysis(out, repos)).toEqual({
+    expect(parsePriorContextAnalysis(out, repos)).toEqual({
       repos: ["ld-shopify"],
       brief: "Finish the disabledEvents UI slice.",
     });
@@ -52,21 +14,21 @@ describe("parseResumeAnalysis", () => {
 
   it("drops unknown repo names", () => {
     const out = '{"repos":["nope","ld-shopify-admin"],"brief":"x"}';
-    expect(parseResumeAnalysis(out, repos)?.repos).toEqual(["ld-shopify-admin"]);
+    expect(parsePriorContextAnalysis(out, repos)?.repos).toEqual(["ld-shopify-admin"]);
   });
 
   it("extracts JSON embedded in prose", () => {
     const out = 'After review:\n{"repos":["transaction-monitor-2"],"brief":"continue"}\ndone';
-    expect(parseResumeAnalysis(out, repos)?.repos).toEqual(["transaction-monitor-2"]);
+    expect(parsePriorContextAnalysis(out, repos)?.repos).toEqual(["transaction-monitor-2"]);
   });
 
   it("returns null when neither repos nor brief present", () => {
-    expect(parseResumeAnalysis('{"repos":["nope"]}', repos)).toBeNull();
-    expect(parseResumeAnalysis("no json", repos)).toBeNull();
+    expect(parsePriorContextAnalysis('{"repos":["nope"]}', repos)).toBeNull();
+    expect(parsePriorContextAnalysis("no json", repos)).toBeNull();
   });
 
   it("accepts a brief with no repos (repo stays undecided)", () => {
-    expect(parseResumeAnalysis('{"brief":"continue in the same place"}', repos)).toEqual({
+    expect(parsePriorContextAnalysis('{"brief":"continue in the same place"}', repos)).toEqual({
       repos: [],
       brief: "continue in the same place",
     });

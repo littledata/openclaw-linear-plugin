@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { repoSelectSignal, optionsSignal, RESUME_SELECT } from "./select-signal.js";
+import { repoSelectSignal, optionsSignal } from "./select-signal.js";
 import { parseRepoSelection } from "./repo-selection-state.js";
-import { parseResumeDecision } from "./resume-state.js";
 
 describe("repoSelectSignal", () => {
   it("maps each candidate to a label/value option", () => {
@@ -32,12 +31,6 @@ describe("repoSelectSignal", () => {
   });
 });
 
-describe("RESUME_SELECT", () => {
-  it("offers resume and fresh values", () => {
-    expect(RESUME_SELECT.signalMetadata.options.map((o) => o.value)).toEqual(["resume", "fresh"]);
-  });
-});
-
 describe("optionsSignal", () => {
   it("builds a select signal from answer choices", () => {
     const s = optionsSignal(["yes", "no"]);
@@ -56,11 +49,6 @@ describe("optionsSignal", () => {
 // The whole point of `select`: the returned value must survive the SAME reply
 // parsers a typed answer hits, since Linear echoes it as a normal prompt.
 describe("option values round-trip through existing reply parsers", () => {
-  it("resume/fresh values parse back to the same decision", () => {
-    for (const o of RESUME_SELECT.signalMetadata.options) {
-      expect(parseResumeDecision(o.value)).toBe(o.value);
-    }
-  });
   it("repo option values parse back to the same selection", () => {
     const cands = ["ld-shopify", "tmv2"];
     const s = repoSelectSignal(cands);

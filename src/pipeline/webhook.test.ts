@@ -2,7 +2,6 @@ import type { AddressInfo } from "node:net";
 import { createServer } from "node:http";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { clearResume, clearResumeHandled, getResume, saveResume } from "./resume-state.js";
 import { clearGrill, getGrill, saveGrill } from "./grill-state.js";
 
 // ── Hoisted mock values ──────────────────────────────────────────────
@@ -1083,112 +1082,6 @@ describe("AgentSessionEvent.prompted full flow", () => {
     expect(result.status).toBe(200);
     const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
     expect(infoCalls.some((msg: string) => msg.includes("agent active, no tmux, ignoring (feedback)"))).toBe(true);
-  });
-
-  it("lets a pending resume decision outrank stale grill state", async () => {
-    const issueId = "issue-resume-over-grill";
-    const sessionId = "session-resume-over-grill";
-    const pluginConfig = {
-      orchestrationMode: "stateplan",
-      grillMode: "on",
-      repos: {
-        "transaction-monitor-2": {
-          path: "/root/repos/transaction-monitor-2",
-          github: "littledata/transaction-monitor-2",
-        },
-      },
-    };
-    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
-      id: issueId,
-      identifier: "CORE-1748",
-      title: "Terminal outcome event stream",
-      description: "Implement the existing plan.",
-      state: { name: "In Progress", type: "started" },
-      team: { id: "team-core", key: "CORE" },
-      labels: { nodes: [] },
-      comments: { nodes: [] },
-      attachments: { nodes: [] },
-      project: null,
-    });
-    saveResume({
-      issueId,
-      issueIdentifier: "CORE-1748",
-      agentSessionId: sessionId,
-      fullContext: "Existing Apex plan",
-      analyzedRepos: ["transaction-monitor-2"],
-      analyzedBrief: "Continue the existing implementation plan.",
-      createdAt: new Date().toISOString(),
-    });
-    saveGrill({
-      issueId,
-      issueIdentifier: "CORE-1748",
-      agentSessionId: sessionId,
-      qa: [],
-      pendingQuestion: "An unrelated stale grill question?",
-      repos: ["transaction-monitor-2"],
-      createdAt: new Date().toISOString(),
-    });
-    _addActiveRunForTesting(issueId);
-
-    try {
-      const result = await postWebhook({
-        type: "AgentSessionEvent",
-        action: "prompted",
-        agentSession: {
-          id: sessionId,
-          issue: { id: issueId, identifier: "CORE-1748" },
-        },
-        agentActivity: { content: { type: "prompt", body: "resume" } },
-        webhookId: "wh-resume-over-grill",
-      }, "/linear/webhook", pluginConfig);
-
-      expect(result.status).toBe(200);
-      await new Promise((resolve) => setTimeout(resolve, 500));
-
-      expect(getGrill(issueId)).toBeUndefined();
-      expect(runStatePlanMock).toHaveBeenCalledOnce();
-      expect(
-        mockLinearApiInstance.emitActivity.mock.calls.some(([, activity]: any[]) =>
-          activity?.type === "thought" && activity.body.includes("Resuming")),
-      ).toBe(true);
-    } finally {
-      clearResume(issueId);
-      clearResumeHandled(issueId);
-      clearGrill(issueId);
-    }
-  });
-
-  it("ignores resume answers sent from an older session", async () => {
-    const issueId = "issue-stale-resume-session";
-    const currentSessionId = "session-current-resume";
-    saveResume({
-      issueId,
-      issueIdentifier: "CORE-NEW",
-      agentSessionId: currentSessionId,
-      fullContext: "Older sessions are context only.",
-      createdAt: new Date().toISOString(),
-    });
-
-    try {
-      const result = await postWebhook({
-        type: "AgentSessionEvent",
-        action: "prompted",
-        agentSession: {
-          id: "session-archived-resume",
-          issue: { id: issueId, identifier: "CORE-NEW" },
-        },
-        agentActivity: { content: { type: "prompt", body: "resume" } },
-        webhookId: "wh-stale-resume-session",
-      });
-
-      expect(result.status).toBe(200);
-      expect(getResume(issueId)?.agentSessionId).toBe(currentSessionId);
-      expect(runStatePlanMock).not.toHaveBeenCalled();
-      const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
-      expect(infoCalls.some((msg: string) => msg.includes("is stale; resume gate belongs"))).toBe(true);
-    } finally {
-      clearResume(issueId);
-    }
   });
 
   it("deduplicates by webhookId", async () => {
@@ -2676,7 +2569,7 @@ describe("handleDispatch via a newly created delegation session", () => {
     expect(mockLinearApiInstance.getViewerId).not.toHaveBeenCalled();
   });
 
-  it("keeps raw prior-session transcripts out of the resume prompt when synthesis fails", async () => {
+  it("continues automatically without exposing raw prior-session transcripts when synthesis fails", async () => {
     const issueId = "issue-resume-synthesis-fallback";
     mockLinearApiInstance.getIssueDetails.mockResolvedValue({
       id: issueId,
@@ -2717,24 +2610,89 @@ describe("handleDispatch via a newly created delegation session", () => {
       expect(result.status).toBe(200);
       await new Promise((resolve) => setTimeout(resolve, 500));
       const analysisCall = runAgentMock.mock.calls.find(
-        ([args]: any[]) => args.sessionId.startsWith("resume-analyze-CORE-SYNTH-"),
+        ([args]: any[]) => args.sessionId.startsWith("prior-context-CORE-SYNTH-"),
       )?.[0];
       expect(analysisCall).toEqual(expect.objectContaining({
         readOnly: true,
-        streaming: expect.objectContaining({ agentSessionId: "resume-analyze-CORE-SYNTH" }),
+        streaming: expect.objectContaining({ agentSessionId: "prior-context-CORE-SYNTH" }),
         toolsDeny: expect.arrayContaining(["group:fs", "group:web", "linear_issues"]),
       }));
-      const elicitation = mockLinearApiInstance.emitActivity.mock.calls.find(
-        ([sessionId, activity]: any[]) =>
-          sessionId === "session-resume-synthesis" && activity?.type === "elicitation",
-      )?.[1]?.body as string;
-      expect(elicitation).toContain("I found relevant work in earlier sessions");
-      expect(elicitation).not.toContain("RAW PLAN THAT MUST NOT BE SHOWN");
-      expect(elicitation).not.toContain("RAW SESSION TAIL THAT MUST NOT BE SHOWN");
+      expect(runStatePlanMock).toHaveBeenCalledOnce();
+      const visibleBodies = mockLinearApiInstance.emitActivity.mock.calls
+        .filter(([sessionId]: any[]) => sessionId === "session-resume-synthesis")
+        .map(([, activity]: any[]) => activity?.body ?? "")
+        .join("\n");
+      expect(visibleBodies).not.toMatch(/resume|fresh/i);
+      expect(visibleBodies).not.toContain("RAW PLAN THAT MUST NOT BE SHOWN");
+      expect(visibleBodies).not.toContain("RAW SESSION TAIL THAT MUST NOT BE SHOWN");
     } finally {
-      clearResume(issueId);
-      clearResumeHandled(issueId);
+      clearGrill(issueId);
     }
+  });
+
+  it("hydrates a new delegation from prior session summaries and skips redundant startup gates", async () => {
+    const issueId = "issue-automatic-handoff";
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: issueId,
+      identifier: "CORE-HANDOFF",
+      title: "Continue existing implementation",
+      description: "Finish the approved ticket plan.",
+      state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
+      team: { id: "team-core", key: "CORE" },
+      labels: { nodes: [] },
+      comments: { nodes: [] },
+      attachments: { nodes: [] },
+      project: null,
+    });
+    mockLinearApiInstance.listAgentSessions.mockResolvedValue([{
+      id: "session-prior",
+      createdAt: "2026-07-13T10:00:00.000Z",
+      status: "complete",
+      summary: "Implemented the API path; the UI and focused tests remain.",
+      plan: "Complete the UI in ld-shopify-admin.",
+      url: null,
+      pullRequests: [],
+      activities: [],
+    }]);
+    runAgentMock.mockResolvedValueOnce({
+      success: true,
+      output: JSON.stringify({
+        repos: ["ld-shopify-admin"],
+        brief: "Continue from the completed API work; implement the remaining UI and focused tests.",
+      }),
+    });
+    const pluginConfig = {
+      orchestrationMode: "stateplan",
+      repoSelectionMode: "always",
+      grillMode: "on",
+      repos: {
+        "transaction-monitor-2": { path: "/root/repos/transaction-monitor-2" },
+        "ld-shopify-admin": { path: "/root/repos/ld-shopify-admin" },
+      },
+    };
+
+    const result = await postDelegationSession(
+      { id: issueId, identifier: "CORE-HANDOFF", title: "Continue existing implementation" },
+      pluginConfig,
+      "session-current",
+    );
+
+    expect(result.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(runStatePlanMock).toHaveBeenCalledOnce();
+    expect(mockLinearApiInstance.listAgentSessions).toHaveBeenCalledWith(
+      issueId,
+      { activityLimit: 12 },
+    );
+    const [, dispatch] = registerDispatchMock.mock.calls[0];
+    expect(dispatch.containerRepos).toEqual(["ld-shopify-admin"]);
+    expect(dispatch.grillGuidance).toContain("implement the remaining UI and focused tests");
+    expect(
+      mockLinearApiInstance.emitActivity.mock.calls.some(([, activity]: any[]) =>
+        activity?.type === "elicitation" && /resume|fresh|which repository/i.test(activity.body),
+      ),
+    ).toBe(false);
   });
 
   it("clears stale interactive state and binds work to the new session", async () => {
@@ -2764,15 +2722,6 @@ describe("handleDispatch via a newly created delegation session", () => {
       attachments: { nodes: [] },
       project: null,
     });
-    saveResume({
-      issueId,
-      issueIdentifier: "CORE-1748",
-      agentSessionId: oldSessionId,
-      fullContext: "Existing Apex plan",
-      analyzedRepos: ["transaction-monitor-2"],
-      analyzedBrief: "Continue the existing implementation plan.",
-      createdAt: new Date().toISOString(),
-    });
     saveGrill({
       issueId,
       issueIdentifier: "CORE-1748",
@@ -2782,8 +2731,8 @@ describe("handleDispatch via a newly created delegation session", () => {
       repos: ["transaction-monitor-2"],
       createdAt: new Date().toISOString(),
     });
-    // Resume/grill gates hold the issue-level claim while awaiting input. A
-    // new delegation must supersede that parked claim and start in its session.
+    // An old grill can hold the issue-level claim while awaiting input. A new
+    // delegation must supersede that parked claim and start in its session.
     _addActiveRunForTesting(issueId);
 
     try {
@@ -2797,7 +2746,6 @@ describe("handleDispatch via a newly created delegation session", () => {
       await new Promise((resolve) => setTimeout(resolve, 500));
 
       expect(getGrill(issueId)).toBeUndefined();
-      expect(getResume(issueId)).toBeUndefined();
       expect(assessTierMock).toHaveBeenCalled();
       expect(runStatePlanMock).toHaveBeenCalledOnce();
       expect(
@@ -2808,8 +2756,6 @@ describe("handleDispatch via a newly created delegation session", () => {
       ).toBe(false);
       expect(mockLinearApiInstance.createComment).not.toHaveBeenCalled();
     } finally {
-      clearResume(issueId);
-      clearResumeHandled(issueId);
       clearGrill(issueId);
     }
   });

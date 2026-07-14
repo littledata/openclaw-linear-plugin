@@ -1,16 +1,13 @@
 /**
  * prior-work.ts — gather everything previous runs did on an issue.
  *
- * On a new dispatch, the resume gate needs to know whether prior work exists and
- * to show the user a recap before asking "resume or start fresh?". The richest
- * source is Linear itself: every prior Agent Session carries a plan/summary, PR
- * links, and a full activity feed. We combine those with the local `.claw`
- * artifacts (plan + per-attempt outputs) when a worktree is present.
+ * Every delegation starts a new Linear Agent Session. This module builds a
+ * bounded handoff from older sessions, issue steering, PRs, and local `.claw`
+ * artifacts so the new run can continue without inheriting raw transcripts.
  *
  * Two renderings are produced:
- *  - `summary`     — concise markdown for the elicitation shown to the user.
- *  - `fullContext` — a fuller transcript fed to the resume-analysis step, which
- *                    re-derives the correct repo(s) and a continuation brief.
+ *  - `summary`     — concise deterministic recap for diagnostics/tests.
+ *  - `fullContext` — bounded source material for semantic handoff synthesis.
  */
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
@@ -24,9 +21,9 @@ export interface PriorWork {
   sessionCount: number;
   /** Substantive prior comments found (plans/verdicts/user steering, noise excluded). */
   commentCount: number;
-  /** Concise markdown recap for the resume/fresh elicitation. */
+  /** Concise deterministic recap of earlier work. */
   summary: string;
-  /** Fuller transcript for the resume-analysis agent (plan + activities + artifacts). */
+  /** Bounded source material for handoff synthesis (plan + terminal activity + artifacts). */
   fullContext: string;
   /** Distinct PR URLs seen across prior sessions. */
   pullRequestUrls: string[];
@@ -40,11 +37,10 @@ export interface PriorComment {
 
 /**
  * Is a comment substantive prior work worth recapping — as opposed to the bot's
- * own gate prompts, system thread markers, and stop/error chatter? Keeps Apex
- * plans, review verdicts, and the user's steering; drops the noise the resume
- * gate itself (and prior runs) generate.
+ * own legacy gate prompts, system thread markers, and stop/error chatter? Keeps
+ * Apex plans, review verdicts, and the user's steering; drops lifecycle noise.
  * @param c - the comment to classify
- * @returns true when the comment is worth showing in a resume recap
+ * @returns true when the comment is worth including in a handoff
  */
 export function isSubstantiveComment(c: PriorComment): boolean {
   const b = (c.body ?? "").trim();
@@ -109,7 +105,7 @@ export async function gatherPriorWork(
   issueId: string,
   opts?: { excludeSessionId?: string; worktreePath?: string },
 ): Promise<PriorWork> {
-  const sessions = (await linearApi.listAgentSessions(issueId).catch(() => []))
+  const sessions = (await linearApi.listAgentSessions(issueId, { activityLimit: 12 }).catch(() => []))
     .filter((s) => s.id !== opts?.excludeSessionId);
 
   const prUrls = new Set<string>();
@@ -133,7 +129,7 @@ export async function gatherPriorWork(
 
   const hasPriorWork = sessions.length > 0 || comments.length > 0 || !!clawSummary;
 
-  // ---- Concise summary (elicitation) ----
+  // ---- Concise deterministic summary ----
   const summaryParts: string[] = [];
   sessions.slice(0, 4).forEach((s, i) => {
     const when = s.createdAt.slice(0, 16).replace("T", " ");
@@ -160,7 +156,7 @@ export async function gatherPriorWork(
   }
   if (prUrls.size) summaryParts.push(`\n**PRs:** ${[...prUrls].join(", ")}`);
 
-  // ---- Full context (resume-analysis agent) ----
+  // ---- Bounded source context for semantic handoff synthesis ----
   // Put durable issue comments FIRST and reserve space for both explicit plans
   // and the latest steering. The previous layout appended comments after up to
   // six large session feeds and then sliced the combined string, which could
@@ -176,7 +172,7 @@ export async function gatherPriorWork(
     const commentText = selected
       .map((c) => `[${c.author ?? "note"}] ${c.body.slice(0, 1200)}`)
       .join("\n\n")
-      .slice(0, 16_000);
+      .slice(0, 12_000);
     ctxParts.push(`## Issue comments (authoritative plans and steering)\n${commentText}`, "");
   }
 
@@ -186,15 +182,22 @@ export async function gatherPriorWork(
     if (s.plan) sessionParts.push(`Plan:\n${String(s.plan).slice(0, 1500)}`);
     if (s.summary) sessionParts.push(`Summary:\n${String(s.summary).slice(0, 1000)}`);
     if (s.pullRequests.length) sessionParts.push(`PRs: ${s.pullRequests.map((p) => p.url).join(", ")}`);
-    const feed = s.activities
+    // Linear's session summary is the preferred compact handoff. Only fall
+    // back to user/terminal activities when Linear has not produced one; tool
+    // calls and streaming thoughts are execution noise, not durable context.
+    const feed = s.summary ? "" : s.activities
+      .filter((a) => {
+        const type = (a.content as any)?.type;
+        return type === "prompt" || type === "response" || type === "elicitation" || type === "error";
+      })
       .map((a) => activityText(a.content))
       .filter(Boolean)
-      .slice(-12)
+      .slice(-8)
       .join("\n");
     if (feed) sessionParts.push(`Activity:\n${feed.slice(0, 1200)}`);
     sessionParts.push("");
   });
-  if (sessionParts.length) ctxParts.push(sessionParts.join("\n").slice(0, 8_000));
+  if (sessionParts.length) ctxParts.push(sessionParts.join("\n").slice(0, 7_000));
   if (clawSummary) ctxParts.push(`## Local worktree artifacts\n${clawSummary.slice(0, 3000)}`);
 
   return {
@@ -202,16 +205,16 @@ export async function gatherPriorWork(
     sessionCount: sessions.length,
     commentCount: comments.length,
     summary: summaryParts.join("\n\n") || "(no readable prior activity)",
-    fullContext: ctxParts.join("\n").slice(0, 27_000),
+    fullContext: ctxParts.join("\n").slice(0, 22_000),
     pullRequestUrls: [...prUrls],
   };
 }
 
 // ---------------------------------------------------------------------------
-// Resume analysis — re-derive the correct repo(s) + a continuation brief
+// Prior-context synthesis — re-derive repo(s) + a continuation brief
 // ---------------------------------------------------------------------------
 
-export interface ResumeAnalysis {
+export interface PriorContextAnalysis {
   /** Repo name(s) the work belongs in, RE-EVALUATED from the prior context. */
   repos: string[];
   /** Continuation brief: what's done, what remains, how to finish. */
@@ -229,15 +232,15 @@ export interface ResumeAnalysis {
  * @param agentId - the orchestrator agent id
  * @returns the re-derived repos + continuation brief (repos may be [] if unclear)
  */
-export async function analyzeResume(
+export async function synthesizePriorContext(
   api: OpenClawPluginApi,
   issue: { identifier: string; title: string; description?: string | null },
   repoNames: string[],
   fullContext: string,
   agentId?: string,
-): Promise<ResumeAnalysis> {
+): Promise<PriorContextAnalysis> {
   const message = [
-    "You are RESUMING prior work on a Linear issue. Read the prior context below",
+    "You are preparing a fresh work session for a Linear issue. Read the bounded prior context below",
     "(plans, prior sessions, PRs, and the user's steering comments).",
     "",
     "Two jobs:",
@@ -263,19 +266,19 @@ export async function analyzeResume(
     const { runAgent } = await import("../agent/agent.js");
     // This is a pure context-synthesis call. Keep it embedded and headless so
     // agent profile instructions cannot turn it into repository exploration or
-    // leak internal tool failures into the resume prompt.
+    // leak internal tool failures into the synthesized handoff.
     const silentLinearApi = {
       emitActivity: async () => undefined,
     } as unknown as LinearAgentApi;
     const result = await runAgent({
       api,
       agentId: agentId ?? resolveDefaultAgent(api),
-      sessionId: `resume-analyze-${issue.identifier}-${Date.now()}`,
+      sessionId: `prior-context-${issue.identifier}-${Date.now()}`,
       message,
       timeoutMs: 90_000,
       streaming: {
         linearApi: silentLinearApi,
-        agentSessionId: `resume-analyze-${issue.identifier}`,
+        agentSessionId: `prior-context-${issue.identifier}`,
       },
       readOnly: true,
       toolsDeny: [
@@ -296,7 +299,7 @@ export async function analyzeResume(
       extraSystemPrompt:
         "CONTEXT SYNTHESIS MODE: Do not call tools. Analyze only the supplied prompt and return exactly the requested JSON object.",
     });
-    const parsed = result.output ? parseResumeAnalysis(result.output, repoNames) : null;
+    const parsed = result.output ? parsePriorContextAnalysis(result.output, repoNames) : null;
     if (parsed) {
       // If the model didn't commit to a repo, don't leave it undecided (which
       // silently defaults to codexBaseRepo): rescue from an explicit mention in
@@ -304,26 +307,26 @@ export async function analyzeResume(
       if (!parsed.repos.length) {
         const mentioned = detectMentionedRepos(fullContext, repoNames);
         if (mentioned.length === 1) {
-          api.logger.info(`resume analysis for ${issue.identifier}: repo from text mention → ${mentioned[0]}`);
+          api.logger.info(`prior-context synthesis for ${issue.identifier}: repo from text mention → ${mentioned[0]}`);
           return { repos: mentioned, brief: parsed.brief };
         }
       }
       return parsed;
     }
-    api.logger.warn(`resume analysis for ${issue.identifier}: unparseable — continuing with no repo override`);
+    api.logger.warn(`prior-context synthesis for ${issue.identifier}: unparseable — continuing with no repo override`);
   } catch (err) {
-    api.logger.warn(`resume analysis error for ${issue.identifier}: ${err}`);
+    api.logger.warn(`prior-context synthesis error for ${issue.identifier}: ${err}`);
   }
   return { repos: [], brief: "" };
 }
 
 /**
- * Parse the resume-analysis JSON from possibly-fenced agent output.
+ * Parse prior-context synthesis JSON from possibly-fenced agent output.
  * @param raw - the agent's raw output
  * @param repoNames - valid repo names (unknown names are dropped)
  * @returns the analysis, or null if unparseable
  */
-export function parseResumeAnalysis(raw: string, repoNames: string[]): ResumeAnalysis | null {
+export function parsePriorContextAnalysis(raw: string, repoNames: string[]): PriorContextAnalysis | null {
   const match = raw.match(/\{[\s\S]*\}/);
   if (!match) return null;
   try {
@@ -334,7 +337,7 @@ export function parseResumeAnalysis(raw: string, repoNames: string[]): ResumeAna
           .filter((r: unknown) => typeof r === "string" && valid.has(r.toLowerCase()))
           .map((r: string) => repoNames.find((n) => n.toLowerCase() === r.toLowerCase()) as string)
       : [];
-    const brief = typeof o.brief === "string" ? o.brief : "";
+    const brief = typeof o.brief === "string" ? o.brief.slice(0, 6_000) : "";
     if (!repos.length && !brief) return null;
     return { repos, brief };
   } catch {

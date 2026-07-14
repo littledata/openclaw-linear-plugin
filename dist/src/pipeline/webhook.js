@@ -8,17 +8,17 @@ import { createManagedFlowForDispatch } from "./taskflow-bridge.js";
 import { createNotifierFromConfig } from "../infra/notify.js";
 import { assessTier } from "./tier-assess.js";
 import { recommendRepos } from "./recommend-repos.js";
-import { startOrReuseContainer, buildContainerSpec, destroyContainer, stopContainerRun, containerNameForIssue, checkoutPullRequestInContainer } from "../infra/container-runner.js";
-import { setContainerRecord, getContainerRecord, removeContainerRecord } from "../infra/container-registry.js";
+import { startOrReuseContainer, buildContainerSpec, stopContainerRun, containerNameForIssue, checkoutPullRequestInContainer } from "../infra/container-runner.js";
+import { setContainerRecord, getContainerRecord } from "../infra/container-registry.js";
 import { resolveRepos, getRepoEntries, resolveReposByNames, buildCandidateRepositories, detectMentionedRepos } from "../infra/multi-repo.js";
-import { repoSelectSignal, optionsSignal, RESUME_SELECT } from "./select-signal.js";
+import { repoSelectSignal, optionsSignal } from "./select-signal.js";
 import { savePendingRepoSelection, getPendingRepoSelection, clearPendingRepoSelection, parseRepoSelection, } from "./repo-selection-state.js";
 import { getGrill, saveGrill, clearGrill } from "./grill-state.js";
 import { runStatePlan } from "./orchestrator.js";
 import { resolveStatePlan, orchestrationMode, isReviewOnlyPlan } from "./state-plan.js";
-import { gatherPriorWork, analyzeResume } from "./prior-work.js";
+import { gatherPriorWork, synthesizePriorContext } from "./prior-work.js";
 import { collectReviewPullRequests, resolveReviewTargets } from "./review-context.js";
-import { getResume, saveResume, clearResume, parseResumeDecision, markResumeHandled, wasResumeHandledRecently, clearResumeHandled } from "./resume-state.js";
+import { clearLegacyResumeState } from "./legacy-resume-state.js";
 import { runGrillStep } from "./grill.js";
 import { ensureClawDir, writeManifest, writeDispatchMemory, resolveOrchestratorWorkspace } from "./artifacts.js";
 import { readPlanningState, isInPlanningMode, getPlanningSession, endPlanningSession } from "./planning-state.js";
@@ -445,14 +445,12 @@ export async function handleLinearWebhook(api, req, res) {
             typeof webhookAppUserId === "string" &&
             enrichedIssue?.delegate?.id === webhookAppUserId;
         if (isDelegationSession) {
-            // A prior resume/grill gate deliberately holds activeRuns while waiting.
-            // A fresh delegation supersedes that parked interaction, but does not
-            // cancel a real in-flight implementation run.
-            const supersedesParkedInteraction = Boolean(getResume(issue.id) || getGrill(issue.id));
+            // A fresh delegation owns a fresh Linear session. Clear any interaction
+            // parked by an older session, but do not cancel a real implementation.
+            const supersedesParkedInteraction = Boolean(getGrill(issue.id));
             clearPendingRepoSelection(issue.id);
             clearGrill(issue.id);
-            clearResume(issue.id);
-            clearResumeHandled(issue.id);
+            clearLegacyResumeState(issue.id);
             if (supersedesParkedInteraction)
                 activeRuns.delete(issue.id);
             linearSessionByIssue.delete(issue.id);
@@ -677,8 +675,7 @@ export async function handleLinearWebhook(api, req, res) {
             catch { /* best effort */ }
             clearPendingRepoSelection(issue.id);
             clearGrill(issue.id);
-            clearResume(issue.id);
-            clearResumeHandled(issue.id); // next engagement should re-ask resume/fresh
+            clearLegacyResumeState(issue.id);
             const stopApi = createLinearApi(api);
             if (stopApi) {
                 await stopApi.emitActivity(session.id, {
@@ -706,103 +703,31 @@ export async function handleLinearWebhook(api, req, res) {
         }
         // ── /grill-me: the user answered an interview question ──
         // Runs BEFORE the activeRuns "ignore feedback" gate because the interview
-        // intentionally holds activeRuns. Record the answer and resume the dispatch.
-        const resumePending = getResume(issue.id);
+        // intentionally holds activeRuns. Record the answer and continue the dispatch.
         const grillPending = getGrill(issue.id);
-        if (!resumePending &&
-            grillPending?.agentSessionId &&
+        if (grillPending?.agentSessionId &&
             grillPending.agentSessionId !== session.id) {
             api.logger.info(`AgentSession prompted: ${session.id} is stale; grill belongs to ${grillPending.agentSessionId} — ignoring`);
             return true;
         }
-        if (grillPending?.pendingQuestion && !resumePending) {
+        if (grillPending?.pendingQuestion) {
             const answer = typeof activityBody === "string" ? activityBody.trim() : "";
             if (answer) {
                 grillPending.qa.push({ question: grillPending.pendingQuestion, answer });
                 grillPending.pendingQuestion = undefined;
                 saveGrill(grillPending);
-                activeRuns.delete(issue.id); // release the interview claim so the resume re-claims
+                activeRuns.delete(issue.id); // release the interview claim so continuation can re-claim
                 const grillApi = createLinearApi(api);
                 if (grillApi) {
                     api.logger.info(`AgentSession prompted: ${issue.identifier ?? issue.id} — grill answer #${grillPending.qa.length} recorded, resuming`);
                     void handleDispatch(api, grillApi, issue, {
                         existingSessionId: grillPending.agentSessionId ?? session.id,
-                        resumeResolved: true,
+                        contextHydrated: true,
                         // Carry the settled repo(s) so the repo-selection gate isn't re-asked
                         // between interview questions.
                         repoOverride: grillPending.repos?.length ? grillPending.repos : undefined,
-                    }).catch((err) => api.logger.error(`grill resume failed: ${err}`));
+                    }).catch((err) => api.logger.error(`grill continuation failed: ${err}`));
                 }
-                return true;
-            }
-        }
-        // ── Resume-or-fresh: the user answered the resume gate ──
-        // Runs BEFORE the activeRuns "ignore feedback" gate — the gate holds
-        // activeRuns while parked, same as /grill-me.
-        if (resumePending) {
-            if (resumePending.agentSessionId &&
-                resumePending.agentSessionId !== session.id) {
-                api.logger.info(`AgentSession prompted: ${session.id} is stale; resume gate belongs to ${resumePending.agentSessionId} — ignoring`);
-                return true;
-            }
-            const reply = typeof activityBody === "string" ? activityBody.trim() : "";
-            if (reply) {
-                const decision = parseResumeDecision(reply);
-                const rApi = createLinearApi(api);
-                if (!decision) {
-                    if (rApi)
-                        await rApi.emitActivity(session.id, { type: "elicitation", body: 'Reply **resume** to continue the prior work, or **fresh** to start over.' }, RESUME_SELECT).catch(() => { });
-                    return true;
-                }
-                clearResume(issue.id);
-                // A pending resume decision is authoritative. Remove any grill state
-                // accidentally created by an older re-delegation before continuing.
-                clearGrill(issue.id);
-                markResumeHandled(issue.id); // suppress the gate for re-triggers this engagement
-                activeRuns.delete(issue.id); // release the gate claim so the resume re-claims
-                if (!rApi)
-                    return true;
-                if (decision === "fresh") {
-                    api.logger.info(`AgentSession prompted: ${issue.identifier ?? issue.id} resume-gate → FRESH`);
-                    await rApi.emitActivity(session.id, { type: "thought", body: "Starting fresh — discarding the prior container and re-planning." }).catch(() => { });
-                    try {
-                        // Fresh = throw away the warm container; the re-dispatch recreates it.
-                        destroyContainer(containerNameForIssue(issue.identifier ?? issue.id));
-                        removeContainerRecord(issue.identifier ?? issue.id);
-                    }
-                    catch (err) {
-                        api.logger.warn(`resume-fresh container destroy failed: ${err}`);
-                    }
-                    void handleDispatch(api, rApi, issue, {
-                        existingSessionId: resumePending.agentSessionId ?? session.id,
-                        resumeResolved: true,
-                    }).catch((err) => api.logger.error(`resume-fresh dispatch failed: ${err}`));
-                    return true;
-                }
-                // decision === "resume": re-derive the correct repo(s) + a continuation
-                // brief from the prior context, then dispatch straight into the pipeline.
-                api.logger.info(`AgentSession prompted: ${issue.identifier ?? issue.id} resume-gate → RESUME`);
-                await rApi.emitActivity(session.id, { type: "thought", body: "Resuming — reviewing prior work to confirm the right repo and continue the plan." }).catch(() => { });
-                const repoNames = Object.keys(getRepoEntries(pluginConfig));
-                // The semantic analysis normally runs BEFORE the elicitation so the user
-                // sees the model's actual understanding and the chosen repos are already
-                // settled. Re-analyse only for parked state written by an older version.
-                const analysis = resumePending.analyzedBrief || resumePending.analyzedRepos?.length
-                    ? {
-                        repos: resumePending.analyzedRepos ?? [],
-                        brief: resumePending.analyzedBrief ?? "",
-                    }
-                    : await analyzeResume(api, { identifier: issue.identifier ?? issue.id, title: issue.title ?? issue.identifier ?? issue.id, description: issue.description }, repoNames, resumePending.fullContext, resolveAgentId(api));
-                if (analysis.repos.length) {
-                    await rApi.emitActivity(session.id, { type: "thought", body: `Resuming in: ${analysis.repos.join(", ")}` }).catch(() => { });
-                }
-                void handleDispatch(api, rApi, issue, {
-                    existingSessionId: resumePending.agentSessionId ?? session.id,
-                    resumeResolved: true,
-                    grillDone: true, // skip grill — we have the repo + continuation brief
-                    repoOverride: analysis.repos.length ? analysis.repos : undefined,
-                    grillGuidance: analysis.brief || undefined,
-                }).catch((err) => api.logger.error(`resume dispatch failed: ${err}`));
                 return true;
             }
         }
@@ -855,7 +780,7 @@ export async function handleLinearWebhook(api, req, res) {
             api.logger.error("No Linear access token configured");
             return true;
         }
-        // ── Interactive repo selection: resume a parked dispatch on the user's reply ──
+        // ── Interactive repo selection: continue a parked dispatch on the user's reply ──
         const pendingRepoSel = getPendingRepoSelection(issue.id);
         if (pendingRepoSel) {
             // Numbers map to the displayed shortlist; names may be ANY configured repo
@@ -877,8 +802,10 @@ export async function handleLinearWebhook(api, req, res) {
             void handleDispatch(api, linearApi, issue, {
                 repoOverride: selected,
                 existingSessionId: pendingRepoSel.agentSessionId ?? session.id,
-                resumeResolved: true, // resume stage already passed earlier in this chain
-            }).catch((err) => api.logger.error(`repo-selection resume failed: ${err}`));
+                contextHydrated: true,
+                grillDone: pendingRepoSel.skipGrill,
+                grillGuidance: pendingRepoSel.guidance,
+            }).catch((err) => api.logger.error(`repo-selection continuation failed: ${err}`));
             return true;
         }
         // Validate agent profiles before doing any work
@@ -2108,6 +2035,7 @@ async function handleDispatch(api, linearApi, issue, opts) {
     // Repo/guidance the grill interview (or an explicit override) may supply.
     let repoOverride = opts?.repoOverride;
     let grillGuidance = opts?.grillGuidance;
+    let grillDone = opts?.grillDone;
     if (reviewOnly) {
         const priorSessions = await linearApi.listAgentSessions(issue.id).catch(() => []);
         const recentComments = await linearApi.getRecentComments(issue.id, 60).catch(() => []);
@@ -2146,98 +2074,38 @@ async function handleDispatch(api, linearApi, issue, opts) {
         repoOverride = [...new Set(reviewTargets.map((target) => target.repoName))];
         api.logger.info(`@dispatch: ${identifier} review-only state — ${reviewTargets.length} linked PR(s), repos=${repoOverride.join(",")}`);
     }
-    // ── Resume-or-fresh gate ──────────────────────────────────────────────
-    // If this issue already has prior agent work (previous sessions/comments),
-    // recap it and ask the user to RESUME (continue the prior plan) or start
-    // FRESH — BEFORE grilling or building a worktree. Runs only in stateplan mode
-    // and only once per dispatch chain (opts.resumeResolved guards re-entry).
-    //
-    // A parked decision always wins over every later preflight. Previously a
-    // re-delegation saw getResume(issue.id), skipped the gate condition below,
-    // marked resume as handled, and fell into repo selection or /grill-me. Re-show
-    // the existing decision instead so a delegated issue cannot silently park on
-    // an unrelated question.
-    const pendingResume = getResume(issue.id);
-    if (orchestrationMode(pluginConfig) === "stateplan" &&
-        !reviewOnly &&
-        !opts?.resumeResolved &&
-        !opts?.grillDone &&
-        pendingResume) {
-        clearGrill(issue.id);
-        let rsid = opts?.existingSessionId ?? pendingResume.agentSessionId ?? linearSessionByIssue.get(issue.id);
-        if (!rsid) {
-            try {
-                const created = await linearApi.createSessionOnIssue(issue.id);
-                rsid = created.sessionId ?? undefined;
-            }
-            catch { /* best effort */ }
-        }
-        if (rsid !== pendingResume.agentSessionId) {
-            saveResume({ ...pendingResume, agentSessionId: rsid });
-        }
-        const understanding = pendingResume.analyzedBrief?.trim()
-            ? `\n\n**My understanding of where it stands:**\n\n${pendingResume.analyzedBrief.trim()}`
-            : "";
-        const ask = `I found prior work waiting on **${identifier}**.${understanding}\n\nReply **resume** to continue from that plan, or **fresh** to start over.`;
-        if (rsid) {
-            await linearApi.emitActivity(rsid, { type: "elicitation", body: ask }, RESUME_SELECT).catch(() => { });
-        }
-        api.logger.info(`@dispatch: ${identifier} resume-gate — existing decision still pending; re-surfaced resume/fresh prompt (activeRuns held)`);
-        return;
-    }
-    if (orchestrationMode(pluginConfig) === "stateplan" &&
-        !reviewOnly &&
-        !opts?.resumeResolved &&
-        !opts?.grillDone &&
-        !getResume(issue.id) &&
-        !wasResumeHandledRecently(issue.id)) {
+    // ── Automatic prior-context handoff ─────────────────────────────────────
+    // Every delegation gets a new Linear Agent Session. Older sessions are
+    // context only: synthesize bounded summaries, plans, terminal events, ticket
+    // comments, and local artifacts into guidance for the new run. There is no
+    // resume/fresh gate and no issue-level status comment.
+    if (!reviewOnly && !opts?.contextHydrated) {
+        // Drop state written by releases that still parked on resume/fresh.
+        clearLegacyResumeState(issue.id);
         const excludeSessionId = opts?.existingSessionId ?? linearSessionByIssue.get(issue.id);
         const prior = await gatherPriorWork(linearApi, issue.id, { excludeSessionId });
         if (prior.hasPriorWork) {
-            let rsid = excludeSessionId;
-            if (!rsid) {
-                try {
-                    const sr = await linearApi.createSessionOnIssue(issue.id);
-                    rsid = sr.sessionId ?? undefined;
-                }
-                catch { /* best effort */ }
-            }
             const repoNames = Object.keys(getRepoEntries(pluginConfig));
-            const analysis = await analyzeResume(api, {
+            const analysis = await synthesizePriorContext(api, {
                 identifier,
                 title: enrichedIssue.title ?? identifier,
                 description: enrichedIssue.description,
             }, repoNames, prior.fullContext, resolveAgentId(api));
-            const counts = [
-                prior.sessionCount ? `${prior.sessionCount} prior session(s)` : "",
-                prior.commentCount ? `${prior.commentCount} planning/steering note(s)` : "",
-            ].filter(Boolean).join(", ");
-            const understanding = analysis.brief.trim();
-            const understandingBlock = understanding
-                ? `\n\n**My understanding of where it stands:**\n\n${understanding}`
-                : "\n\nI found relevant work in earlier sessions and will use it as context when continuing.";
-            const ask = `I found prior work on **${identifier}**${counts ? ` (${counts})` : ""}.${understandingBlock}\n\nReply **resume** to continue from that plan, or **fresh** to start over.`;
-            if (rsid) {
-                await linearApi.emitActivity(rsid, { type: "elicitation", body: ask }, RESUME_SELECT).catch(() => { });
+            if (!repoOverride?.length && analysis.repos.length)
+                repoOverride = analysis.repos;
+            if (analysis.brief.trim()) {
+                grillGuidance = [analysis.brief.trim(), grillGuidance?.trim()]
+                    .filter(Boolean)
+                    .join("\n\n");
             }
-            saveResume({
-                issueId: issue.id,
-                issueIdentifier: identifier,
-                agentSessionId: rsid,
-                fullContext: prior.fullContext,
-                analyzedRepos: analysis.repos,
-                analyzedBrief: analysis.brief,
-                createdAt: new Date().toISOString(),
-            });
-            api.logger.info(`@dispatch: ${identifier} resume-gate — ${prior.sessionCount} prior session(s), awaiting resume/fresh reply (activeRuns held)`);
-            return; // activeRuns left set on purpose — released by the prompted resume
+            // Existing planning and steering replace the startup interview. The
+            // implementer receives the handoff directly and continues immediately.
+            grillDone = true;
+            api.logger.info(`@dispatch: ${identifier} hydrated context from ${prior.sessionCount} prior session(s) ` +
+                `and ${prior.commentCount} steering note(s); repos=[${analysis.repos.join(",")}], ` +
+                `brief=${analysis.brief ? "yes" : "no"}`);
         }
     }
-    // Past the resume stage for this engagement — mark it so re-entries (grill /
-    // repo-selection replies, or a stray Issue.update re-delegation) don't re-ask.
-    // Idempotent + sliding: refreshed on each re-entry while work is active.
-    if (orchestrationMode(pluginConfig) === "stateplan" && !reviewOnly)
-        markResumeHandled(issue.id);
     // NOTE: the /grill-me interview gate runs AFTER repo resolution (below), so the
     // repo is settled first and grilling never re-asks which repo.
     // Resolve repos for this dispatch (explicit override → body markers → labels → team mapping → config default)
@@ -2356,6 +2224,8 @@ async function handleDispatch(api, linearApi, issue, opts) {
                 issueIdentifier: identifier,
                 candidates,
                 agentSessionId: selectionSessionId,
+                guidance: grillGuidance,
+                skipGrill: grillDone,
                 createdAt: new Date().toISOString(),
             });
             api.logger.info(`@dispatch: ${identifier} awaiting repo selection (${candidates.length} candidates)`);
@@ -2366,11 +2236,11 @@ async function handleDispatch(api, linearApi, issue, opts) {
     // ── /grill-me interview gate ──────────────────────────────────────────
     // Runs AFTER repo resolution so the repo is already settled — the grill only
     // clarifies requirements and NEVER re-asks which repo. The chosen repo(s) are
-    // persisted in grill state and carried on each resume so the repo-selection gate
+    // persisted in grill state and carried on each continuation so the repo-selection gate
     // above doesn't re-trigger mid-interview. activeRuns stays claimed while parked so
     // the created-handler still skips its conversational run (single session); the
-    // `prompted` handler records each answer and resumes this dispatch.
-    if (!reviewOnly && (pluginConfig?.grillMode ?? "off") === "on" && !opts?.grillDone) {
+    // `prompted` handler records each answer and continues this dispatch.
+    if (!reviewOnly && (pluginConfig?.grillMode ?? "off") === "on" && !grillDone) {
         const chosenRepos = repoResolution.repos.map((r) => r.name);
         const grill = getGrill(issue.id);
         const step = await runGrillStep(api, { identifier, title: enrichedIssue.title ?? identifier, description: enrichedIssue.description }, chosenRepos, grill?.qa ?? [], resolveAgentId(api));
@@ -2396,7 +2266,7 @@ async function handleDispatch(api, linearApi, issue, opts) {
                 createdAt: grill?.createdAt ?? new Date().toISOString(),
             });
             api.logger.info(`@dispatch: ${identifier} grill-me — asked question ${(grill?.qa.length ?? 0) + 1}, awaiting reply (activeRuns held)`);
-            return; // NOTE: activeRuns left set on purpose — released by the prompted resume
+            return; // NOTE: activeRuns left set on purpose — released by the prompted continuation
         }
         // Interview complete → carry the implementation brief into the worker.
         clearGrill(issue.id);
