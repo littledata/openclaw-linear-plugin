@@ -221,12 +221,39 @@ export async function analyzeResume(api, issue, repoNames, fullContext, agentId)
     ].filter(Boolean).join("\n");
     try {
         const { runAgent } = await import("../agent/agent.js");
+        // This is a pure context-synthesis call. Keep it embedded and headless so
+        // agent profile instructions cannot turn it into repository exploration or
+        // leak internal tool failures into the resume prompt.
+        const silentLinearApi = {
+            emitActivity: async () => undefined,
+        };
         const result = await runAgent({
             api,
             agentId: agentId ?? resolveDefaultAgent(api),
             sessionId: `resume-analyze-${issue.identifier}-${Date.now()}`,
             message,
             timeoutMs: 90_000,
+            streaming: {
+                linearApi: silentLinearApi,
+                agentSessionId: `resume-analyze-${issue.identifier}`,
+            },
+            readOnly: true,
+            toolsDeny: [
+                "group:fs",
+                "group:web",
+                "group:memory",
+                "sessions_list",
+                "sessions_history",
+                "linear_issues",
+                "cli_codex",
+                "cli_claude",
+                "cli_gemini",
+                "container_exec",
+                "container_read_file",
+                "container_list_files",
+                "container_git_diff",
+            ],
+            extraSystemPrompt: "CONTEXT SYNTHESIS MODE: Do not call tools. Analyze only the supplied prompt and return exactly the requested JSON object.",
         });
         const parsed = result.output ? parseResumeAnalysis(result.output, repoNames) : null;
         if (parsed) {

@@ -2212,8 +2212,11 @@ async function handleDispatch(api, linearApi, issue, opts) {
                 prior.sessionCount ? `${prior.sessionCount} prior session(s)` : "",
                 prior.commentCount ? `${prior.commentCount} planning/steering note(s)` : "",
             ].filter(Boolean).join(", ");
-            const understanding = analysis.brief || prior.summary;
-            const ask = `I found prior work on **${identifier}**${counts ? ` (${counts})` : ""}.\n\n**My understanding of where it stands:**\n\n${understanding}\n\nReply **resume** to continue from that plan, or **fresh** to start over.`;
+            const understanding = analysis.brief.trim();
+            const understandingBlock = understanding
+                ? `\n\n**My understanding of where it stands:**\n\n${understanding}`
+                : "\n\nI found relevant work in earlier sessions and will use it as context when continuing.";
+            const ask = `I found prior work on **${identifier}**${counts ? ` (${counts})` : ""}.${understandingBlock}\n\nReply **resume** to continue from that plan, or **fresh** to start over.`;
             if (rsid) {
                 await linearApi.emitActivity(rsid, { type: "elicitation", body: ask }, RESUME_SELECT).catch(() => { });
             }

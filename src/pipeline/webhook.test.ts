@@ -2676,6 +2676,67 @@ describe("handleDispatch via a newly created delegation session", () => {
     expect(mockLinearApiInstance.getViewerId).not.toHaveBeenCalled();
   });
 
+  it("keeps raw prior-session transcripts out of the resume prompt when synthesis fails", async () => {
+    const issueId = "issue-resume-synthesis-fallback";
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: issueId,
+      identifier: "CORE-SYNTH",
+      title: "Resume synthesis",
+      description: "Continue the prior implementation.",
+      state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
+      team: { id: "team-core", key: "CORE" },
+      labels: { nodes: [] },
+      comments: { nodes: [] },
+      attachments: { nodes: [] },
+      project: null,
+    });
+    mockLinearApiInstance.listAgentSessions.mockResolvedValue([{
+      id: "session-raw-history",
+      createdAt: "2026-07-13T10:00:00.000Z",
+      status: "complete",
+      summary: null,
+      plan: "RAW PLAN THAT MUST NOT BE SHOWN",
+      url: null,
+      pullRequests: [],
+      activities: [{
+        createdAt: "2026-07-13T10:01:00.000Z",
+        signal: null,
+        content: { type: "response", body: "RAW SESSION TAIL THAT MUST NOT BE SHOWN" },
+      }],
+    }]);
+    runAgentMock.mockResolvedValueOnce({ success: false, output: "tool failure without JSON" });
+
+    try {
+      const result = await postDelegationSession(
+        { id: issueId, identifier: "CORE-SYNTH", title: "Resume synthesis" },
+        { orchestrationMode: "stateplan", grillMode: "off" },
+        "session-resume-synthesis",
+      );
+
+      expect(result.status).toBe(200);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const analysisCall = runAgentMock.mock.calls.find(
+        ([args]: any[]) => args.sessionId.startsWith("resume-analyze-CORE-SYNTH-"),
+      )?.[0];
+      expect(analysisCall).toEqual(expect.objectContaining({
+        readOnly: true,
+        streaming: expect.objectContaining({ agentSessionId: "resume-analyze-CORE-SYNTH" }),
+        toolsDeny: expect.arrayContaining(["group:fs", "group:web", "linear_issues"]),
+      }));
+      const elicitation = mockLinearApiInstance.emitActivity.mock.calls.find(
+        ([sessionId, activity]: any[]) =>
+          sessionId === "session-resume-synthesis" && activity?.type === "elicitation",
+      )?.[1]?.body as string;
+      expect(elicitation).toContain("I found relevant work in earlier sessions");
+      expect(elicitation).not.toContain("RAW PLAN THAT MUST NOT BE SHOWN");
+      expect(elicitation).not.toContain("RAW SESSION TAIL THAT MUST NOT BE SHOWN");
+    } finally {
+      clearResume(issueId);
+      clearResumeHandled(issueId);
+    }
+  });
+
   it("clears stale interactive state and binds work to the new session", async () => {
     const issueId = "issue-pending-resume";
     const oldSessionId = "session-pending-resume";
