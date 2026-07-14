@@ -39,18 +39,25 @@ function openBrowser(url: string): void {
   exec(`${cmd} ${JSON.stringify(url)}`, () => {});
 }
 
-function saveLinearPluginConfig(
+/** Persist plugin configuration through OpenClaw's active-profile mutation API. */
+export async function saveLinearPluginConfig(
   api: OpenClawPluginApi,
   pluginConfig: Record<string, unknown>,
-): void {
-  const runtimeConfig = api.runtime.config.loadConfig() as Record<string, any>;
-  const pluginEntries = runtimeConfig.plugins?.entries ?? {};
-  pluginEntries["openclaw-linear"] = {
-    ...pluginEntries["openclaw-linear"],
-    config: pluginConfig,
-  };
-  runtimeConfig.plugins = { ...runtimeConfig.plugins, entries: pluginEntries };
-  api.runtime.config.writeConfigFile(runtimeConfig);
+): Promise<void> {
+  await api.runtime.config.mutateConfigFile({
+    base: "source",
+    afterWrite: { mode: "auto" },
+    mutate: (draft) => {
+      const mutable = draft as Record<string, any>;
+      const plugins = mutable.plugins ?? {};
+      const entries = plugins.entries ?? {};
+      entries["openclaw-linear"] = {
+        ...entries["openclaw-linear"],
+        config: pluginConfig,
+      };
+      mutable.plugins = { ...plugins, entries };
+    },
+  });
 }
 
 async function promptGitHubAppRole(
@@ -477,7 +484,7 @@ export function registerCli(program: Command, api: OpenClawPluginApi): void {
                 ...candidate,
                 ...(owners.length === 1 ? { githubOwner: owners[0] } : {}),
               };
-              saveLinearPluginConfig(api, pluginConfig);
+              await saveLinearPluginConfig(api, pluginConfig);
               console.log(`  ✓ Coding App: ${verified.coding.length} repositories`);
               console.log(`  ✓ Reviewer App: ${verified.reviewer.length} repositories`);
               console.log("  ✓ Remote-first GitHub repository mode enabled");
@@ -493,7 +500,7 @@ export function registerCli(program: Command, api: OpenClawPluginApi): void {
           console.log(`  ✓ Reviewer App: ${verified.reviewer.length} repositories`);
           if (pluginConfig.repositorySource !== "github-app") {
             pluginConfig = { ...pluginConfig, repositorySource: "github-app" };
-            saveLinearPluginConfig(api, pluginConfig);
+            await saveLinearPluginConfig(api, pluginConfig);
             console.log("  ✓ Migrated repository source from host mirrors to GitHub Apps");
           }
         } catch (err) {
@@ -618,7 +625,7 @@ export function registerCli(program: Command, api: OpenClawPluginApi): void {
           repositorySource: "github-app",
           ...(owners.length === 1 ? { githubOwner: owners[0] } : {}),
         };
-        saveLinearPluginConfig(api, migrated);
+        await saveLinearPluginConfig(api, migrated);
         console.log(`  ✓ Coding catalog: ${verified.coding.length} repositories`);
         console.log(`  ✓ Reviewer catalog: ${verified.reviewer.length} repositories`);
         console.log("  ✓ repositorySource set to github-app");
