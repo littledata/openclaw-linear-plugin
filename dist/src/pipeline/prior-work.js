@@ -30,6 +30,7 @@ export function isSubstantiveComment(c) {
     const noise = [
         /^This thread is for an agent session/i, // Linear system marker (author null)
         /^Please reply with an option/i, // our own select-signal mirror comment
+        /^\*\*Input needed to continue\*\*/i, // issue-level link to a pending Agent Session prompt
         /^Which repo(sitory)? should/i, // grill repo question (recommendation, not a decision)
         /^🛑\s*Stop received/i, // stop acknowledgements
         /Something went wrong while processing/i, // transient failure notices

@@ -86,6 +86,7 @@ describe("isSubstantiveComment", () => {
   it("drops the bot's own gate prompts, system markers, and stop/error noise", () => {
     expect(isSubstantiveComment(c("This thread is for an agent session with vasile.", null))).toBe(false);
     expect(isSubstantiveComment(c("Please reply with an option:\n- Resume — continue prior work (resume)\n- Start fresh (fresh)", "Vasile"))).toBe(false);
+    expect(isSubstantiveComment(c("**Input needed to continue**\n\nOpen the Vasile agent session.", "Vasile"))).toBe(false);
     expect(isSubstantiveComment(c("Which repo should CORE-1740 be implemented in? Recommended: shopify-tracker", "Vasile"))).toBe(false);
     expect(isSubstantiveComment(c("🛑 Stop received for CORE-1740 — no active work was running; cleared any pending dispatch state.", "Vasile"))).toBe(false);
     expect(isSubstantiveComment(c("**[main]** Something went wrong while processing this. The system will retry automatically if possible.", "Vasile"))).toBe(false);

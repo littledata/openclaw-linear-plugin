@@ -247,6 +247,35 @@ async function postAgentComment(api, linearApi, issueId, body, label, agentOpts)
         await createCommentWithDedup(linearApi, issueId, `**[${label}]** ${body}`);
     }
 }
+/**
+ * Emit an input request in the Agent Session and mirror a durable, clickable
+ * notice onto the issue. Linear can reuse an older awaiting-input session when
+ * an issue is delegated again; without the issue notice the new prompt is easy
+ * to miss because it lands in that existing session rather than a new panel.
+ */
+async function emitVisibleElicitation(api, linearApi, issueId, sessionId, body, signal) {
+    let emitted = false;
+    if (sessionId) {
+        try {
+            await linearApi.emitActivity(sessionId, { type: "elicitation", body }, signal);
+            emitted = true;
+        }
+        catch (err) {
+            api.logger.warn(`Could not emit Agent Session elicitation ${sessionId}: ${err}`);
+        }
+    }
+    let sessionUrl = null;
+    if (emitted && sessionId) {
+        const sessions = await linearApi.listAgentSessions(issueId, { activityLimit: 1 }).catch(() => []);
+        sessionUrl = sessions.find((session) => session.id === sessionId)?.url ?? null;
+    }
+    const notice = sessionUrl
+        ? `**Input needed to continue**\n\n[Open the Vasile agent session and answer the pending question](${sessionUrl}).`
+        : `**Input needed to continue**\n\n${body}`;
+    await createCommentWithDedup(linearApi, issueId, notice).catch((err) => {
+        api.logger.warn(`Could not mirror Agent Session elicitation onto issue ${issueId}: ${err}`);
+    });
+}
 function resolveAgentId(api) {
     const fromConfig = api.pluginConfig?.defaultAgentId;
     if (typeof fromConfig === "string" && fromConfig)
@@ -685,8 +714,9 @@ export async function handleLinearWebhook(api, req, res) {
         // ── /grill-me: the user answered an interview question ──
         // Runs BEFORE the activeRuns "ignore feedback" gate because the interview
         // intentionally holds activeRuns. Record the answer and resume the dispatch.
+        const resumePending = getResume(issue.id);
         const grillPending = getGrill(issue.id);
-        if (grillPending?.pendingQuestion) {
+        if (grillPending?.pendingQuestion && !resumePending) {
             const answer = typeof activityBody === "string" ? activityBody.trim() : "";
             if (answer) {
                 grillPending.qa.push({ question: grillPending.pendingQuestion, answer });
@@ -710,7 +740,6 @@ export async function handleLinearWebhook(api, req, res) {
         // ── Resume-or-fresh: the user answered the resume gate ──
         // Runs BEFORE the activeRuns "ignore feedback" gate — the gate holds
         // activeRuns while parked, same as /grill-me.
-        const resumePending = getResume(issue.id);
         if (resumePending) {
             const reply = typeof activityBody === "string" ? activityBody.trim() : "";
             if (reply) {
@@ -722,6 +751,9 @@ export async function handleLinearWebhook(api, req, res) {
                     return true;
                 }
                 clearResume(issue.id);
+                // A pending resume decision is authoritative. Remove any grill state
+                // accidentally created by an older re-delegation before continuing.
+                clearGrill(issue.id);
                 markResumeHandled(issue.id); // suppress the gate for re-triggers this engagement
                 activeRuns.delete(issue.id); // release the gate claim so the resume re-claims
                 if (!rApi)
@@ -2098,6 +2130,40 @@ async function handleDispatch(api, linearApi, issue, opts) {
     // recap it and ask the user to RESUME (continue the prior plan) or start
     // FRESH — BEFORE grilling or building a worktree. Runs only in stateplan mode
     // and only once per dispatch chain (opts.resumeResolved guards re-entry).
+    //
+    // A parked decision always wins over every later preflight. Previously a
+    // re-delegation saw getResume(issue.id), skipped the gate condition below,
+    // marked resume as handled, and fell into repo selection or /grill-me. Re-show
+    // the existing decision instead so a delegated issue cannot silently park on
+    // an unrelated question.
+    const pendingResume = getResume(issue.id);
+    if (orchestrationMode(pluginConfig) === "stateplan" &&
+        !reviewOnly &&
+        !opts?.resumeResolved &&
+        !opts?.grillDone &&
+        pendingResume) {
+        clearGrill(issue.id);
+        let rsid = opts?.existingSessionId ?? pendingResume.agentSessionId ?? linearSessionByIssue.get(issue.id);
+        if (!rsid) {
+            try {
+                const created = await linearApi.createSessionOnIssue(issue.id);
+                rsid = created.sessionId ?? undefined;
+            }
+            catch {
+                // emitVisibleElicitation posts the question as an issue comment below.
+            }
+        }
+        if (rsid !== pendingResume.agentSessionId) {
+            saveResume({ ...pendingResume, agentSessionId: rsid });
+        }
+        const understanding = pendingResume.analyzedBrief?.trim()
+            ? `\n\n**My understanding of where it stands:**\n\n${pendingResume.analyzedBrief.trim()}`
+            : "";
+        const ask = `I found prior work waiting on **${identifier}**.${understanding}\n\nReply **resume** to continue from that plan, or **fresh** to start over.`;
+        await emitVisibleElicitation(api, linearApi, issue.id, rsid, ask, RESUME_SELECT);
+        api.logger.info(`@dispatch: ${identifier} resume-gate — existing decision still pending; re-surfaced resume/fresh prompt (activeRuns held)`);
+        return;
+    }
     if (orchestrationMode(pluginConfig) === "stateplan" &&
         !reviewOnly &&
         !opts?.resumeResolved &&
@@ -2127,8 +2193,7 @@ async function handleDispatch(api, linearApi, issue, opts) {
             ].filter(Boolean).join(", ");
             const understanding = analysis.brief || prior.summary;
             const ask = `I found prior work on **${identifier}**${counts ? ` (${counts})` : ""}.\n\n**My understanding of where it stands:**\n\n${understanding}\n\nReply **resume** to continue from that plan, or **fresh** to start over.`;
-            if (rsid)
-                await linearApi.emitActivity(rsid, { type: "elicitation", body: ask }, RESUME_SELECT).catch(() => { });
+            await emitVisibleElicitation(api, linearApi, issue.id, rsid, ask, RESUME_SELECT);
             saveResume({
                 issueId: issue.id,
                 issueIdentifier: identifier,
@@ -2292,8 +2357,7 @@ async function handleDispatch(api, linearApi, issue, opts) {
                 }
                 catch { /* best effort */ }
             }
-            if (gsid)
-                await linearApi.emitActivity(gsid, { type: "elicitation", body: step.question }, optionsSignal(step.options ?? [])).catch(() => { });
+            await emitVisibleElicitation(api, linearApi, issue.id, gsid, step.question, optionsSignal(step.options ?? []));
             saveGrill({
                 issueId: issue.id,
                 issueIdentifier: identifier,

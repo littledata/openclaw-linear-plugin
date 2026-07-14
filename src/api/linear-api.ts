@@ -660,7 +660,7 @@ export class LinearAgentApi {
       }>(
         `query IssueAgentSessions($id: String!, $activityLimit: Int!) {
           issue(id: $id) {
-            agentSessions {
+            agentSessions(first: 20) {
               nodes {
                 id
                 createdAt

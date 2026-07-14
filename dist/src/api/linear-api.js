@@ -414,7 +414,7 @@ export class LinearAgentApi {
         try {
             const data = await this.gql(`query IssueAgentSessions($id: String!, $activityLimit: Int!) {
           issue(id: $id) {
-            agentSessions {
+            agentSessions(first: 20) {
               nodes {
                 id
                 createdAt

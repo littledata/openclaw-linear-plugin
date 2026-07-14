@@ -2,6 +2,8 @@ import type { AddressInfo } from "node:net";
 import { createServer } from "node:http";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { clearResume, clearResumeHandled, saveResume } from "./resume-state.js";
+import { clearGrill, getGrill, saveGrill } from "./grill-state.js";
 
 // ── Hoisted mock values ──────────────────────────────────────────────
 const {
@@ -1026,6 +1028,79 @@ describe("AgentSessionEvent.prompted full flow", () => {
     expect(result.status).toBe(200);
     const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
     expect(infoCalls.some((msg: string) => msg.includes("agent active, no tmux, ignoring (feedback)"))).toBe(true);
+  });
+
+  it("lets a pending resume decision outrank stale grill state", async () => {
+    const issueId = "issue-resume-over-grill";
+    const sessionId = "session-resume-over-grill";
+    const pluginConfig = {
+      orchestrationMode: "stateplan",
+      grillMode: "on",
+      repos: {
+        "transaction-monitor-2": {
+          path: "/root/repos/transaction-monitor-2",
+          github: "littledata/transaction-monitor-2",
+        },
+      },
+    };
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: issueId,
+      identifier: "CORE-1748",
+      title: "Terminal outcome event stream",
+      description: "Implement the existing plan.",
+      state: { name: "In Progress", type: "started" },
+      team: { id: "team-core", key: "CORE" },
+      labels: { nodes: [] },
+      comments: { nodes: [] },
+      attachments: { nodes: [] },
+      project: null,
+    });
+    saveResume({
+      issueId,
+      issueIdentifier: "CORE-1748",
+      agentSessionId: sessionId,
+      fullContext: "Existing Apex plan",
+      analyzedRepos: ["transaction-monitor-2"],
+      analyzedBrief: "Continue the existing implementation plan.",
+      createdAt: new Date().toISOString(),
+    });
+    saveGrill({
+      issueId,
+      issueIdentifier: "CORE-1748",
+      agentSessionId: sessionId,
+      qa: [],
+      pendingQuestion: "An unrelated stale grill question?",
+      repos: ["transaction-monitor-2"],
+      createdAt: new Date().toISOString(),
+    });
+    _addActiveRunForTesting(issueId);
+
+    try {
+      const result = await postWebhook({
+        type: "AgentSessionEvent",
+        action: "prompted",
+        agentSession: {
+          id: sessionId,
+          issue: { id: issueId, identifier: "CORE-1748" },
+        },
+        agentActivity: { content: { type: "prompt", body: "resume" } },
+        webhookId: "wh-resume-over-grill",
+      }, "/linear/webhook", pluginConfig);
+
+      expect(result.status).toBe(200);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      expect(getGrill(issueId)).toBeUndefined();
+      expect(runStatePlanMock).toHaveBeenCalledOnce();
+      expect(
+        mockLinearApiInstance.emitActivity.mock.calls.some(([, activity]: any[]) =>
+          activity?.type === "thought" && activity.body.includes("Resuming")),
+      ).toBe(true);
+    } finally {
+      clearResume(issueId);
+      clearResumeHandled(issueId);
+      clearGrill(issueId);
+    }
   });
 
   it("deduplicates by webhookId", async () => {
@@ -2486,6 +2561,88 @@ describe("handleCloseIssue via close_issue intent", () => {
 // ---------------------------------------------------------------------------
 
 describe("handleDispatch via Issue.update assignment", () => {
+  it("re-surfaces a parked resume decision instead of falling through to grill-me", async () => {
+    const issueId = "issue-pending-resume";
+    const sessionId = "session-pending-resume";
+    const pluginConfig = {
+      orchestrationMode: "stateplan",
+      grillMode: "on",
+      repos: {
+        "transaction-monitor-2": {
+          path: "/root/repos/transaction-monitor-2",
+          github: "littledata/transaction-monitor-2",
+        },
+      },
+    };
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: issueId,
+      identifier: "CORE-1748",
+      title: "Terminal outcome event stream",
+      description: "Implement the existing plan.",
+      state: { name: "In Progress", type: "started" },
+      team: { id: "team-core", key: "CORE" },
+      labels: { nodes: [] },
+      comments: { nodes: [] },
+      attachments: { nodes: [] },
+      project: null,
+    });
+    saveResume({
+      issueId,
+      issueIdentifier: "CORE-1748",
+      agentSessionId: sessionId,
+      fullContext: "Existing Apex plan",
+      analyzedRepos: ["transaction-monitor-2"],
+      analyzedBrief: "Continue the existing implementation plan.",
+      createdAt: new Date().toISOString(),
+    });
+    saveGrill({
+      issueId,
+      issueIdentifier: "CORE-1748",
+      agentSessionId: sessionId,
+      qa: [],
+      pendingQuestion: "An unrelated stale grill question?",
+      repos: ["transaction-monitor-2"],
+      createdAt: new Date().toISOString(),
+    });
+
+    try {
+      const result = await postWebhook({
+        type: "Issue",
+        action: "update",
+        data: {
+          id: issueId,
+          identifier: "CORE-1748",
+          assigneeId: "viewer-1",
+        },
+        updatedFrom: { assigneeId: null },
+      }, "/linear/webhook", pluginConfig);
+
+      expect(result.status).toBe(200);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      expect(mockLinearApiInstance.emitActivity).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({
+          type: "elicitation",
+          body: expect.stringContaining("Reply **resume**"),
+        }),
+        expect.objectContaining({ signal: "select" }),
+      );
+      expect(mockLinearApiInstance.createComment).toHaveBeenCalledWith(
+        issueId,
+        expect.stringContaining("Input needed to continue"),
+        undefined,
+      );
+      expect(getGrill(issueId)).toBeUndefined();
+      expect(assessTierMock).not.toHaveBeenCalled();
+      expect(runStatePlanMock).not.toHaveBeenCalled();
+    } finally {
+      clearResume(issueId);
+      clearResumeHandled(issueId);
+      clearGrill(issueId);
+    }
+  });
+
   it("enters review directly and checks out the attached PR without resume, repo selection, or grilling", async () => {
     const pullRequestUrl = "https://github.com/littledata/ld-shopify/pull/1740";
     const pluginConfig = {

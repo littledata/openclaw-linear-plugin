@@ -554,6 +554,7 @@ describe("LinearAgentApi", () => {
         result: "clean",
       });
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.query).toContain("agentSessions(first: 20)");
       expect(body.query).toContain("pullRequest { url title sourceBranch targetBranch status }");
       expect(body.query).toContain("... on AgentActivityActionContent { type action parameter result }");
       expect(body.query).toContain("... on AgentActivityPromptContent { type body }");
