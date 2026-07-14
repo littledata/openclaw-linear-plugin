@@ -74,6 +74,8 @@ const {
   }),
   mockLinearApiInstance: {
     emitActivity: vi.fn().mockResolvedValue(undefined),
+    completeSession: vi.fn().mockResolvedValue(undefined),
+    resumeSession: vi.fn(),
     createComment: vi.fn().mockResolvedValue("comment-id"),
     getIssueDetails: vi.fn().mockResolvedValue(null),
     updateSession: vi.fn().mockResolvedValue(undefined),
@@ -421,6 +423,8 @@ afterEach(() => {
   spawnWorkerMock.mockReset().mockResolvedValue(undefined);
   runStatePlanMock.mockReset().mockResolvedValue(undefined);
   mockLinearApiInstance.emitActivity.mockReset().mockResolvedValue(undefined);
+  mockLinearApiInstance.completeSession.mockReset().mockResolvedValue(undefined);
+  mockLinearApiInstance.resumeSession.mockReset();
   mockLinearApiInstance.createComment.mockReset().mockResolvedValue("comment-id");
   mockLinearApiInstance.getIssueDetails.mockReset().mockResolvedValue(null);
   mockLinearApiInstance.getRecentComments.mockReset().mockResolvedValue([]);
@@ -1077,9 +1081,9 @@ describe("AgentSessionEvent.prompted full flow", () => {
       undefined,
     );
     expect(removeActiveDispatchMock).not.toHaveBeenCalled();
-    expect(mockLinearApiInstance.emitActivity).toHaveBeenCalledWith(
+    expect(mockLinearApiInstance.completeSession).toHaveBeenCalledWith(
       "sess-pause",
-      expect.objectContaining({ body: expect.stringContaining("Reply in this session") }),
+      expect.stringContaining("Reply in this session"),
     );
   });
 
@@ -1124,6 +1128,7 @@ describe("AgentSessionEvent.prompted full flow", () => {
 
     expect(result.status).toBe(200);
     await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(mockLinearApiInstance.resumeSession).toHaveBeenCalledWith("sess-resume");
     expect(runStatePlanMock).toHaveBeenCalledWith(
       expect.any(Object),
       expect.objectContaining({

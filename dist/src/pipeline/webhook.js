@@ -704,10 +704,10 @@ export async function handleLinearWebhook(api, req, res) {
                     ? `🛑 Paused — halted the running turn for ${stopIdentifier}. Reply in this session to continue with the same context and workspace.`
                     : `🛑 Pause received for ${stopIdentifier}. Reply in this session to continue with the same context and workspace.`;
                 trackEmittedActivity(stopBody);
-                await stopApi.emitActivity(session.id, {
-                    type: "response",
-                    body: stopBody,
-                }).catch(() => { });
+                // A response is Linear's terminal activity: it marks the visible
+                // Agent Session complete. The API lifecycle fence makes this the last
+                // activity even if the interrupted worker still has queued tool rows.
+                await stopApi.completeSession(session.id, stopBody).catch(() => { });
             }
             return true;
         }
@@ -2632,6 +2632,9 @@ async function resumePausedDispatch(api, linearApi, session, issue, userMessage,
     let claimedActiveRun = false;
     try {
         if (!(await waitForRunToSettle(issueId))) {
+            if ((pauseGenerations.get(issueId) ?? 0) !== expectedPauseGeneration)
+                return;
+            linearApi.resumeSession(session.id);
             await linearApi.emitActivity(session.id, {
                 type: "error",
                 body: `Could not resume ${identifier}: the stopped turn did not finish shutting down. Please retry.`,
@@ -2664,6 +2667,9 @@ async function resumePausedDispatch(api, linearApi, session, issue, userMessage,
                 await startOrReuseContainer(buildContainerSpec(identifier, persisted.containerRepos, persisted.branch, effectivePluginConfig, Date.now()), api.logger, effectivePluginConfig);
             }
             catch (err) {
+                if ((pauseGenerations.get(issueId) ?? 0) !== expectedPauseGeneration)
+                    return;
+                linearApi.resumeSession(session.id);
                 await linearApi.emitActivity(session.id, {
                     type: "error",
                     body: `Could not resume ${identifier}: the ticket repositories could not be refreshed (${String(err).slice(0, 250)}).`,
@@ -2678,14 +2684,26 @@ async function resumePausedDispatch(api, linearApi, session, issue, userMessage,
         };
         const plan = resolveStatePlan(workflowState, effectivePluginConfig);
         if (!plan) {
+            if ((pauseGenerations.get(issueId) ?? 0) !== expectedPauseGeneration)
+                return;
+            linearApi.resumeSession(session.id);
             await linearApi.emitActivity(session.id, {
                 type: "error",
                 body: `Could not resume ${identifier}: no pipeline is configured for "${workflowState.name}".`,
             }).catch(() => { });
             return;
         }
+        // Reopen only after the stopped run has fully unwound. Reopening earlier
+        // could let a delayed activity from that run enter the new generation.
+        if ((pauseGenerations.get(issueId) ?? 0) !== expectedPauseGeneration)
+            return;
+        linearApi.resumeSession(session.id);
         clearCancel(issueId);
         const dispatch = await updateDispatchProgress(identifier, { status: "working", pausedAt: null, stuckReason: null, agentSessionId: session.id }, statePath);
+        if ((pauseGenerations.get(issueId) ?? 0) !== expectedPauseGeneration) {
+            await updateDispatchProgress(identifier, { status: "paused", pausedAt: new Date().toISOString() }, statePath).catch(() => { });
+            return;
+        }
         if (!dispatch)
             return;
         pausedIssues.delete(issueId);

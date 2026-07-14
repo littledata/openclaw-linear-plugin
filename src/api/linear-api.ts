@@ -3,6 +3,11 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { refreshLinearToken } from "./auth.js";
 import { withResilience } from "../infra/resilience.js";
+import {
+  enqueueAgentSessionActivity,
+  markAgentSessionComplete,
+  resumeAgentSession,
+} from "./agent-session-lifecycle.js";
 
 export const LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql";
 export const AUTH_PROFILES_PATH = join(
@@ -33,6 +38,8 @@ export interface ActivityEmitOptions {
   signalMetadata?: { options?: Array<{ label?: string; value: string }> };
   /** Transient activity removed by Linear when the next activity arrives. */
   ephemeral?: boolean;
+  /** Internal: allow the terminal response through a completed-session fence. */
+  allowWhenComplete?: boolean;
 }
 
 export interface ExternalUrl {
@@ -275,6 +282,41 @@ export class LinearAgentApi {
    * @param opts - optional signal + signalMetadata (siblings of content in the API)
    */
   async emitActivity(
+    agentSessionId: string,
+    content: ActivityContent,
+    opts?: ActivityEmitOptions,
+  ): Promise<void> {
+    return enqueueAgentSessionActivity(
+      agentSessionId,
+      opts?.allowWhenComplete === true,
+      () => this.emitActivityNow(agentSessionId, content, opts),
+    );
+  }
+
+  /**
+   * Mark a Linear Agent Session complete with a final response. Linear derives
+   * the visible `complete` state from this terminal activity.
+   * @param agentSessionId - target Linear Agent Session id
+   * @param body - final stopped-state message shown to the user
+   */
+  async completeSession(agentSessionId: string, body: string): Promise<void> {
+    markAgentSessionComplete(agentSessionId);
+    await this.emitActivity(
+      agentSessionId,
+      { type: "response", body },
+      { allowWhenComplete: true },
+    );
+  }
+
+  /**
+   * Reopen a completed Linear Agent Session for a user continuation prompt.
+   * @param agentSessionId - target Linear Agent Session id
+   */
+  resumeSession(agentSessionId: string): void {
+    resumeAgentSession(agentSessionId);
+  }
+
+  private async emitActivityNow(
     agentSessionId: string,
     content: ActivityContent,
     opts?: ActivityEmitOptions,

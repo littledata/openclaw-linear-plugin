@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, type Mock } from "vitest";
 import { resolveLinearToken, LinearAgentApi, AUTH_PROFILES_PATH, refreshTokenProactively, formatAgentPlan } from "./linear-api.js";
+import { _resetAgentSessionLifecycleForTesting } from "./agent-session-lifecycle.js";
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -70,6 +71,7 @@ let fetchMock: Mock;
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  _resetAgentSessionLifecycleForTesting();
   fetchMock = vi.fn();
   vi.stubGlobal("fetch", fetchMock);
 
@@ -414,6 +416,54 @@ describe("LinearAgentApi", () => {
         agentSessionId: "session-1",
         ephemeral: true,
         content: { type: "action", action: "container_exec", parameter: "git diff" },
+      });
+    });
+
+    it("makes the completion response terminal until the same session resumes", async () => {
+      fetchMock
+        .mockResolvedValueOnce(okResponse({ agentActivityCreate: { success: true } }))
+        .mockResolvedValueOnce(okResponse({ agentActivityCreate: { success: true } }));
+
+      const api = new LinearAgentApi(TOKEN);
+      await api.completeSession("session-stop", "Stopped. Reply to continue.");
+      await api.emitActivity("session-stop", { type: "thought", body: "late worker output" });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const completion = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(completion.variables.input.content).toEqual({
+        type: "response",
+        body: "Stopped. Reply to continue.",
+      });
+
+      api.resumeSession("session-stop");
+      await api.emitActivity("session-stop", { type: "thought", body: "continuing" });
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const continuation = JSON.parse(fetchMock.mock.calls[1][1].body);
+      expect(continuation.variables.input.content).toEqual({
+        type: "thought",
+        body: "continuing",
+      });
+    });
+
+    it("drops activities queued before completion so the response remains last", async () => {
+      fetchMock.mockResolvedValueOnce(
+        okResponse({ agentActivityCreate: { success: true } }),
+      );
+
+      const api = new LinearAgentApi(TOKEN);
+      const staleActivity = api.emitActivity("session-race", {
+        type: "action",
+        action: "old tool call",
+      });
+      const completion = api.completeSession("session-race", "Stopped.");
+      await Promise.all([staleActivity, completion]);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.variables.input.content).toEqual({
+        type: "response",
+        body: "Stopped.",
       });
     });
   });

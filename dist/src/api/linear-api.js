@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { refreshLinearToken } from "./auth.js";
 import { withResilience } from "../infra/resilience.js";
+import { enqueueAgentSessionActivity, markAgentSessionComplete, resumeAgentSession, } from "./agent-session-lifecycle.js";
 export const LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql";
 export const AUTH_PROFILES_PATH = join(homedir(), ".openclaw", "auth-profiles.json");
 /** Convert Linear's JSON Agent Plan payload into readable context text. */
@@ -196,6 +197,26 @@ export class LinearAgentApi {
      * @param opts - optional signal + signalMetadata (siblings of content in the API)
      */
     async emitActivity(agentSessionId, content, opts) {
+        return enqueueAgentSessionActivity(agentSessionId, opts?.allowWhenComplete === true, () => this.emitActivityNow(agentSessionId, content, opts));
+    }
+    /**
+     * Mark a Linear Agent Session complete with a final response. Linear derives
+     * the visible `complete` state from this terminal activity.
+     * @param agentSessionId - target Linear Agent Session id
+     * @param body - final stopped-state message shown to the user
+     */
+    async completeSession(agentSessionId, body) {
+        markAgentSessionComplete(agentSessionId);
+        await this.emitActivity(agentSessionId, { type: "response", body }, { allowWhenComplete: true });
+    }
+    /**
+     * Reopen a completed Linear Agent Session for a user continuation prompt.
+     * @param agentSessionId - target Linear Agent Session id
+     */
+    resumeSession(agentSessionId) {
+        resumeAgentSession(agentSessionId);
+    }
+    async emitActivityNow(agentSessionId, content, opts) {
         const mutation = `mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
         agentActivityCreate(input: $input) {
           success
