@@ -436,7 +436,12 @@ export async function handleLinearWebhook(api, req, res) {
         const webhookAppUserId = typeof payload.appUserId === "string"
             ? payload.appUserId
             : await linearApi.getViewerId();
-        const isDelegationSession = !session?.comment &&
+        const sessionCommentBody = typeof session?.comment?.body === "string"
+            ? session.comment.body.trim()
+            : "";
+        const hasUserAuthoredSessionComment = Boolean(session?.comment &&
+            !/^This thread is for an agent session with\b/i.test(sessionCommentBody));
+        const isDelegationSession = !hasUserAuthoredSessionComment &&
             typeof webhookAppUserId === "string" &&
             enrichedIssue?.delegate?.id === webhookAppUserId;
         if (isDelegationSession) {

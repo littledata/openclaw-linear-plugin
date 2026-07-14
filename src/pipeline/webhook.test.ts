@@ -396,7 +396,10 @@ async function postDelegationSession(
     agentSession: {
       id: sessionId,
       issue,
-      comment: null,
+      comment: {
+        id: `thread-${sessionId}`,
+        body: "This thread is for an agent session with vasile.",
+      },
     },
     previousComments: [],
     promptContext: `<issue identifier="${issue.identifier}"><title>${issue.title ?? issue.identifier}</title></issue>`,
