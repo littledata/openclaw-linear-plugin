@@ -2685,7 +2685,7 @@ async function resumePausedDispatch(api, linearApi, session, issue, userMessage,
             return;
         }
         clearCancel(issueId);
-        const dispatch = await updateDispatchProgress(identifier, { status: "working", pausedAt: null, agentSessionId: session.id }, statePath);
+        const dispatch = await updateDispatchProgress(identifier, { status: "working", pausedAt: null, stuckReason: null, agentSessionId: session.id }, statePath);
         if (!dispatch)
             return;
         pausedIssues.delete(issueId);

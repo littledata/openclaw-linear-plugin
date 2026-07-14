@@ -3063,7 +3063,7 @@ async function resumePausedDispatch(
     clearCancel(issueId);
     const dispatch = await updateDispatchProgress(
       identifier,
-      { status: "working", pausedAt: null, agentSessionId: session.id },
+      { status: "working", pausedAt: null, stuckReason: null, agentSessionId: session.id },
       statePath,
     );
     if (!dispatch) return;

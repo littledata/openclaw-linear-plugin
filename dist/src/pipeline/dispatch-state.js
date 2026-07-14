@@ -324,6 +324,10 @@ export async function updateDispatchProgress(issueIdentifier, updates, configPat
             delete dispatch.pausedAt;
         else if (updates.pausedAt !== undefined)
             dispatch.pausedAt = updates.pausedAt;
+        if (updates.stuckReason === null)
+            delete dispatch.stuckReason;
+        else if (updates.stuckReason !== undefined)
+            dispatch.stuckReason = updates.stuckReason;
         if (updates.agentSessionId !== undefined)
             dispatch.agentSessionId = updates.agentSessionId;
         await writeDispatchState(filePath, data);
@@ -362,6 +366,12 @@ export function listActiveDispatches(state) {
 export function listStaleDispatches(state, maxAgeMs) {
     const now = Date.now();
     return Object.values(state.dispatches.active).filter((d) => {
+        // STOPped work is intentionally idle and must remain resumable indefinitely.
+        // Stuck/terminal records are already classified and should not be counted
+        // again by stale-run monitoring.
+        if (!["dispatched", "working", "auditing"].includes(d.status)) {
+            return false;
+        }
         const age = now - new Date(d.dispatchedAt).getTime();
         return age > maxAgeMs;
     });
