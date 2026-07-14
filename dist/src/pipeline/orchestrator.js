@@ -456,7 +456,7 @@ async function openPr(ctx, dispatch, issue) {
                 // Still attempt: the agent may have committed (porcelain clean but ahead
                 // of base). openPrInContainer no-ops gh when there's truly no diff.
             }
-            const prUrl = openPrInContainer(dispatch.containerName, repo, dispatch.branch, `${issue.identifier}: ${issue.title}`, body);
+            const prUrl = await openPrInContainer(dispatch.containerName, repo, dispatch.branch, `${issue.identifier}: ${issue.title}`, body, ctx.pluginConfig);
             if (prUrl)
                 opened.push(`**${repo}**: ${prUrl}`);
         }
@@ -496,14 +496,14 @@ function reviewFocus(role) {
     }
 }
 /** Re-fetch and reset every linked PR head in the issue's existing container. */
-function syncReviewSandbox(dispatch) {
+async function syncReviewSandbox(ctx, dispatch) {
     const pullRequests = dispatch.reviewPullRequests ?? [];
     if (!pullRequests.length)
         return null;
     if (!dispatch.containerName)
         return "no ticket container is available for review";
     for (const pullRequest of pullRequests) {
-        const synced = checkoutPullRequestInContainer(dispatch.containerName, pullRequest.repoName, pullRequest.url, pullRequest.number);
+        const synced = await checkoutPullRequestInContainer(dispatch.containerName, pullRequest.repoName, pullRequest.url, pullRequest.number, ctx.pluginConfig);
         if (synced.status !== 0) {
             return `could not refresh ${pullRequest.url} in ${pullRequest.repoName}: ${synced.stderr.trim().slice(0, 500)}`;
         }
@@ -542,7 +542,7 @@ async function publishReview(ctx, dispatch, role, verdict) {
             failures.push(`${pullRequest.url}: no ticket container`);
             continue;
         }
-        const published = publishPullRequestReviewInContainer(dispatch.containerName, pullRequest.repoName, pullRequest.url, body);
+        const published = await publishPullRequestReviewInContainer(dispatch.containerName, pullRequest.repoName, pullRequest.url, body, verdict.pass, ctx.pluginConfig);
         if (published.status !== 0) {
             failures.push(`${pullRequest.url}: ${published.stderr.trim().slice(0, 300)}`);
         }
@@ -622,7 +622,7 @@ async function runStructuredReview(ctx, dispatch, issue, role, focus) {
  * @param gate - true when the phase blocks on failure; false = annotate-only
  */
 async function runReviewPhase(ctx, dispatch, issue, role, gate) {
-    const syncFailure = syncReviewSandbox(dispatch);
+    const syncFailure = await syncReviewSandbox(ctx, dispatch);
     if (syncFailure) {
         return { success: false, reason: `${role.label} review sandbox sync failed: ${syncFailure}` };
     }

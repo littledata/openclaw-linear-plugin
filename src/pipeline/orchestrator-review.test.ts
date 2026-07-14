@@ -25,8 +25,8 @@ import { runStatePlan } from "./orchestrator.js";
 describe("review verdict recovery", () => {
   beforeEach(() => {
     runAgentMock.mockReset();
-    checkoutPullRequestMock.mockReset().mockReturnValue({ status: 0, stdout: "", stderr: "" });
-    publishPullRequestReviewMock.mockReset().mockReturnValue({ status: 0, stdout: "", stderr: "" });
+    checkoutPullRequestMock.mockReset().mockResolvedValue({ status: 0, stdout: "", stderr: "" });
+    publishPullRequestReviewMock.mockReset().mockResolvedValue({ status: 0, stdout: "", stderr: "" });
   });
 
   it("asks the reviewer for a format-only correction when a successful review omits its verdict line", async () => {
@@ -98,6 +98,7 @@ describe("review verdict recovery", () => {
       "ld-shopify",
       "https://github.com/littledata/ld-shopify/pull/1740",
       1740,
+      {},
     );
     expect(runAgentMock.mock.calls[1][0].message).toContain("Your review completed, but its verdict format was missing");
     expect(runAgentMock.mock.calls[0][0]).toMatchObject({ issueIdentifier: "CORE-1740" });
@@ -107,6 +108,8 @@ describe("review verdict recovery", () => {
       "ld-shopify",
       "https://github.com/littledata/ld-shopify/pull/1740",
       expect.stringContaining("## Warden review"),
+      true,
+      {},
     );
     expect(createComment).not.toHaveBeenCalled();
     expect(emitActivity).toHaveBeenCalledWith(

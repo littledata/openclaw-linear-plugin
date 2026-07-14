@@ -7,6 +7,8 @@ import {
   PROVISION_SCRIPT,
   CHECKOUT_PR_SCRIPT,
   PUBLISH_PR_REVIEW_SCRIPT,
+  checkoutPullRequestInContainer,
+  publishPullRequestReviewInContainer,
   parseContainerRows,
   selectExpired,
   ISSUE_LABEL,
@@ -55,18 +57,16 @@ describe("buildRunArgs", () => {
     expect(args.slice(-2)).toEqual(["sleep", "infinity"]);
   });
 
-  it("adds auth mounts, gh token, and resource caps when provided", () => {
+  it("mounts only Codex auth and never ambient GitHub credentials", () => {
     const args = buildRunArgs({
       ...base,
       codexAuthFile: "/root/.codex/auth.json",
-      gitCredentialsFile: "/root/.git-credentials",
-      ghToken: "ght_abc",
       memory: "4g",
       cpus: "2",
     });
     expect(args).toContain("/root/.codex/auth.json:/root/.codex/auth.json:ro");
-    expect(args).toContain("/root/.git-credentials:/root/.git-credentials:ro");
-    expect(args).toContain("GH_TOKEN=ght_abc");
+    expect(args.join(" ")).not.toContain(".git-credentials");
+    expect(args.join(" ")).not.toContain("GH_TOKEN=");
     expect(args).toContain("--memory");
     expect(args).toContain("4g");
     expect(args).toContain("--cpus");
@@ -87,11 +87,34 @@ describe("CHECKOUT_PR_SCRIPT", () => {
     expect(CHECKOUT_PR_SCRIPT).toContain('checkout -B "review/pr-$PR_NUMBER" FETCH_HEAD');
     expect(CHECKOUT_PR_SCRIPT).toContain('reset --hard FETCH_HEAD');
   });
+
+  it("rejects a PR URL from a repository other than the configured target", async () => {
+    await expect(checkoutPullRequestInContainer(
+      "openclaw-linear-CORE-1740",
+      "ld-shopify",
+      "https://github.com/attacker/ld-shopify/pull/10",
+      10,
+      { githubOwner: "littledata", repos: { "ld-shopify": "/repos/ld-shopify" } },
+    )).resolves.toMatchObject({ status: 2, stderr: expect.stringContaining("does not match") });
+  });
 });
 
 describe("PUBLISH_PR_REVIEW_SCRIPT", () => {
-  it("publishes a GitHub review comment using env-provided content", () => {
-    expect(PUBLISH_PR_REVIEW_SCRIPT).toContain('gh pr review "$PR_URL" --comment --body "$REVIEW_BODY"');
+  it("publishes a formal GitHub review and stable check run", () => {
+    expect(PUBLISH_PR_REVIEW_SCRIPT).toContain('gh pr review "$PR_URL" "$REVIEW_EVENT" --body "$REVIEW_BODY"');
+    expect(PUBLISH_PR_REVIEW_SCRIPT).toContain('name="OpenClaw Review"');
+    expect(PUBLISH_PR_REVIEW_SCRIPT).toContain('conclusion="$CHECK_CONCLUSION"');
+  });
+
+  it("rejects review publication outside the configured repository", async () => {
+    await expect(publishPullRequestReviewInContainer(
+      "openclaw-linear-CORE-1740",
+      "ld-shopify",
+      "https://github.com/attacker/ld-shopify/pull/10",
+      "review",
+      true,
+      { githubOwner: "littledata", repos: { "ld-shopify": "/repos/ld-shopify" } },
+    )).resolves.toMatchObject({ status: 2, stderr: expect.stringContaining("does not match") });
   });
 });
 

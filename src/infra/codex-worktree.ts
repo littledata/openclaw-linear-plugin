@@ -4,6 +4,12 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { ensureGitignore } from "../pipeline/artifacts.js";
 import type { RepoConfig } from "./multi-repo.js";
+import {
+  getGitHubAppToken,
+  githubAuthenticationEnvironment,
+  invalidateGitHubAppToken,
+  parseGitHubRepositoryRemote,
+} from "./github-app-auth.js";
 
 const DEFAULT_BASE_REPO = path.join(homedir(), "ai-workspace");
 const DEFAULT_WORKTREE_BASE_DIR = path.join(homedir(), ".openclaw", "worktrees");
@@ -345,12 +351,18 @@ export function removeWorktree(
 
 /**
  * Push the worktree branch and create a GitHub PR via `gh`.
+ * @param worktreePath - local git worktree path
+ * @param title - pull request title and fallback commit message
+ * @param body - pull request body
+ * @param pluginConfig - OpenClaw plugin configuration
+ * @returns the created pull request URL
  */
-export function createPullRequest(
+export async function createPullRequest(
   worktreePath: string,
   title: string,
   body: string,
-): { prUrl: string } {
+  pluginConfig?: Record<string, unknown>,
+): Promise<{ prUrl: string }> {
   // Commit any uncommitted changes first
   const status = getWorktreeStatus(worktreePath);
   if (status.hasUncommitted) {
@@ -367,18 +379,32 @@ export function createPullRequest(
 
   // Get branch name
   const branch = git(["rev-parse", "--abbrev-ref", "HEAD"], worktreePath);
+  const repository = parseGitHubRepositoryRemote(git(["remote", "get-url", "origin"], worktreePath));
 
-  // Push branch
-  git(["push", "-u", "origin", branch], worktreePath);
-
-  // Create PR via gh CLI
-  const prUrl = execFileSync(
-    "gh",
-    ["pr", "create", "--title", title, "--body", body, "--head", branch],
-    { cwd: worktreePath, encoding: "utf8", timeout: 30_000 },
-  ).trim();
-
-  return { prUrl };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const token = await getGitHubAppToken("coding", repository, pluginConfig);
+    const env = { ...process.env, ...githubAuthenticationEnvironment(token) };
+    try {
+      execFileSync("git", ["push", "-u", "origin", branch], {
+        cwd: worktreePath,
+        env,
+        encoding: "utf8",
+        timeout: 120_000,
+      });
+      const prUrl = execFileSync(
+        "gh",
+        ["pr", "create", "--repo", repository, "--title", title, "--body", body, "--head", branch],
+        { cwd: worktreePath, env, encoding: "utf8", timeout: 30_000 },
+      ).trim();
+      return { prUrl };
+    } catch (err) {
+      if (attempt === 1 || !/bad credentials|authentication failed|http 401|401 unauthorized|token (?:has )?expired/i.test(String(err))) {
+        throw err;
+      }
+      invalidateGitHubAppToken("coding", repository);
+    }
+  }
+  throw new Error("GitHub authentication retry failed");
 }
 
 export interface WorktreeEntry {

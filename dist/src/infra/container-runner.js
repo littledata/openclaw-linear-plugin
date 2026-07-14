@@ -25,13 +25,15 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { InactivityWatchdog } from "../agent/watchdog.js";
 import { createProgressEmitter, formatActivityLogLine } from "../tools/cli-shared.js";
 import { mapCodexEventToActivity } from "../tools/codex-tool.js";
 import { listContainerRecords, removeContainerRecord, selectIdleExpired } from "./container-registry.js";
+import { getGitHubAppToken, githubAuthenticationEnvironment, invalidateGitHubAppToken, } from "./github-app-auth.js";
+import { resolveGitHubRepository } from "./multi-repo.js";
 export const CONTAINER_PREFIX = "openclaw-linear";
 export const ISSUE_LABEL = "openclaw.linear.issue";
 export const CREATED_LABEL = "openclaw.linear.createdAt";
@@ -51,23 +53,6 @@ export function containerNameForIssue(issueIdentifier) {
 /** In-container writable working dir for a cloned repo. */
 export function repoWorkdir(repoName) {
     return `${WORK_ROOT}/${repoName}`;
-}
-/**
- * Extract a GitHub token from a git-credentials file so `gh` works in the
- * container (git push uses the mounted file; gh needs GH_TOKEN).
- * @param path - path to the git-credentials file
- * @returns the token, or undefined
- */
-export function readGhTokenFromCredentials(path) {
-    try {
-        const content = readFileSync(path, "utf8");
-        // https://<user>:<token>@github.com  (or https://<token>@github.com)
-        const m = /https:\/\/(?:[^:@/]+:)?([^@/\s]+)@github\.com/.exec(content);
-        return m?.[1];
-    }
-    catch {
-        return undefined;
-    }
 }
 /**
  * Build the `docker run -d` argv for a persistent worker container. The
@@ -93,10 +78,6 @@ export function buildRunArgs(spec) {
     ];
     if (spec.codexAuthFile)
         args.push("-v", `${spec.codexAuthFile}:/root/.codex/auth.json:ro`);
-    if (spec.gitCredentialsFile)
-        args.push("-v", `${spec.gitCredentialsFile}:/root/.git-credentials:ro`);
-    if (spec.ghToken)
-        args.push("-e", `GH_TOKEN=${spec.ghToken}`);
     if (spec.memory)
         args.push("--memory", spec.memory);
     if (spec.cpus)
@@ -112,7 +93,6 @@ export function buildRunArgs(spec) {
  */
 export const PROVISION_SCRIPT = [
     "set -eu",
-    "git config --global credential.helper store",
     'git config --global user.email "agent@littledata.io"',
     'git config --global user.name "Littledata Agent"',
     "mkdir -p /work/.claw",
@@ -145,7 +125,9 @@ export const CHECKOUT_PR_SCRIPT = [
 export const PUBLISH_PR_REVIEW_SCRIPT = [
     "set -eu",
     'cd "$REPO_DIR"',
-    'gh pr review "$PR_URL" --comment --body "$REVIEW_BODY"',
+    'gh pr review "$PR_URL" "$REVIEW_EVENT" --body "$REVIEW_BODY"',
+    'HEAD_SHA=$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid)',
+    'gh api --method POST "repos/$REPOSITORY/check-runs" -f name="OpenClaw Review" -f head_sha="$HEAD_SHA" -f status=completed -f conclusion="$CHECK_CONCLUSION" -f "output[title]=$CHECK_TITLE" -f "output[summary]=$REVIEW_BODY" >/dev/null',
 ].join("\n");
 /**
  * Build the in-container codex command string (values are trusted: config/derived).
@@ -172,12 +154,13 @@ export const GIT_STATUS_SCRIPT = 'cd "$REPO_DIR" && printf "PORCELAIN<<\\n"; git
  * stderr when the repo is unchanged (handled by the caller as a skip).
  */
 export const OPEN_PR_SCRIPT = [
-    "set -u",
+    "set -eu",
     'cd "$REPO_DIR"',
     "git add -A",
     'git commit -m "$TITLE" >/dev/null 2>&1 || true', // no-op if nothing staged
-    'git push -u origin "$BRANCH" 1>&2 || true',
-    'gh pr create --head "$BRANCH" ${BASE:+--base "$BASE"} --title "$TITLE" --body "$BODY"',
+    'git remote set-url origin "$REMOTE_URL"',
+    'git push -u origin "$BRANCH" 1>&2',
+    'gh pr create --repo "$REPOSITORY" --head "$BRANCH" ${BASE:+--base "$BASE"} --title "$TITLE" --body "$BODY"',
 ].join("\n");
 /** Parse `docker ps` rows of the form `<name>|<createdAtMs>`. */
 export function parseContainerRows(output) {
@@ -204,6 +187,29 @@ function dockerSync(args, opts) {
         maxBuffer: 32 * 1024 * 1024,
     });
     return { status: r.status ?? 1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+function githubEnvironmentArgs(token) {
+    return Object.entries(githubAuthenticationEnvironment(token)).flatMap(([key, value]) => ["-e", `${key}=${value}`]);
+}
+function isAuthenticationFailure(result) {
+    return /bad credentials|authentication failed|could not read username|http 401|401 unauthorized|token (?:has )?expired/i.test(`${result.stdout}\n${result.stderr}`);
+}
+function redactToken(result, token) {
+    return {
+        ...result,
+        stdout: result.stdout.replaceAll(token, "[REDACTED]"),
+        stderr: result.stderr.replaceAll(token, "[REDACTED]"),
+    };
+}
+async function runAuthenticatedDockerOperation(role, repository, pluginConfig, buildArgs, timeoutMs) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        const token = await getGitHubAppToken(role, repository, pluginConfig);
+        const result = redactToken(dockerSync(buildArgs(githubEnvironmentArgs(token)), { timeoutMs }), token);
+        if (result.status === 0 || !isAuthenticationFailure(result) || attempt === 1)
+            return result;
+        invalidateGitHubAppToken(role, repository);
+    }
+    return { status: 1, stdout: "", stderr: "GitHub authentication retry failed" };
 }
 /** True if a container with this name is currently running. */
 export function isContainerRunning(name) {
@@ -262,7 +268,7 @@ export function startOrReuseContainer(spec, logger) {
  * @param identifier - the Linear issue identifier
  * @param targetRepos - repo names to clone writable
  * @param branch - the working branch
- * @param pluginConfig - the plugin config (image/reposRoot/memory/cpus/token overrides)
+ * @param pluginConfig - the plugin config (image/reposRoot/memory/cpus overrides)
  * @param createdAtMs - creation timestamp (for the TTL label)
  * @returns a fully-populated ContainerStartSpec
  */
@@ -270,7 +276,6 @@ export function buildContainerSpec(identifier, targetRepos, branch, pluginConfig
     const home = process.env.HOME ?? homedir();
     const containersBase = pluginConfig?.containersBaseDir ?? join(home, ".openclaw", "containers");
     const hostRoot = join(containersBase, identifier.replace(/[^a-zA-Z0-9_.-]/g, "-"));
-    const gitCredentialsFile = join(home, ".git-credentials");
     return {
         issueIdentifier: identifier,
         image: pluginConfig?.workerImage ?? "openclaw-linear-worker:latest",
@@ -279,10 +284,6 @@ export function buildContainerSpec(identifier, targetRepos, branch, pluginConfig
         reposRoot: pluginConfig?.reposRoot ?? join(home, "repos"),
         clawHostDir: join(hostRoot, ".claw"),
         codexAuthFile: join(home, ".codex", "auth.json"),
-        gitCredentialsFile,
-        ghToken: pluginConfig?.githubToken ??
-            process.env.GH_TOKEN ??
-            readGhTokenFromCredentials(gitCredentialsFile),
         memory: pluginConfig?.containerMemory ?? "6g",
         cpus: pluginConfig?.containerCpus ?? "3",
         createdAtMs,
@@ -358,39 +359,77 @@ export function cloneRepo(name, repo, branch) {
  * Check out a linked GitHub PR head in an already-provisioned repo.
  * The PR URL and number are passed through environment variables, never shell
  * interpolation. Returns a normal Docker command result for explicit gating.
+ * @param name - ticket container name
+ * @param repo - configured repository key
+ * @param pullRequestUrl - canonical GitHub pull request URL
+ * @param pullRequestNumber - GitHub pull request number
+ * @param pluginConfig - OpenClaw plugin configuration
+ * @returns Docker checkout result
  */
-export function checkoutPullRequestInContainer(name, repo, pullRequestUrl, pullRequestNumber) {
+export async function checkoutPullRequestInContainer(name, repo, pullRequestUrl, pullRequestNumber, pluginConfig) {
     const match = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/\d+(?:[/?#].*)?$/i.exec(pullRequestUrl.trim());
     if (!match || !Number.isInteger(pullRequestNumber) || pullRequestNumber < 1) {
         return { status: 2, stdout: "", stderr: `invalid GitHub pull request: ${pullRequestUrl}` };
     }
-    const remoteUrl = `https://github.com/${match[1]}/${match[2].replace(/\.git$/i, "")}.git`;
-    return dockerSync([
+    const repository = `${match[1]}/${match[2].replace(/\.git$/i, "")}`;
+    const expectedRepository = resolveGitHubRepository(repo, pluginConfig);
+    if (repository.toLowerCase() !== expectedRepository.toLowerCase()) {
+        return {
+            status: 2,
+            stdout: "",
+            stderr: `pull request repository ${repository} does not match configured repository ${expectedRepository}`,
+        };
+    }
+    const remoteUrl = `https://github.com/${repository}.git`;
+    return runAuthenticatedDockerOperation("reviewer", repository, pluginConfig, (authenticationArgs) => [
         "exec",
+        ...authenticationArgs,
         "-e", `REPO_DIR=${repoWorkdir(repo)}`,
         "-e", `REMOTE_URL=${remoteUrl}`,
         "-e", `PR_NUMBER=${pullRequestNumber}`,
         name,
         "sh", "-c", CHECKOUT_PR_SCRIPT,
-    ], { timeoutMs: 120_000 });
+    ], 120_000);
 }
 /**
  * Publish a review comment on a linked PR using the container's authenticated
  * GitHub CLI. Keeping this inside the ticket container uses the same credentials
  * and repository context as implementation/review work.
+ * @param name - ticket container name
+ * @param repo - configured repository key
+ * @param pullRequestUrl - canonical GitHub pull request URL
+ * @param body - review body
+ * @param passed - whether to approve or request changes
+ * @param pluginConfig - OpenClaw plugin configuration
+ * @returns Docker publication result
  */
-export function publishPullRequestReviewInContainer(name, repo, pullRequestUrl, body) {
-    if (!/^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+(?:[/?#].*)?$/i.test(pullRequestUrl.trim())) {
+export async function publishPullRequestReviewInContainer(name, repo, pullRequestUrl, body, passed, pluginConfig) {
+    const match = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/\d+(?:[/?#].*)?$/i.exec(pullRequestUrl.trim());
+    if (!match) {
         return { status: 2, stdout: "", stderr: `invalid GitHub pull request: ${pullRequestUrl}` };
     }
-    return dockerSync([
+    const repository = `${match[1]}/${match[2].replace(/\.git$/i, "")}`;
+    const expectedRepository = resolveGitHubRepository(repo, pluginConfig);
+    if (repository.toLowerCase() !== expectedRepository.toLowerCase()) {
+        return {
+            status: 2,
+            stdout: "",
+            stderr: `pull request repository ${repository} does not match configured repository ${expectedRepository}`,
+        };
+    }
+    return runAuthenticatedDockerOperation("reviewer", repository, pluginConfig, (authenticationArgs) => [
         "exec",
+        ...authenticationArgs,
         "-e", `REPO_DIR=${repoWorkdir(repo)}`,
         "-e", `PR_URL=${pullRequestUrl.trim()}`,
+        "-e", `REPOSITORY=${repository}`,
         "-e", `REVIEW_BODY=${body}`,
+        "-e", `REVIEW_EVENT=${passed ? "--approve" : "--request-changes"}`,
+        "-e", `CHECK_CONCLUSION=${passed ? "success" : "failure"}`,
+        "-e", `CHECK_TITLE=${passed ? "Review passed" : "Changes requested"}`,
         name,
         "sh", "-c", PUBLISH_PR_REVIEW_SCRIPT,
-    ], { timeoutMs: 120_000 });
+    ], 120_000);
 }
 /**
  * Run an arbitrary shell command inside the container and capture its output.
@@ -476,19 +515,29 @@ export function containerGitStatus(name, repoName) {
 }
 /**
  * Commit + push a repo's branch and open a PR from inside the container.
+ * @param name - ticket container name
+ * @param repoName - configured repository key
+ * @param branch - branch to push
+ * @param title - pull request title and fallback commit message
+ * @param body - pull request body
+ * @param pluginConfig - OpenClaw plugin configuration
+ * @param base - optional base branch
  * @returns the PR URL, or null when the repo had no changes (gh "no commits")
  *   or a PR already exists. Throws on a genuine failure.
  */
-export function openPrInContainer(name, repoName, branch, title, body, base) {
+export async function openPrInContainer(name, repoName, branch, title, body, pluginConfig, base) {
+    const repository = resolveGitHubRepository(repoName, pluginConfig);
     const env = [
         "-e", `REPO_DIR=${repoWorkdir(repoName)}`,
         "-e", `BRANCH=${branch}`,
         "-e", `TITLE=${title}`,
         "-e", `BODY=${body}`,
+        "-e", `REPOSITORY=${repository}`,
+        "-e", `REMOTE_URL=https://github.com/${repository}.git`,
     ];
     if (base)
         env.push("-e", `BASE=${base}`);
-    const r = dockerSync(["exec", ...env, name, "sh", "-c", OPEN_PR_SCRIPT], { timeoutMs: 120_000 });
+    const r = await runAuthenticatedDockerOperation("coding", repository, pluginConfig, (authenticationArgs) => ["exec", ...authenticationArgs, ...env, name, "sh", "-c", OPEN_PR_SCRIPT], 120_000);
     const combined = `${r.stdout}\n${r.stderr}`;
     const url = /https:\/\/github\.com\/\S+\/pull\/\d+/.exec(combined)?.[0];
     if (url)

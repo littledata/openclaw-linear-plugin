@@ -142,8 +142,7 @@ vi.mock("../infra/container-runner.js", () => ({
   destroyContainer: vi.fn(),
   stopContainerRun: vi.fn().mockReturnValue(false),
   containerNameForIssue: (id: string) => `openclaw-linear-${id}`,
-  readGhTokenFromCredentials: vi.fn().mockReturnValue("ght_test"),
-  checkoutPullRequestInContainer: vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" }),
+  checkoutPullRequestInContainer: vi.fn().mockResolvedValue({ status: 0, stdout: "", stderr: "" }),
 }));
 
 vi.mock("../infra/container-registry.js", () => ({

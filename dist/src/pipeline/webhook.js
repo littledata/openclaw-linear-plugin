@@ -2338,8 +2338,6 @@ async function handleDispatch(api, linearApi, issue, opts) {
         worktreeBaseDir ??
         join(home, ".openclaw", "containers");
     const hostRoot = join(containersBase, identifier.replace(/[^a-zA-Z0-9_.-]/g, "-"));
-    const clawHostDir = join(hostRoot, ".claw");
-    const gitCredentialsFile = join(home, ".git-credentials");
     const worktreePath = hostRoot;
     const worktreeBranch = dispatchBranch;
     let containerName;
@@ -2359,7 +2357,7 @@ async function handleDispatch(api, linearApi, issue, opts) {
             lastUsedMs: nowMs,
         });
         for (const target of reviewTargets) {
-            const checkout = checkoutPullRequestInContainer(start.name, target.repoName, target.url, target.number);
+            const checkout = await checkoutPullRequestInContainer(start.name, target.repoName, target.url, target.number, pluginConfig);
             if (checkout.status !== 0) {
                 throw new Error(`could not check out ${target.url} in ${target.repoName}: ${checkout.stderr.slice(0, 300)}`);
             }

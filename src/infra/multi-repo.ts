@@ -55,6 +55,30 @@ export function getRepoEntries(pluginConfig?: Record<string, unknown>): Record<s
 }
 
 /**
+ * Resolve a configured repo key to the canonical GitHub `owner/repo` identity.
+ * Explicit per-repo identities win; otherwise `githubOwner` supplies the owner.
+ * @param repoName - key from the plugin's repos map
+ * @param pluginConfig - OpenClaw plugin configuration
+ * @returns canonical owner/repo identity
+ */
+export function resolveGitHubRepository(
+  repoName: string,
+  pluginConfig?: Record<string, unknown>,
+): string {
+  const entry = getRepoEntries(pluginConfig)[repoName];
+  if (entry?.hostname && entry.hostname.toLowerCase() !== "github.com") {
+    throw new Error(`GitHub App authentication does not support host ${entry.hostname} for ${repoName}`);
+  }
+  if (entry?.github && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(entry.github)) return entry.github;
+  const owner = typeof pluginConfig?.githubOwner === "string" ? pluginConfig.githubOwner.trim() : "";
+  if (!/^[A-Za-z0-9_.-]+$/.test(owner)) {
+    throw new Error(`No GitHub identity configured for ${repoName}; set repos.${repoName}.github or githubOwner`);
+  }
+  if (!/^[A-Za-z0-9_.-]+$/.test(repoName)) throw new Error(`Invalid GitHub repository name: ${repoName}`);
+  return `${owner}/${repoName}`;
+}
+
+/**
  * Build candidate repositories for Linear's issueRepositorySuggestions API.
  * Extracts GitHub identity from enriched repo entries.
  */

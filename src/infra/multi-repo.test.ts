@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { homedir } from "node:os";
 import path from "node:path";
-import { resolveRepos, isMultiRepo, validateRepoPath, getRepoEntries, buildCandidateRepositories, detectMentionedRepos, type RepoResolution } from "./multi-repo.ts";
+import { resolveRepos, isMultiRepo, validateRepoPath, getRepoEntries, buildCandidateRepositories, detectMentionedRepos, resolveGitHubRepository, type RepoResolution } from "./multi-repo.ts";
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
@@ -298,6 +298,27 @@ describe("detectMentionedRepos", () => {
   it("returns [] for empty text or no match", () => {
     expect(detectMentionedRepos("", repos)).toEqual([]);
     expect(detectMentionedRepos("nothing relevant here", repos)).toEqual([]);
+  });
+});
+
+describe("resolveGitHubRepository", () => {
+  it("prefers an explicit owner/repo identity", () => {
+    expect(resolveGitHubRepository("api", {
+      githubOwner: "fallback",
+      repos: { api: { path: "/repos/api", github: "littledata/special-api" } },
+    })).toBe("littledata/special-api");
+  });
+
+  it("uses githubOwner for legacy string repo entries", () => {
+    expect(resolveGitHubRepository("transaction-monitor-2", {
+      githubOwner: "littledata",
+      repos: { "transaction-monitor-2": "/repos/transaction-monitor-2" },
+    })).toBe("littledata/transaction-monitor-2");
+  });
+
+  it("fails closed when neither an explicit identity nor owner is configured", () => {
+    expect(() => resolveGitHubRepository("api", { repos: { api: "/repos/api" } }))
+      .toThrow("No GitHub identity configured");
   });
 });
 

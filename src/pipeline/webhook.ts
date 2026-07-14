@@ -10,7 +10,7 @@ import { createManagedFlowForDispatch } from "./taskflow-bridge.js";
 import { createNotifierFromConfig, type NotifyFn } from "../infra/notify.js";
 import { assessTier } from "./tier-assess.js";
 import { recommendRepos } from "./recommend-repos.js";
-import { startOrReuseContainer, buildContainerSpec, destroyContainer, stopContainerRun, containerNameForIssue, readGhTokenFromCredentials, checkoutPullRequestInContainer } from "../infra/container-runner.js";
+import { startOrReuseContainer, buildContainerSpec, destroyContainer, stopContainerRun, containerNameForIssue, checkoutPullRequestInContainer } from "../infra/container-runner.js";
 import { setContainerRecord, getContainerRecord, removeContainerRecord } from "../infra/container-registry.js";
 import { resolveRepos, getRepoEntries, resolveReposByNames, buildCandidateRepositories, detectMentionedRepos, type RepoResolution } from "../infra/multi-repo.js";
 import { repoSelectSignal, optionsSignal, RESUME_SELECT } from "./select-signal.js";
@@ -2640,8 +2640,6 @@ async function handleDispatch(
     (worktreeBaseDir as string | undefined) ??
     join(home, ".openclaw", "containers");
   const hostRoot = join(containersBase, identifier.replace(/[^a-zA-Z0-9_.-]/g, "-"));
-  const clawHostDir = join(hostRoot, ".claw");
-  const gitCredentialsFile = join(home, ".git-credentials");
   const worktreePath = hostRoot;
   const worktreeBranch = dispatchBranch;
   let containerName: string;
@@ -2664,11 +2662,12 @@ async function handleDispatch(
       lastUsedMs: nowMs,
     });
     for (const target of reviewTargets) {
-      const checkout = checkoutPullRequestInContainer(
+      const checkout = await checkoutPullRequestInContainer(
         start.name,
         target.repoName,
         target.url,
         target.number,
+        pluginConfig,
       );
       if (checkout.status !== 0) {
         throw new Error(

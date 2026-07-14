@@ -122,7 +122,7 @@ const {
   createMultiWorktreeMock: vi.fn().mockReturnValue({ parentPath: "/tmp/multi", worktrees: [] }),
   prepareWorkspaceMock: vi.fn().mockReturnValue({ pulled: true, submodulesInitialized: false, errors: [] }),
   startOrReuseContainerMock: vi.fn().mockReturnValue({ name: "openclaw-linear-ENG-123", reused: false }),
-  checkoutPullRequestInContainerMock: vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" }),
+  checkoutPullRequestInContainerMock: vi.fn().mockResolvedValue({ status: 0, stdout: "", stderr: "" }),
   resolveReposMock: vi.fn().mockReturnValue({ repos: [{ name: "main", path: "/home/claw/ai-workspace" }], source: "config_default" }),
   isMultiRepoMock: vi.fn().mockReturnValue(false),
   ensureClawDirMock: vi.fn(),
@@ -223,7 +223,6 @@ vi.mock("../infra/container-runner.js", () => ({
   destroyContainer: vi.fn(),
   stopContainerRun: vi.fn().mockReturnValue(false),
   containerNameForIssue: (id: string) => `openclaw-linear-${id}`,
-  readGhTokenFromCredentials: vi.fn().mockReturnValue("ght_test"),
   checkoutPullRequestInContainer: checkoutPullRequestInContainerMock,
 }));
 
@@ -442,7 +441,7 @@ afterEach(() => {
   createWorktreeMock.mockReset().mockReturnValue({ path: "/tmp/worktree", branch: "codex/ENG-123", resumed: false });
   prepareWorkspaceMock.mockReset().mockReturnValue({ pulled: true, submodulesInitialized: false, errors: [] });
   startOrReuseContainerMock.mockReset().mockReturnValue({ name: "openclaw-linear-ENG-123", reused: false });
-  checkoutPullRequestInContainerMock.mockReset().mockReturnValue({ status: 0, stdout: "", stderr: "" });
+  checkoutPullRequestInContainerMock.mockReset().mockResolvedValue({ status: 0, stdout: "", stderr: "" });
   resolveReposMock.mockReset().mockReturnValue({ repos: [{ name: "main", path: "/home/claw/ai-workspace" }], source: "config_default" });
   isMultiRepoMock.mockReset().mockReturnValue(false);
   ensureClawDirMock.mockReset();
@@ -2550,6 +2549,7 @@ describe("handleDispatch via Issue.update assignment", () => {
       "ld-shopify",
       pullRequestUrl,
       1740,
+      pluginConfig,
     );
     expect(runStatePlanMock).toHaveBeenCalledOnce();
     const [, registeredDispatch] = registerDispatchMock.mock.calls[0];

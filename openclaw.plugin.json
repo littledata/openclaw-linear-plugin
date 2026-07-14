@@ -39,6 +39,35 @@
       "codexBaseRepo": { "type": "string", "description": "Path to git repo for Codex worktrees", "default": "/home/claw/ai-workspace" },
       "executionMode": { "type": "string", "enum": ["worktree", "container"], "description": "Worker isolation mode. 'worktree' (default): git worktree off a shared local clone. 'container': a per-session Docker container that clones the repo fresh (removes shared git state → safe for concurrent dispatches on the same repo).", "default": "worktree" },
       "workerImage": { "type": "string", "description": "Docker image for container execution mode (built from docker/worker.Dockerfile).", "default": "openclaw-linear-worker:latest" },
+      "githubOwner": { "type": "string", "description": "Default GitHub organization for repo entries that omit an explicit github owner/repo identity." },
+      "githubApps": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Short-lived GitHub App identities used for trusted coding and review operations. Private keys stay on the gateway host.",
+        "properties": {
+          "coding": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["appId", "installationId", "privateKeyPath"],
+            "properties": {
+              "appId": { "type": "integer", "description": "LilCodingAgent GitHub App ID." },
+              "installationId": { "type": "integer", "description": "LilCodingAgent installation ID for the GitHub organization." },
+              "privateKeyPath": { "type": "string", "description": "Host path to the owner-only LilCodingAgent PEM private key." }
+            }
+          },
+          "reviewer": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["appId", "installationId", "privateKeyPath"],
+            "properties": {
+              "appId": { "type": "integer", "description": "LilReviewerAgent GitHub App ID." },
+              "installationId": { "type": "integer", "description": "LilReviewerAgent installation ID for the GitHub organization." },
+              "privateKeyPath": { "type": "string", "description": "Host path to the owner-only LilReviewerAgent PEM private key." }
+            }
+          }
+        },
+        "required": ["coding", "reviewer"]
+      },
       "workerBackend": { "type": "string", "enum": ["embedded", "codex"], "description": "Worker execution backend. 'embedded' (default): the in-process OpenClaw agent (subject to OpenClaw's exec/tool policy). 'codex': delegate all implementation to `codex exec` in its own --full-auto sandbox (no OpenClaw exec-approval gate) on the codex model — recommended when the embedded runner's writes are blocked by the exec policy.", "default": "embedded" },
       "grillMode": { "type": "string", "enum": ["off", "on"], "description": "When 'on', a dispatch first runs a /grill-me interview in the Agent Session (one question at a time) to establish which repo(s) the work belongs in and clarify requirements, BEFORE spawning the worker. The chosen repo(s) + implementation brief are passed to the worker. Default 'off'.", "default": "off" },
       "orchestrationMode": { "type": "string", "enum": ["single", "stateplan"], "description": "Dispatch pipeline. 'single' (default): the single-worker flow (worker → audit → rework). 'stateplan': the state-driven specialist pipeline — the ticket's Linear workflow state selects a phase plan (see statePlans). Todo/In Progress → Apex plans + routes implementers → they build via codex → Apex self-reviews → PR → move to Code Review; Code Review → Warden + Apex review gate → move to QA; QA → Proof QA gate → move to Done. Transitions are agent-decided (a phase failure never moves the ticket).", "default": "single" },
