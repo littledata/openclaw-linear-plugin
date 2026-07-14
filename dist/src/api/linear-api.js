@@ -290,6 +290,7 @@ export class LinearAgentApi {
           state { name type }
           creator { name email }
           assignee { name }
+          delegate { id name }
           labels { nodes { id name } }
           team { id key name issueEstimationType }
           comments(last: 10) {

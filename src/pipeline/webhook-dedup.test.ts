@@ -39,6 +39,7 @@ vi.mock("../api/linear-api.js", () => ({
 vi.mock("./active-session.js", () => ({
   setActiveSession: vi.fn(),
   clearActiveSession: vi.fn(),
+  getActiveSession: vi.fn().mockReturnValue(null),
   getIssueAffinity: vi.fn().mockReturnValue(null),
   _configureAffinityTtl: vi.fn(),
   _resetAffinityForTesting: vi.fn(),
@@ -256,7 +257,7 @@ describe("webhook deduplication", () => {
     expect(logs.some((l) => l.includes("skipping our own comment"))).toBe(true);
   });
 
-  it("skips duplicate Issue.update with same assignment", async () => {
+  it("keeps duplicate Issue.update events side-effect free while awaiting the session", async () => {
     const payload = {
       type: "Issue",
       action: "update",
@@ -281,12 +282,8 @@ describe("webhook deduplication", () => {
     await postWebhook(api2, payload);
 
     const secondLogs = infoLogs(api2);
-    // Should be skipped — content dedup ("already processed"/"no assignment"/"not us")
-    // or the early activeRuns guard ("active run") once the first dispatch claims it.
-    const skipped = secondLogs.some(
-      (l) => l.includes("already processed") || l.includes("no assignment") || l.includes("not us") || l.includes("active run"),
-    );
-    expect(skipped).toBe(true);
+    expect(secondLogs.some((l) => l.includes("awaiting Linear's new AgentSession.created"))).toBe(true);
+    expect(classifyIntent).not.toHaveBeenCalled();
   });
 
   it("skips AgentSessionEvent.created when activeRuns already has the issue", async () => {
@@ -309,8 +306,7 @@ describe("webhook deduplication", () => {
     await postWebhook(api, payload);
 
     const logs = infoLogs(api);
-    // Should hit the activeRuns guard FIRST (before wasRecentlyProcessed)
-    expect(logs.some((l) => l.includes("already running") && l.includes("ENG-505"))).toBe(true);
+    expect(logs.some((l) => l.includes("dispatch active") && l.includes("ENG-505"))).toBe(true);
   });
 
   it("ignores AppUserNotification events", async () => {

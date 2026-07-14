@@ -454,6 +454,7 @@ describe("LinearAgentApi", () => {
         estimate: 3,
         state: { name: "In Progress" },
         assignee: { name: "Alice" },
+        delegate: { id: "app-1", name: "Vasile" },
         labels: { nodes: [{ id: "l1", name: "bug" }] },
         team: { id: "t1", name: "Engineering", issueEstimationType: "fibonacci" },
         comments: {
@@ -485,6 +486,7 @@ describe("LinearAgentApi", () => {
       expect(result.estimate).toBe(3);
       expect(result.state.name).toBe("In Progress");
       expect(result.assignee?.name).toBe("Alice");
+      expect(result.delegate?.id).toBe("app-1");
       expect(result.labels.nodes).toHaveLength(1);
       expect(result.team.issueEstimationType).toBe("fibonacci");
       expect(result.comments.nodes).toHaveLength(1);
@@ -497,6 +499,7 @@ describe("LinearAgentApi", () => {
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
       expect(body.variables).toEqual({ id: "iss-1" });
       expect(body.query).toContain("attachments(first: 50)");
+      expect(body.query).toContain("delegate { id name }");
     });
   });
 

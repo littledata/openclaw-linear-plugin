@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { LinearAgentApi, resolveLinearToken } from "../api/linear-api.js";
 import { buildProjectContext, type HookContext } from "./pipeline.js";
-import { setActiveSession, clearActiveSession, getIssueAffinity, _configureAffinityTtl, _resetAffinityForTesting } from "./active-session.js";
+import { setActiveSession, clearActiveSession, getActiveSession, getIssueAffinity, _configureAffinityTtl, _resetAffinityForTesting } from "./active-session.js";
 import { readDispatchState, getActiveDispatch, registerDispatch, updateDispatchStatus, completeDispatch, removeActiveDispatch, type ActiveDispatch } from "./dispatch-state.js";
 import { createManagedFlowForDispatch } from "./taskflow-bridge.js";
 import { createNotifierFromConfig, type NotifyFn } from "../infra/notify.js";
@@ -80,10 +80,9 @@ function shouldBlockWorkRequest(
 // Track issues with active agent runs to prevent concurrent duplicate runs.
 const activeRuns = new Set<string>();
 /**
- * issue id → the Linear AgentSession id that Linear auto-created when the agent
- * was delegated the issue. The dispatch reuses it (instead of creating its own)
- * so the whole pipeline runs in ONE Linear session. Populated by the
- * AgentSessionEvent.created handler when it defers to an in-flight dispatch.
+ * issue id → a Linear AgentSession created by one of our own non-delegation
+ * handlers. This only bridges the race between createSessionOnIssue() and its
+ * created webhook; delegation sessions are passed directly to handleDispatch.
  */
 const linearSessionByIssue = new Map<string, string>();
 
@@ -286,44 +285,6 @@ async function postAgentComment(
   }
 }
 
-/**
- * Emit an input request in the Agent Session and mirror a durable, clickable
- * notice onto the issue. Linear can reuse an older awaiting-input session when
- * an issue is delegated again; without the issue notice the new prompt is easy
- * to miss because it lands in that existing session rather than a new panel.
- */
-async function emitVisibleElicitation(
-  api: OpenClawPluginApi,
-  linearApi: LinearAgentApi,
-  issueId: string,
-  sessionId: string | undefined,
-  body: string,
-  signal?: Parameters<LinearAgentApi["emitActivity"]>[2],
-): Promise<void> {
-  let emitted = false;
-  if (sessionId) {
-    try {
-      await linearApi.emitActivity(sessionId, { type: "elicitation", body }, signal);
-      emitted = true;
-    } catch (err) {
-      api.logger.warn(`Could not emit Agent Session elicitation ${sessionId}: ${err}`);
-    }
-  }
-
-  let sessionUrl: string | null = null;
-  if (emitted && sessionId) {
-    const sessions = await linearApi.listAgentSessions(issueId, { activityLimit: 1 }).catch(() => []);
-    sessionUrl = sessions.find((session) => session.id === sessionId)?.url ?? null;
-  }
-
-  const notice = sessionUrl
-    ? `**Input needed to continue**\n\n[Open the Vasile agent session and answer the pending question](${sessionUrl}).`
-    : `**Input needed to continue**\n\n${body}`;
-  await createCommentWithDedup(linearApi, issueId, notice).catch((err) => {
-    api.logger.warn(`Could not mirror Agent Session elicitation onto issue ${issueId}: ${err}`);
-  });
-}
-
 function resolveAgentId(api: OpenClawPluginApi): string {
   const fromConfig = (api as any).pluginConfig?.defaultAgentId;
   if (typeof fromConfig === "string" && fromConfig) return fromConfig;
@@ -398,10 +359,10 @@ export async function handleLinearWebhook(
     return true;
   }
 
-  // ── AgentSessionEvent.created — direct agent run ─────────────────
-  // User chatted with @ctclaw in Linear's agent session. Run the agent
-  // DIRECTLY with the user's message. The plan→implement→audit pipeline
-  // is only triggered from Issue.update delegation, not from chat.
+  // ── AgentSessionEvent.created — sole session entry point ────────────
+  // Linear creates a new session for both delegation and conversation. A
+  // delegation starts the plan→implement→audit pipeline in that exact new
+  // session; a mention/chat starts the conversational agent in its session.
   if (
     (payload.type === "AgentSessionEvent" && payload.action === "created") ||
     (payload.type === "AgentSession" && payload.action === "create")
@@ -418,21 +379,8 @@ export async function handleLinearWebhook(
       return true;
     }
 
-    // Guard: check activeRuns FIRST (O(1), no side effects).
-    // This catches sessions created by our own handlers (Comment dispatch,
-    // Issue triage, handleDispatch) which all set activeRuns BEFORE calling
-    // createSessionOnIssue(). Checking this first prevents the race condition
-    // where the webhook arrives before wasRecentlyProcessed is registered.
-    if (activeRuns.has(issue.id)) {
-      // A dispatch is already handling this issue. Capture the session Linear
-      // just created so the dispatch emits into it (one unified session) rather
-      // than creating its own, and skip the parallel conversational run.
-      linearSessionByIssue.set(issue.id, session.id);
-      api.logger.info(`Agent already running for ${issue?.identifier ?? issue?.id} — reusing session ${session.id} for the dispatch`);
-      return true;
-    }
-
-    // Secondary dedup: skip if we already handled this exact session ID
+    // Deduplicate only the exact session. Never deduplicate a fresh delegation
+    // by issue id: each delegation owns a newly-created Linear session.
     if (wasRecentlyProcessed(`session:${session.id}`)) {
       api.logger.info(`AgentSession ${session.id} already handled — skipping`);
       return true;
@@ -452,12 +400,16 @@ export async function handleLinearWebhook(
         type: "error",
         body: profilesError,
       }).catch(() => {});
-      // Also try posting as a comment in case emitActivity doesn't render markdown
-      try {
-        await createCommentWithDedup(linearApi, issue.id, profilesError);
-      } catch {}
       return true;
     }
+
+    // Linear owns the session lifecycle for mentions and delegations. Acknowledge
+    // this exact session immediately; all subsequent work for this invocation
+    // must stay attached to session.id.
+    await linearApi.emitActivity(session.id, {
+      type: "thought",
+      body: `Starting a new session for ${issue.identifier ?? issue.id}...`,
+    }, { ephemeral: true }).catch(() => {});
 
     const previousComments = payload.previousComments ?? [];
     const guidanceCtx = extractGuidance(payload);
@@ -534,6 +486,50 @@ export async function handleLinearWebhook(
       enrichedIssue = await linearApi.getIssueDetails(issue.id);
     } catch (err) {
       api.logger.warn(`Could not fetch issue details: ${err}`);
+    }
+
+    // Delegating an issue automatically creates this session. Start the full
+    // work pipeline from AgentSessionEvent.created, never from the parallel
+    // Issue.update webhook. A comment-backed session is an @mention/conversation,
+    // even when the issue happens to remain delegated to this app.
+    const viewerId = await linearApi.getViewerId();
+    const isDelegationSession =
+      !session?.comment &&
+      typeof viewerId === "string" &&
+      enrichedIssue?.delegate?.id === viewerId;
+    if (isDelegationSession) {
+      // A prior resume/grill gate deliberately holds activeRuns while waiting.
+      // A fresh delegation supersedes that parked interaction, but does not
+      // cancel a real in-flight implementation run.
+      const supersedesParkedInteraction = Boolean(
+        getResume(issue.id) || getGrill(issue.id),
+      );
+      clearPendingRepoSelection(issue.id);
+      clearGrill(issue.id);
+      clearResume(issue.id);
+      clearResumeHandled(issue.id);
+      if (supersedesParkedInteraction) activeRuns.delete(issue.id);
+      linearSessionByIssue.delete(issue.id);
+      api.logger.info(
+        `AgentSession ${session.id}: new delegation for ${issue.identifier ?? issue.id} — starting pipeline in this session`,
+      );
+      void handleDispatch(api, linearApi, enrichedIssue, {
+        existingSessionId: session.id,
+      }).catch((err) => {
+        api.logger.error(`Dispatch pipeline error for ${issue.identifier ?? issue.id}: ${err}`);
+      });
+      return true;
+    }
+
+    // A non-delegation handler may have proactively created this session while
+    // its run is already active. Capture that exact session without launching a
+    // duplicate conversational agent. Delegations have already returned above.
+    if (activeRuns.has(issue.id)) {
+      linearSessionByIssue.set(issue.id, session.id);
+      api.logger.info(
+        `AgentSession ${session.id}: dispatch active for ${issue.identifier ?? issue.id} — reusing this session, skipping conversational run`,
+      );
+      return true;
     }
 
     // Team-based agent routing: if no mention or affinity override, try team mapping
@@ -650,15 +646,6 @@ export async function handleLinearWebhook(
       `Respond within the scope defined above. Be concise and action-oriented.`,
     ].filter(Boolean).join("\n");
 
-    // Re-check: the Issue.update dispatch may have claimed this issue during the
-    // (multi-second) intent classification above. If so, reuse THIS session for
-    // the dispatch and skip the conversational run — avoids a duplicate session.
-    if (activeRuns.has(issue.id)) {
-      linearSessionByIssue.set(issue.id, session.id);
-      api.logger.info(`AgentSession ${session.id}: dispatch active for ${issue.identifier ?? issue.id} — reusing this session, skipping conversational run`);
-      return true;
-    }
-
     // Run agent directly (non-blocking)
     activeRuns.add(issue.id);
     void (async () => {
@@ -701,21 +688,15 @@ export async function handleLinearWebhook(
           ? result.output
           : `Something went wrong while processing this. The system will retry automatically if possible. If this keeps happening, run \`openclaw openclaw-linear doctor\` to check for issues.`;
 
-        // Emit response via session (preferred — avoids duplicate comment).
-        // Fall back to a regular comment only if emitActivity fails.
+        // Agent-session invocations communicate only through their session.
+        // Linear renders these activities in the session thread itself.
         const labeledResponse = `**[${label}]** ${responseBody}`;
-        const emitted = await linearApi.emitActivity(session.id, {
+        await linearApi.emitActivity(session.id, {
           type: "response",
           body: labeledResponse,
-        }).then(() => true).catch(() => false);
-
-        if (!emitted) {
-          const avatarUrl = profiles[agentId]?.avatarUrl;
-          const agentOpts = avatarUrl
-            ? { createAsUser: label, displayIconUrl: avatarUrl }
-            : undefined;
-          await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts);
-        }
+        }).catch((err) => {
+          api.logger.warn(`Could not emit response in AgentSession ${session.id}: ${err}`);
+        });
 
         api.logger.info(`Posted agent response to ${enrichedIssue?.identifier ?? issue.id} (session ${session.id})`);
       } catch (err) {
@@ -813,6 +794,16 @@ export async function handleLinearWebhook(
     // intentionally holds activeRuns. Record the answer and resume the dispatch.
     const resumePending = getResume(issue.id);
     const grillPending = getGrill(issue.id);
+    if (
+      !resumePending &&
+      grillPending?.agentSessionId &&
+      grillPending.agentSessionId !== session.id
+    ) {
+      api.logger.info(
+        `AgentSession prompted: ${session.id} is stale; grill belongs to ${grillPending.agentSessionId} — ignoring`,
+      );
+      return true;
+    }
     if (grillPending?.pendingQuestion && !resumePending) {
       const answer = typeof activityBody === "string" ? activityBody.trim() : "";
       if (answer) {
@@ -839,6 +830,15 @@ export async function handleLinearWebhook(
     // Runs BEFORE the activeRuns "ignore feedback" gate — the gate holds
     // activeRuns while parked, same as /grill-me.
     if (resumePending) {
+      if (
+        resumePending.agentSessionId &&
+        resumePending.agentSessionId !== session.id
+      ) {
+        api.logger.info(
+          `AgentSession prompted: ${session.id} is stale; resume gate belongs to ${resumePending.agentSessionId} — ignoring`,
+        );
+        return true;
+      }
       const reply = typeof activityBody === "string" ? activityBody.trim() : "";
       if (reply) {
         const decision = parseResumeDecision(reply);
@@ -909,6 +909,16 @@ export async function handleLinearWebhook(
     // 2. If active dispatch with tmux session → route to steering orchestrator
     const tmuxSession = getActiveTmuxSession(issue.id);
     if (tmuxSession) {
+      const activeSession = getActiveSession(issue.id);
+      if (
+        activeSession?.agentSessionId &&
+        activeSession.agentSessionId !== session.id
+      ) {
+        api.logger.info(
+          `AgentSession prompted: ${session.id} is stale; active work belongs to ${activeSession.agentSessionId} — ignoring`,
+        );
+        return true;
+      }
       const userText = activityBody;
       if (!userText || typeof userText !== "string" || !userText.trim()) {
         api.logger.info(`AgentSession prompted: ${session.id} — tmux active but empty user message, ignoring`);
@@ -1546,21 +1556,13 @@ export async function handleLinearWebhook(
     }
 
     const trigger = isDelegatedToUs ? "delegated" : "assigned";
-    api.logger.info(`Issue ${trigger} to our app user (${viewerId}), executing pipeline`);
-
-    // Secondary dedup: catch duplicate webhooks that both passed the activeRuns
-    // check before either could register (belt-and-suspenders with the sync guard).
-    const dedupKey = `${trigger}:${issue.id}:${viewerId}`;
-    if (wasRecentlyProcessed(dedupKey)) {
-      api.logger.info(`${trigger} ${issue.id} -> ${viewerId} already processed — skipping`);
-      return true;
-    }
-
-    // Assignment triggers the full dispatch pipeline:
-    // tier assessment → worktree → plan → implement → audit
-    void handleDispatch(api, linearApi, issue).catch((err) => {
-      api.logger.error(`Dispatch pipeline error for ${issue.identifier ?? issue.id}: ${err}`);
-    });
+    // Linear automatically creates a fresh AgentSession for a delegation. The
+    // corresponding AgentSessionEvent.created webhook is the sole work entry
+    // point, guaranteeing that every run is bound to the new session rather
+    // than racing this webhook and reusing an older awaiting-input session.
+    api.logger.info(
+      `Issue ${trigger} to our app user (${viewerId}) — awaiting Linear's new AgentSession.created event`,
+    );
 
     return true;
   }
@@ -2302,10 +2304,12 @@ async function handleDispatch(
       const planState = await readPlanningState(planStatePath);
       if (isInPlanningMode(planState, planProjectId)) {
         api.logger.info(`dispatch: ${identifier} is in planning-mode project — skipping`);
-        await createCommentWithDedup(linearApi,
-          issue.id,
-          `**Can't dispatch yet** — this project is in planning mode.\n\n**To continue:** Comment on the planning issue with your requirements, then say **"finalize plan"** when ready.\n\n**To cancel planning:** Comment **"abandon"** on the planning issue.`,
-        );
+        const body = `**Can't dispatch yet** — this project is in planning mode.\n\n**To continue:** Comment on the planning issue with your requirements, then say **"finalize plan"** when ready.\n\n**To cancel planning:** Comment **"abandon"** on the planning issue.`;
+        if (opts?.existingSessionId) {
+          await linearApi.emitActivity(opts.existingSessionId, { type: "response", body }).catch(() => {});
+        } else {
+          await createCommentWithDedup(linearApi, issue.id, body);
+        }
         return;
       }
     }
@@ -2325,10 +2329,12 @@ async function handleDispatch(
     if (!isStale && inMemory) {
       // Truly still running in this gateway process
       api.logger.info(`dispatch: ${identifier} actively running (status: ${existing.status}, age: ${Math.round(ageMs / 1000)}s) — skipping`);
-      await createCommentWithDedup(linearApi,
-        issue.id,
-        `**Already running** as **${existing.tier}** — status: **${existing.status}**, started ${Math.round(ageMs / 60_000)}m ago.\n\nWorktree: \`${existing.worktreePath}\`\n\n**Options:**\n- Check progress: \`/dispatch status ${identifier}\`\n- Force restart: \`/dispatch retry ${identifier}\` (only works when stuck)\n- Escalate: \`/dispatch escalate ${identifier} "reason"\``,
-      );
+      const body = `**Already running** as **${existing.tier}** — status: **${existing.status}**, started ${Math.round(ageMs / 60_000)}m ago.\n\nWorktree: \`${existing.worktreePath}\`\n\n**Options:**\n- Check progress: \`/dispatch status ${identifier}\`\n- Force restart: \`/dispatch retry ${identifier}\` (only works when stuck)\n- Escalate: \`/dispatch escalate ${identifier} "reason"\``;
+      if (opts?.existingSessionId) {
+        await linearApi.emitActivity(opts.existingSessionId, { type: "response", body }).catch(() => {});
+      } else {
+        await createCommentWithDedup(linearApi, issue.id, body);
+      }
       return;
     }
 
@@ -2344,12 +2350,17 @@ async function handleDispatch(
   // 2. Prevent concurrent runs on same issue
   if (activeRuns.has(issue.id)) {
     api.logger.info(`@dispatch: ${identifier} has active agent run — skipping`);
+    if (opts?.existingSessionId) {
+      await linearApi.emitActivity(opts.existingSessionId, {
+        type: "response",
+        body: `A run is already active for **${identifier}**. This new session will not start a concurrent implementation.`,
+      }).catch(() => {});
+    }
     return;
   }
-  // Claim the issue NOW (not at step 6). Linear fires AgentSessionEvent.created
-  // on delegation, racing this dispatch; claiming here blocks that handler from
-  // spawning a second, conversational agent during the multi-second assessment.
-  // Cleaned up on any early-return failure path below.
+  // Claim the issue before assessment so duplicate invocations cannot start a
+  // second pipeline while this session is being prepared. Cleaned up on every
+  // early-return failure path below.
   activeRuns.add(issue.id);
 
   // 3. Fetch full issue details for tier assessment
@@ -2450,9 +2461,7 @@ async function handleDispatch(
       try {
         const created = await linearApi.createSessionOnIssue(issue.id);
         rsid = created.sessionId ?? undefined;
-      } catch {
-        // emitVisibleElicitation posts the question as an issue comment below.
-      }
+      } catch { /* best effort */ }
     }
     if (rsid !== pendingResume.agentSessionId) {
       saveResume({ ...pendingResume, agentSessionId: rsid });
@@ -2461,7 +2470,9 @@ async function handleDispatch(
       ? `\n\n**My understanding of where it stands:**\n\n${pendingResume.analyzedBrief.trim()}`
       : "";
     const ask = `I found prior work waiting on **${identifier}**.${understanding}\n\nReply **resume** to continue from that plan, or **fresh** to start over.`;
-    await emitVisibleElicitation(api, linearApi, issue.id, rsid, ask, RESUME_SELECT);
+    if (rsid) {
+      await linearApi.emitActivity(rsid, { type: "elicitation", body: ask }, RESUME_SELECT).catch(() => {});
+    }
     api.logger.info(`@dispatch: ${identifier} resume-gate — existing decision still pending; re-surfaced resume/fresh prompt (activeRuns held)`);
     return;
   }
@@ -2499,7 +2510,9 @@ async function handleDispatch(
       ].filter(Boolean).join(", ");
       const understanding = analysis.brief || prior.summary;
       const ask = `I found prior work on **${identifier}**${counts ? ` (${counts})` : ""}.\n\n**My understanding of where it stands:**\n\n${understanding}\n\nReply **resume** to continue from that plan, or **fresh** to start over.`;
-      await emitVisibleElicitation(api, linearApi, issue.id, rsid, ask, RESUME_SELECT);
+      if (rsid) {
+        await linearApi.emitActivity(rsid, { type: "elicitation", body: ask }, RESUME_SELECT).catch(() => {});
+      }
       saveResume({
         issueId: issue.id,
         issueIdentifier: identifier,
@@ -2669,14 +2682,13 @@ async function handleDispatch(
       if (!gsid) {
         try { const sr = await linearApi.createSessionOnIssue(issue.id); gsid = sr.sessionId ?? undefined; } catch { /* best effort */ }
       }
-      await emitVisibleElicitation(
-        api,
-        linearApi,
-        issue.id,
-        gsid,
-        step.question,
-        optionsSignal(step.options ?? []),
-      );
+      if (gsid) {
+        await linearApi.emitActivity(
+          gsid,
+          { type: "elicitation", body: step.question },
+          optionsSignal(step.options ?? []),
+        ).catch(() => {});
+      }
       saveGrill({
         issueId: issue.id,
         issueIdentifier: identifier,
@@ -2764,16 +2776,18 @@ async function handleDispatch(
   } catch (err) {
     api.logger.error(`@dispatch: container start failed: ${err}`);
     activeRuns.delete(issue.id); // release the early claim on failure
-    await createCommentWithDedup(linearApi,
-      issue.id,
-      `**Dispatch failed** — couldn't prepare the ticket container.\n\n> ${String(err).slice(0, 300)}\n\n**What to try:**\n- Re-assign this issue to retry\n- Check the gateway logs`,
-    );
+    const body = `**Dispatch failed** — couldn't prepare the ticket container.\n\n> ${String(err).slice(0, 300)}\n\n**What to try:**\n- Re-assign this issue to retry\n- Check the gateway logs`;
+    if (opts?.existingSessionId) {
+      await linearApi.emitActivity(opts.existingSessionId, { type: "error", body }).catch(() => {});
+    } else {
+      await createCommentWithDedup(linearApi, issue.id, body);
+    }
     return;
   }
 
-  // 6. Reuse the Linear session — an explicit opt, or the one Linear auto-created
-  // on delegation that the created-handler captured — so the whole pipeline runs
-  // in ONE session. Only create a fresh session as a last resort.
+  // 6. Use the explicit delegation session, or a session created by one of the
+  // non-delegation dispatch paths. Only create one as a last resort for callers
+  // that did not originate from AgentSessionEvent.created.
   activeRuns.add(issue.id);
   let agentSessionId: string | undefined = opts?.existingSessionId ?? linearSessionByIssue.get(issue.id);
   if (!agentSessionId) {

@@ -394,6 +394,7 @@ export class LinearAgentApi {
     state: { name: string; type: string };
     creator: { name: string; email: string | null } | null;
     assignee: { name: string } | null;
+    delegate: { id: string; name: string } | null;
     labels: { nodes: Array<{ id: string; name: string }> };
     team: { id: string; key: string; name: string; issueEstimationType: string };
     comments: { nodes: Array<{ body: string; user: { name: string } | null; createdAt: string }> };
@@ -413,6 +414,7 @@ export class LinearAgentApi {
           state { name type }
           creator { name email }
           assignee { name }
+          delegate { id name }
           labels { nodes { id name } }
           team { id key name issueEstimationType }
           comments(last: 10) {
