@@ -33,6 +33,7 @@ import { getActiveTmuxSession } from "../infra/tmux-runner.js";
 import { capturePane } from "../infra/tmux.js";
 import { loadCodingConfig, resolveToolName } from "../tools/code-tool.js";
 import { clearCancel } from "./cancellation.js";
+import { _resetCodexSteeringForTesting, isCodexHarnessSteeringEnabled, steerActiveCodexRun, stopActiveCodexRun, } from "../agent/codex-steering.js";
 // ── Prompt input sanitization ─────────────────────────────────────
 /**
  * Sanitize user-controlled text before embedding in agent prompts.
@@ -129,6 +130,7 @@ export function _resetForTesting() {
     _sweepIntervalMs = 10_000;
     _resetGuidanceCacheForTesting();
     _resetAffinityForTesting();
+    _resetCodexSteeringForTesting();
 }
 // ── Feedback loop prevention for steering ─────────────────────────────
 // Track recently emitted activity body hashes to prevent our own emissions
@@ -622,6 +624,7 @@ export async function handleLinearWebhook(api, req, res) {
                     sessionId,
                     message,
                     timeoutMs: 5 * 60_000,
+                    abortKey: issue.id,
                     streaming: {
                         linearApi,
                         agentSessionId: session.id,
@@ -678,6 +681,15 @@ export async function handleLinearWebhook(api, req, res) {
         if (stopSignal === "stop") {
             const stopIdentifier = issue.identifier ?? issue.id;
             api.logger.info(`AgentSession prompted: STOP signal for ${stopIdentifier}`);
+            const stopApi = createLinearApi(api);
+            const codexStopped = stopApi
+                ? await stopActiveCodexRun({
+                    api,
+                    linearApi: stopApi,
+                    issueId: issue.id,
+                    linearSessionId: session.id,
+                })
+                : false;
             // Abort in-flight EMBEDDED runs (reviewers) AND the codex process inside
             // the container. The container is LEFT RUNNING (warm) so the next message
             // can continue in the same workspace.
@@ -690,7 +702,7 @@ export async function handleLinearWebhook(api, req, res) {
             pausedIssues.add(issue.id);
             pauseGenerations.set(issue.id, (pauseGenerations.get(issue.id) ?? 0) + 1);
             const codexKilled = stopContainerRun(containerNameForIssue(stopIdentifier));
-            const halted = abortedRuns > 0 || codexKilled;
+            const halted = codexStopped || abortedRuns > 0 || codexKilled;
             // Keep the dispatch record: it owns the selected repos, current phase,
             // Linear session, stable OpenClaw session ids, and warm container needed
             // by the next prompted turn.
@@ -698,7 +710,6 @@ export async function handleLinearWebhook(api, req, res) {
             clearPendingRepoSelection(issue.id);
             clearGrill(issue.id);
             clearLegacyResumeState(issue.id);
-            const stopApi = createLinearApi(api);
             if (stopApi) {
                 const stopBody = halted
                     ? `🛑 Paused — halted the running turn for ${stopIdentifier}. Reply in this session to continue with the same context and workspace.`
@@ -759,6 +770,29 @@ export async function handleLinearWebhook(api, req, res) {
                         repoOverride: grillPending.repos?.length ? grillPending.repos : undefined,
                     }).catch((err) => api.logger.error(`grill continuation failed: ${err}`));
                 }
+                return true;
+            }
+        }
+        // An opt-in Codex harness run owns this exact Linear session. Route the
+        // message through OpenClaw's generic /steer command: active Codex turns
+        // receive turn/steer, pending request_user_input consumes it as an answer,
+        // and review/compaction rejection is deferred as a normal prompt.
+        if (activeRuns.has(issue.id) &&
+            isCodexHarnessSteeringEnabled(pluginConfig)) {
+            const userText = typeof activityBody === "string" ? activityBody.trim() : "";
+            const steeringApi = createLinearApi(api);
+            if (userText && steeringApi && steerActiveCodexRun({
+                api,
+                linearApi: steeringApi,
+                issueId: issue.id,
+                linearSessionId: session.id,
+                message: sanitizePromptInput(userText),
+            })) {
+                await steeringApi.emitActivity(session.id, {
+                    type: "thought",
+                    body: "Steering the active Codex run with your follow-up...",
+                }, { ephemeral: true }).catch(() => { });
+                api.logger.info(`AgentSession prompted: ${session.id} issue=${issue.identifier ?? issue.id} — queued on active Codex harness run`);
                 return true;
             }
         }
@@ -1002,6 +1036,7 @@ export async function handleLinearWebhook(api, req, res) {
                     sessionId,
                     message,
                     timeoutMs: 5 * 60_000,
+                    abortKey: issue.id,
                     streaming: {
                         linearApi,
                         agentSessionId: session.id,

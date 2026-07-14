@@ -3,6 +3,11 @@ import { createServer } from "node:http";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearGrill, getGrill, saveGrill } from "./grill-state.js";
+import {
+  bindActiveCodexRun,
+  buildLinearCodexSessionKey,
+  drainCodexControls,
+} from "../agent/codex-steering.js";
 
 // ── Hoisted mock values ──────────────────────────────────────────────
 const {
@@ -316,6 +321,15 @@ import {
 } from "./webhook.js";
 
 function createApi(pluginConfig: Record<string, unknown> = {}): OpenClawPluginApi {
+  const buildContext = vi.fn((input: any) => ({
+    ...input,
+    SessionKey: input.route.routeSessionKey,
+    CommandBody: input.message.commandBody,
+  }));
+  const dispatchReplyWithBufferedBlockDispatcher = vi.fn(async ({ dispatcherOptions }: any) => {
+    await dispatcherOptions.deliver({ text: "steered current session." });
+    return { queuedFinal: false, counts: {} };
+  });
   return {
     logger: {
       info: vi.fn(),
@@ -323,7 +337,13 @@ function createApi(pluginConfig: Record<string, unknown> = {}): OpenClawPluginAp
       error: vi.fn(),
       debug: vi.fn(),
     },
-    runtime: {},
+    runtime: {
+      config: { current: vi.fn().mockReturnValue({}) },
+      channel: {
+        inbound: { buildContext },
+        reply: { dispatchReplyWithBufferedBlockDispatcher },
+      },
+    },
     pluginConfig,
   } as unknown as OpenClawPluginApi;
 }
@@ -1233,6 +1253,74 @@ describe("AgentSessionEvent.prompted full flow", () => {
     expect(result.status).toBe(200);
     const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
     expect(infoCalls.some((msg: string) => msg.includes("agent active, no tmux, ignoring (feedback)"))).toBe(true);
+  });
+
+  it("steers a follow-up into the same active Codex harness session", async () => {
+    _addActiveRunForTesting("issue-steer");
+    const binding = bindActiveCodexRun({
+      issueId: "issue-steer",
+      linearSessionId: "sess-steer",
+      agentId: "apex",
+      openClawSessionId: "linear-impl-ENG-STEER",
+      sessionKey: buildLinearCodexSessionKey("apex", "sess-steer"),
+      runId: "run-steer",
+    });
+
+    const result = await postWebhook({
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "sess-steer",
+        issue: { id: "issue-steer", identifier: "ENG-STEER" },
+      },
+      agentActivity: { content: { type: "prompt", body: "also cover the retry path" } },
+    }, "/linear/webhook", { enableCodexHarnessSteering: true });
+    await drainCodexControls(binding);
+
+    expect(result.status).toBe(200);
+    expect((result.api.runtime.channel.inbound.buildContext as any)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        route: expect.objectContaining({
+          routeSessionKey: "agent:apex:linear:direct:sess-steer",
+        }),
+        message: expect.objectContaining({
+          commandBody: "/steer also cover the retry path",
+        }),
+      }),
+    );
+    expect(runAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("routes a stop signal to /codex stop before completing the Linear session", async () => {
+    _addActiveRunForTesting("issue-codex-stop");
+    bindActiveCodexRun({
+      issueId: "issue-codex-stop",
+      linearSessionId: "sess-codex-stop",
+      agentId: "apex",
+      openClawSessionId: "linear-impl-ENG-STOP",
+      sessionKey: buildLinearCodexSessionKey("apex", "sess-codex-stop"),
+      runId: "run-stop",
+    });
+
+    const result = await postWebhook({
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "sess-codex-stop",
+        issue: { id: "issue-codex-stop", identifier: "ENG-STOP" },
+      },
+      agentActivity: { signal: "stop", content: { type: "prompt", body: "do not steer this" } },
+    }, "/linear/webhook", { enableCodexHarnessSteering: true });
+
+    const buildContext = result.api.runtime.channel.inbound.buildContext as any;
+    expect(buildContext).toHaveBeenCalledWith(expect.objectContaining({
+      message: expect.objectContaining({ commandBody: "/codex stop" }),
+    }));
+    expect(buildContext.mock.calls[0][0].message.commandBody).not.toContain("steer");
+    expect(mockLinearApiInstance.completeSession).toHaveBeenCalledWith(
+      "sess-codex-stop",
+      expect.stringContaining("Reply in this session"),
+    );
   });
 
   it("deduplicates by webhookId", async () => {

@@ -40,6 +40,13 @@ describe("implementerUsesContainerAgent", () => {
     expect(implementerUsesContainerAgent({ workerBackend: "codex" })).toBe(false);
   });
 
+  it("uses the continuous container agent when Codex harness steering is enabled", () => {
+    expect(implementerUsesContainerAgent({
+      workerBackend: "codex",
+      enableCodexHarnessSteering: true,
+    })).toBe(true);
+  });
+
   it("uses the embedded container agent by default or when configured", () => {
     expect(implementerUsesContainerAgent()).toBe(true);
     expect(implementerUsesContainerAgent({ workerBackend: "embedded" })).toBe(true);

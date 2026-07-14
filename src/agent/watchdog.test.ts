@@ -94,6 +94,28 @@ describe("InactivityWatchdog", () => {
     expect(wd.wasKilled).toBe(false);
   });
 
+  it("pauses while waiting for user input and resumes on the next tick", () => {
+    const onKill = vi.fn();
+    const wd = new InactivityWatchdog({
+      inactivityMs: 5_000,
+      label: "test",
+      logger: makeLogger(),
+      onKill,
+    });
+
+    wd.start();
+    vi.advanceTimersByTime(4_000);
+    wd.pause();
+    vi.advanceTimersByTime(20_000);
+    expect(onKill).not.toHaveBeenCalled();
+
+    wd.tick();
+    vi.advanceTimersByTime(4_000);
+    expect(onKill).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(2_000);
+    expect(onKill).toHaveBeenCalledOnce();
+  });
+
   it("wasKilled is true after kill", () => {
     const onKill = vi.fn();
     const wd = new InactivityWatchdog({

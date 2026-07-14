@@ -51,6 +51,7 @@ import {
 import { resolveTargetState, type StatePlan, type PlanPhase } from "./state-plan.js";
 import { isCancelled, clearCancel } from "./cancellation.js";
 import { getActiveSession } from "./active-session.js";
+import { isCodexHarnessSteeringEnabled } from "../agent/codex-steering.js";
 
 interface OrchIssue {
   id: string;
@@ -200,10 +201,16 @@ async function runRole(
   extra: string | undefined,
   issue: OrchIssue,
 ): Promise<RoleRunResult> {
-  // Reviews are always executed by Codex inside the ticket container. Embedded
-  // reviewers can see connector tools and previously drifted into many serial
-  // GitHub fetches instead of inspecting the already-prepared local checkout.
-  const backend = phase === "review" ? "codex" : resolveRoleBackend(role, ctx.pluginConfig);
+  // With harness steering enabled, every specialist runs through OpenClaw's
+  // embedded Codex app-server turn and operates on the ticket container via
+  // container_* tools. Otherwise preserve the direct in-container Codex review
+  // path that avoids connector-based serial GitHub reads.
+  const harnessSteering = isCodexHarnessSteeringEnabled(ctx.pluginConfig);
+  const backend = harnessSteering
+    ? "embedded"
+    : phase === "review"
+      ? "codex"
+      : resolveRoleBackend(role, ctx.pluginConfig);
   const system = buildRolePrompt(role, { identifier: dispatch.issueIdentifier, phase, backend, extra });
   const task = buildRoleTask(issue, dispatch, extra);
 
@@ -349,7 +356,7 @@ async function runApexPlan(
  * @returns true when the container-agent path should be used
  */
 export function implementerUsesContainerAgent(cfg?: Record<string, unknown>): boolean {
-  return cfg?.workerBackend !== "codex";
+  return isCodexHarnessSteeringEnabled(cfg) || cfg?.workerBackend !== "codex";
 }
 
 /**

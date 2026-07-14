@@ -228,4 +228,58 @@ describe("review verdict recovery", () => {
       expect.objectContaining({ type: "response", body: expect.stringContaining("parameterize the query") }),
     );
   });
+
+  it("uses the steerable embedded Codex harness for container-local review when opted in", async () => {
+    runAgentMock.mockResolvedValue({ success: true, output: "SECURITY: pass" });
+    const emitActivity = vi.fn().mockResolvedValue(undefined);
+    const updateIssue = vi.fn().mockResolvedValue(true);
+    const ctx = {
+      api: { logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } },
+      linearApi: {
+        getIssueDetails: vi.fn().mockResolvedValue({ title: "Review", team: { id: "team-1" } }),
+        emitActivity,
+        createComment: vi.fn().mockResolvedValue("comment-1"),
+        updateIssue,
+      },
+      notify: vi.fn().mockResolvedValue(undefined),
+      pluginConfig: { enableCodexHarnessSteering: true },
+    } as any;
+    const dispatch = {
+      issueId: "issue-1",
+      issueIdentifier: "CORE-1750",
+      issueTitle: "Review",
+      worktreePath: "/tmp/openclaw-linear-review-test",
+      branch: "CORE-1750/review",
+      tier: "medium",
+      model: "test-model",
+      status: "dispatched",
+      dispatchedAt: "2026-07-15T10:00:00.000Z",
+      attempt: 0,
+      agentSessionId: "session-1",
+      containerName: "openclaw-linear-CORE-1750",
+      containerRepos: ["transaction-monitor-2"],
+      reviewPullRequests: [{
+        url: "https://github.com/littledata/transaction-monitor-2/pull/1750",
+        repoName: "transaction-monitor-2",
+        repository: "littledata/transaction-monitor-2",
+        number: 1750,
+      }],
+    } as any;
+
+    await runStatePlan(ctx, dispatch, {
+      stateLabel: "code-review",
+      phases: [{ type: "review", role: "warden", gate: true }],
+      onSuccess: null,
+    });
+
+    expect(execCodexMock).not.toHaveBeenCalled();
+    expect(runAgentMock).toHaveBeenCalledWith(expect.objectContaining({
+      agentId: "warden",
+      abortKey: "issue-1",
+      issueIdentifier: "CORE-1750",
+      readOnly: true,
+      streaming: expect.objectContaining({ agentSessionId: "session-1" }),
+    }));
+    expect(publishPullRequestReviewMock).toHaveBeenCalledTimes(1);
+  });
 });

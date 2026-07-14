@@ -18,6 +18,7 @@ import { parse as parseYaml } from "yaml";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type { LinearAgentApi, ActivityContent } from "../api/linear-api.js";
 import { runAgent } from "../agent/agent.js";
+import { isCodexHarnessSteeringEnabled } from "../agent/codex-steering.js";
 import { runCodex } from "../tools/codex-tool.js";
 import { setActiveSession, clearActiveSession } from "./active-session.js";
 import { getCachedGuidanceForTeam, isGuidanceEnabled } from "./guidance.js";
@@ -1064,10 +1065,12 @@ export async function spawnWorker(
   //    session. codex runs inside tmux, so the STOP handler's killActiveSession
   //    can abort it. `workerAgentId` still drives phase/task-flow bookkeeping above.
   //  - "embedded" (default, upstream behavior): the in-process OpenClaw agent,
-  //    subject to OpenClaw's tool/exec policy.
+  //    subject to OpenClaw's tool/exec policy. The opt-in Codex harness
+  //    steering setting also selects this path so OpenClaw owns the live turn.
   const workerBackend = (pluginConfig?.workerBackend as string) ?? "embedded";
+  const useCodexHarness = isCodexHarnessSteeringEnabled(pluginConfig as Record<string, unknown> | undefined);
   let result: { success: boolean; output: string; error?: string; watchdogKilled?: boolean };
-  if (workerBackend === "codex") {
+  if (workerBackend === "codex" && !useCodexHarness) {
     result = await runCodex(api, {
       prompt: `${workerPrompt.system}\n\n${workerPrompt.task}`,
       workingDir: dispatch.worktreePath,

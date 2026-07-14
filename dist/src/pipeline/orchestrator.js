@@ -26,6 +26,7 @@ import { ROLES, resolveRole, implementerRoles, buildRolePrompt, parseReviewVerdi
 import { resolveTargetState } from "./state-plan.js";
 import { isCancelled, clearCancel } from "./cancellation.js";
 import { getActiveSession } from "./active-session.js";
+import { isCodexHarnessSteeringEnabled } from "../agent/codex-steering.js";
 /** Max bounded rework attempts (config `maxReworkAttempts`, default 2). */
 function maxRework(pluginConfig) {
     const v = pluginConfig?.maxReworkAttempts;
@@ -117,10 +118,16 @@ function buildRoleTask(issue, dispatch, extra) {
  * @returns the run result (success + text output)
  */
 async function runRole(ctx, dispatch, role, phase, extra, issue) {
-    // Reviews are always executed by Codex inside the ticket container. Embedded
-    // reviewers can see connector tools and previously drifted into many serial
-    // GitHub fetches instead of inspecting the already-prepared local checkout.
-    const backend = phase === "review" ? "codex" : resolveRoleBackend(role, ctx.pluginConfig);
+    // With harness steering enabled, every specialist runs through OpenClaw's
+    // embedded Codex app-server turn and operates on the ticket container via
+    // container_* tools. Otherwise preserve the direct in-container Codex review
+    // path that avoids connector-based serial GitHub reads.
+    const harnessSteering = isCodexHarnessSteeringEnabled(ctx.pluginConfig);
+    const backend = harnessSteering
+        ? "embedded"
+        : phase === "review"
+            ? "codex"
+            : resolveRoleBackend(role, ctx.pluginConfig);
     const system = buildRolePrompt(role, { identifier: dispatch.issueIdentifier, phase, backend, extra });
     const task = buildRoleTask(issue, dispatch, extra);
     emit(ctx, dispatch, { type: "thought", body: `[${role.label}] starting ${phase} (${backend})` });
@@ -255,7 +262,7 @@ async function runApexPlan(ctx, dispatch, issue) {
  * @returns true when the container-agent path should be used
  */
 export function implementerUsesContainerAgent(cfg) {
-    return cfg?.workerBackend !== "codex";
+    return isCodexHarnessSteeringEnabled(cfg) || cfg?.workerBackend !== "codex";
 }
 /**
  * Run ONE OpenClaw agent that implements the issue inside its per-ticket

@@ -16,6 +16,8 @@ vi.mock("./watchdog.js", () => ({
     silenceMs = 0;
     start() {}
     tick() {}
+    pause() {}
+    resume() {}
     stop() {}
   },
   resolveWatchdogConfig: (...args: any[]) => mockResolveWatchdogConfig(...args),
@@ -432,10 +434,62 @@ describe("embedded tool activity projection", () => {
       "Repository shell commands are allowed only through the container_* tools",
     );
     expect(runEmbeddedPiAgent.mock.calls[0][0].extraSystemPrompt).not.toContain("Do not run shell commands");
+    expect(runEmbeddedPiAgent.mock.calls[0][0]).not.toHaveProperty("agentHarnessRuntimeOverride");
   });
 
   it("pretty-prints JSON and caps oversized values", () => {
     expect(formatToolActivityValue('{"a":1}', 100)).toBe('{\n  "a": 1\n}');
     expect(formatToolActivityValue("abcdefgh", 4)).toContain("abcd\n…(4 more characters)");
+  });
+
+  it("opts into the Codex harness, binds the stable session, and emits native input as elicitation", async () => {
+    const api = createApi() as any;
+    api.pluginConfig = {
+      enableCodexHarnessSteering: true,
+      codexHarnessModel: "openai/gpt-5.3-codex",
+    };
+    const emitActivity = vi.fn().mockResolvedValue(undefined);
+    const upsertSessionEntry = vi.fn().mockResolvedValue(undefined);
+    const runEmbeddedPiAgent = vi.fn().mockImplementation(async (opts: any) => {
+      await opts.onBlockReply({ text: "Codex needs input:\n1. Use migration A\n2. Use migration B" });
+      return { payloads: [{ text: "done" }], meta: { durationMs: 10 } };
+    });
+    api.runtime.agent = {
+      defaults: { provider: "openrouter", model: "test-model" },
+      session: { upsertSessionEntry },
+      runEmbeddedPiAgent,
+    };
+
+    const result = await runAgent({
+      api,
+      agentId: "apex",
+      sessionId: "linear-apex-CORE-1-0",
+      message: "review",
+      abortKey: "issue-1",
+      streaming: { linearApi: { emitActivity } as any, agentSessionId: "linear-session-1" },
+    });
+
+    expect(result.success).toBe(true);
+    expect(runEmbeddedPiAgent).toHaveBeenCalledWith(expect.objectContaining({
+      sessionKey: "agent:apex:linear:direct:linear-session-1",
+      agentHarnessRuntimeOverride: "codex",
+      provider: "openai",
+      model: "gpt-5.3-codex",
+    }));
+    expect(upsertSessionEntry).toHaveBeenCalledWith(expect.objectContaining({
+      sessionKey: "agent:apex:linear:direct:linear-session-1",
+      entry: expect.objectContaining({
+        sessionId: "linear-apex-CORE-1-0",
+        agentRuntimeOverride: "codex",
+      }),
+    }));
+    expect(emitActivity).toHaveBeenCalledWith(
+      "linear-session-1",
+      {
+        type: "elicitation",
+        body: "Codex needs input:\n1. Use migration A\n2. Use migration B",
+      },
+      undefined,
+    );
   });
 });
