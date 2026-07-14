@@ -526,7 +526,17 @@ describe("LinearAgentApi", () => {
                   },
                 }],
               },
+              // Linear returns these newest-first; the API wrapper should make
+              // the result chronological for deterministic handoff selection.
               activities: { nodes: [{
+                createdAt: "2026-07-13T10:02:00Z",
+                signal: null,
+                content: {
+                  __typename: "AgentActivityResponseContent",
+                  type: "response",
+                  body: "Implementation complete",
+                },
+              }, {
                 createdAt: "2026-07-13T10:01:00Z",
                 signal: null,
                 content: {
@@ -555,6 +565,10 @@ describe("LinearAgentApi", () => {
         action: "container_exec",
         parameter: "git diff",
         result: "clean",
+      });
+      expect(sessions[0].activities[1].content).toEqual({
+        type: "response",
+        body: "Implementation complete",
       });
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
       expect(body.query).toContain("agentSessions(first: 20)");

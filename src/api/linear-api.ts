@@ -706,10 +706,15 @@ export class LinearAgentApi {
           plan: formatAgentPlan(s.plan),
           url: s.url ?? null,
           pullRequests: (s.pullRequests?.nodes ?? []).map((node) => node.pullRequest).filter(Boolean),
-          activities: (s.activities?.nodes ?? []).map((activity) => {
-            const { __typename: _typename, ...content } = activity.content;
-            return { ...activity, content: content as AgentActivityContent };
-          }),
+          // Linear currently returns activity nodes newest-first. Normalize to
+          // chronological order so callers can reliably use reverse() for the
+          // terminal activity and slice(-N) for the newest bounded handoff.
+          activities: (s.activities?.nodes ?? [])
+            .map((activity) => {
+              const { __typename: _typename, ...content } = activity.content;
+              return { ...activity, content: content as AgentActivityContent };
+            })
+            .sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
         }))
         .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)); // newest first
     } catch (err) {
