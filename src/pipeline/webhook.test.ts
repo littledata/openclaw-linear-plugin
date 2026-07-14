@@ -34,6 +34,7 @@ const {
   getActiveDispatchMock,
   registerDispatchMock,
   updateDispatchStatusMock,
+  updateDispatchProgressMock,
   completeDispatchMock,
   removeActiveDispatchMock,
   assessTierMock,
@@ -116,6 +117,7 @@ const {
   getActiveDispatchMock: vi.fn().mockReturnValue(null),
   registerDispatchMock: vi.fn().mockResolvedValue(undefined),
   updateDispatchStatusMock: vi.fn().mockResolvedValue(undefined),
+  updateDispatchProgressMock: vi.fn().mockResolvedValue(null),
   completeDispatchMock: vi.fn().mockResolvedValue(undefined),
   removeActiveDispatchMock: vi.fn().mockResolvedValue(undefined),
   assessTierMock: vi.fn().mockResolvedValue({ tier: "medium", model: "anthropic/claude-sonnet-4-6", reasoning: "moderate complexity" }),
@@ -197,6 +199,7 @@ vi.mock("./dispatch-state.js", () => ({
   getActiveDispatch: getActiveDispatchMock,
   registerDispatch: registerDispatchMock,
   updateDispatchStatus: updateDispatchStatusMock,
+  updateDispatchProgress: updateDispatchProgressMock,
   completeDispatch: completeDispatchMock,
   removeActiveDispatch: removeActiveDispatchMock,
 }));
@@ -295,6 +298,7 @@ vi.mock("../infra/notify.js", () => ({
 
 vi.mock("../agent/agent.js", () => ({
   runAgent: runAgentMock,
+  abortRunsFor: vi.fn().mockReturnValue(0),
 }));
 
 import {
@@ -461,6 +465,7 @@ afterEach(() => {
   getActiveDispatchMock.mockReset().mockReturnValue(null);
   registerDispatchMock.mockReset().mockResolvedValue(undefined);
   updateDispatchStatusMock.mockReset().mockResolvedValue(undefined);
+  updateDispatchProgressMock.mockReset().mockResolvedValue(null);
   removeActiveDispatchMock.mockReset().mockResolvedValue(undefined);
   assessTierMock.mockReset().mockResolvedValue({ tier: "medium", model: "anthropic/claude-sonnet-4-6", reasoning: "moderate complexity" });
   createWorktreeMock.mockReset().mockReturnValue({ path: "/tmp/worktree", branch: "codex/ENG-123", resumed: false });
@@ -1053,6 +1058,90 @@ describe("AgentSessionEvent.created full flow", () => {
 // ---------------------------------------------------------------------------
 
 describe("AgentSessionEvent.prompted full flow", () => {
+  it("marks STOPped work paused without deleting its dispatch", async () => {
+    const result = await postWebhook({
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "sess-pause",
+        issue: { id: "issue-pause", identifier: "ENG-PAUSE" },
+      },
+      agentActivity: { signal: "stop" },
+    });
+
+    expect(result.status).toBe(200);
+    expect(updateDispatchProgressMock).toHaveBeenCalledWith(
+      "ENG-PAUSE",
+      expect.objectContaining({ status: "paused" }),
+      undefined,
+    );
+    expect(removeActiveDispatchMock).not.toHaveBeenCalled();
+    expect(mockLinearApiInstance.emitActivity).toHaveBeenCalledWith(
+      "sess-pause",
+      expect.objectContaining({ body: expect.stringContaining("Reply in this session") }),
+    );
+  });
+
+  it("resumes a paused dispatch in the same Linear and OpenClaw implementation session", async () => {
+    const pausedDispatch = {
+      issueId: "issue-resume",
+      issueIdentifier: "ENG-RESUME",
+      issueTitle: "Resume me",
+      worktreePath: "/tmp/ENG-RESUME",
+      branch: "core-eng-resume",
+      tier: "medium",
+      model: "test-model",
+      status: "paused",
+      dispatchedAt: new Date().toISOString(),
+      agentSessionId: "sess-resume",
+      attempt: 0,
+      containerName: "openclaw-linear-ENG-RESUME",
+      containerRepos: ["api"],
+      phaseIndex: 0,
+    };
+    getActiveDispatchMock.mockReturnValue(pausedDispatch);
+    updateDispatchProgressMock.mockResolvedValue({ ...pausedDispatch, status: "working" });
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: "issue-resume",
+      identifier: "ENG-RESUME",
+      title: "Resume me",
+      description: "Implement the feature",
+      state: { name: "In Progress", type: "started" },
+      team: { id: "team-resume" },
+    });
+
+    const result = await postWebhook({
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "sess-resume",
+        issue: { id: "issue-resume", identifier: "ENG-RESUME" },
+      },
+      agentActivity: { content: { body: "Continue, but leave Elasticsearch to the infrastructure repo." } },
+      webhookId: "wh-resume-1",
+    });
+
+    expect(result.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(runStatePlanMock).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        issueIdentifier: "ENG-RESUME",
+        agentSessionId: "sess-resume",
+        containerName: "openclaw-linear-ENG-RESUME",
+      }),
+      expect.objectContaining({ phases: [{ type: "plan-implement" }] }),
+      expect.objectContaining({
+        resume: true,
+        resumeGuidance: "Continue, but leave Elasticsearch to the infrastructure repo.",
+      }),
+    );
+    expect(runAgentMock).not.toHaveBeenCalled();
+    expect(setActiveSessionMock).toHaveBeenCalledWith(
+      expect.objectContaining({ agentSessionId: "sess-resume", issueIdentifier: "ENG-RESUME" }),
+    );
+  });
+
   it("responds 200 and ignores when session/issue data is missing", async () => {
     const result = await postWebhook({
       type: "AgentSessionEvent",

@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { runAgentMock, checkoutPullRequestMock, publishPullRequestReviewMock } = vi.hoisted(() => ({
+const { runAgentMock, checkoutPullRequestMock, publishPullRequestReviewMock, updateDispatchProgressMock } = vi.hoisted(() => ({
   runAgentMock: vi.fn(),
   checkoutPullRequestMock: vi.fn(),
   publishPullRequestReviewMock: vi.fn(),
+  updateDispatchProgressMock: vi.fn(),
 }));
 
 vi.mock("../agent/agent.js", () => ({
@@ -20,6 +21,10 @@ vi.mock("../infra/container-runner.js", async (importOriginal) => {
   };
 });
 
+vi.mock("./dispatch-state.js", () => ({
+  updateDispatchProgress: updateDispatchProgressMock,
+}));
+
 import { runStatePlan } from "./orchestrator.js";
 
 describe("review verdict recovery", () => {
@@ -27,6 +32,7 @@ describe("review verdict recovery", () => {
     runAgentMock.mockReset();
     checkoutPullRequestMock.mockReset().mockResolvedValue({ status: 0, stdout: "", stderr: "" });
     publishPullRequestReviewMock.mockReset().mockResolvedValue({ status: 0, stdout: "", stderr: "" });
+    updateDispatchProgressMock.mockReset().mockResolvedValue(undefined);
   });
 
   it("asks the reviewer for a format-only correction when a successful review omits its verdict line", async () => {

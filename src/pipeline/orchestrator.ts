@@ -30,7 +30,7 @@ import {
   WORK_ROOT,
 } from "../infra/container-runner.js";
 import { readManifest, writeManifest, updateManifest, savePlan, saveWorkerOutput, appendLog } from "./artifacts.js";
-import type { ActiveDispatch } from "./dispatch-state.js";
+import { updateDispatchProgress, type ActiveDispatch } from "./dispatch-state.js";
 import type { HookContext } from "./pipeline.js";
 import type { ActivityContent } from "../api/linear-api.js";
 import {
@@ -72,6 +72,14 @@ interface RoleRunResult {
 interface StructuredReviewResult extends ReviewVerdict {
   output: string;
   infrastructureFailure?: boolean;
+}
+
+/** Optional continuation data when a stopped state plan resumes. */
+export interface StatePlanRunOptions {
+  /** User direction for the first resumed phase. */
+  resumeGuidance?: string;
+  /** Resume at the persisted phase rather than restarting the whole plan. */
+  resume?: boolean;
 }
 
 /** Max bounded rework attempts (config `maxReworkAttempts`, default 2). */
@@ -409,9 +417,19 @@ async function runImplementPhase(
   ctx: HookContext,
   dispatch: ActiveDispatch,
   issue: OrchIssue,
+  resumeGuidance?: string,
 ): Promise<{ success: boolean; reason?: string }> {
   const limit = maxRework(ctx.pluginConfig);
-  let assignments = await runApexPlan(ctx, dispatch, issue);
+  let assignments = resumeGuidance
+    ? [{
+      role: "spine",
+      task: [
+        "Continue the existing implementation in the preserved ticket workspace and OpenClaw session.",
+        "Inspect the current work before changing it; do not restart completed work.",
+        `User continuation: ${resumeGuidance}`,
+      ].join("\n"),
+    }]
+    : await runApexPlan(ctx, dispatch, issue);
   let lastReason = "";
   const useContainerAgent = implementerUsesContainerAgent(ctx.pluginConfig);
 
@@ -767,12 +785,17 @@ async function runReviewPhase(
   issue: OrchIssue,
   role: RoleDef,
   gate: boolean,
+  resumeGuidance?: string,
 ): Promise<{ success: boolean; reason?: string }> {
   const syncFailure = await syncReviewSandbox(ctx, dispatch);
   if (syncFailure) {
     return { success: false, reason: `${role.label} review sandbox sync failed: ${syncFailure}` };
   }
-  const verdict = await runStructuredReview(ctx, dispatch, issue, role, reviewFocus(role));
+  const focus = [
+    reviewFocus(role),
+    resumeGuidance ? `User continuation after pausing: ${resumeGuidance}` : "",
+  ].filter(Boolean).join("\n\n");
+  const verdict = await runStructuredReview(ctx, dispatch, issue, role, focus);
   emit(ctx, dispatch, {
     type: "thought",
     body: `${verdict.pass ? "✅" : "❌"} ${role.label} review — ${verdict.pass ? "pass" : "fail"}: ${verdict.reason}`,
@@ -828,6 +851,7 @@ export async function runStatePlan(
   ctx: HookContext,
   dispatch: ActiveDispatch,
   plan: StatePlan,
+  options: StatePlanRunOptions = {},
 ): Promise<void> {
   const details = await ctx.linearApi.getIssueDetails(dispatch.issueId).catch(() => null);
   const issue: OrchIssue = {
@@ -838,30 +862,66 @@ export async function runStatePlan(
     teamId: details?.team?.id,
   };
 
-  // Fresh run — drop any stale halt flag from a prior (stopped) dispatch.
+  // A resumed turn deliberately clears the STOP flag while retaining the same
+  // Linear session, OpenClaw session ids, repos, and container.
   clearCancel(dispatch.issueId);
+  const startPhaseIndex = options.resume && typeof dispatch.phaseIndex === "number"
+    ? Math.min(Math.max(dispatch.phaseIndex, 0), Math.max(plan.phases.length - 1, 0))
+    : 0;
+  await updateDispatchProgress(
+    dispatch.issueIdentifier,
+    { status: "working", phaseIndex: startPhaseIndex, pausedAt: null },
+    ctx.configPath,
+  ).catch((err) => {
+    ctx.api.logger.warn(`[orchestrator] could not persist resume state for ${issue.identifier}: ${err}`);
+  });
   ensureManifest(dispatch);
-  setStatus(dispatch, "orchestrating");
+  setStatus(dispatch, options.resume ? "resuming" : "orchestrating");
   emit(ctx, dispatch, {
     type: "thought",
-    body: `Orchestrating "${plan.stateLabel}" — ${plan.phases.length} phase(s)`,
+    body: options.resume
+      ? `Resuming "${plan.stateLabel}" at phase ${startPhaseIndex + 1}/${plan.phases.length}`
+      : `Orchestrating "${plan.stateLabel}" — ${plan.phases.length} phase(s)`,
   });
   ctx.api.logger.info(
     `[orchestrator] ${issue.identifier} plan=${plan.stateLabel} phases=${plan.phases.map((p) => p.role ?? p.type).join(",")}`,
   );
 
   try {
-    for (const phase of plan.phases) {
+    for (let phaseIndex = startPhaseIndex; phaseIndex < plan.phases.length; phaseIndex++) {
+      const phase = plan.phases[phaseIndex];
+      dispatch.phaseIndex = phaseIndex;
+      await updateDispatchProgress(
+        dispatch.issueIdentifier,
+        { status: "working", phaseIndex, pausedAt: null },
+        ctx.configPath,
+      ).catch((err) => {
+        ctx.api.logger.warn(`[orchestrator] could not persist phase ${phaseIndex} for ${issue.identifier}: ${err}`);
+      });
       // Honor a STOP requested between phases — bail cleanly, don't advance.
       if (isCancelled(dispatch.issueId)) {
         setStatus(dispatch, "cancelled");
-        endSession(ctx, dispatch, "response", "🛑 Halted — stopped before completing the pipeline. Re-assign or comment to start again.");
+        await updateDispatchProgress(
+          dispatch.issueIdentifier,
+          { status: "paused", phaseIndex, pausedAt: new Date().toISOString() },
+          ctx.configPath,
+        ).catch(() => {});
         return;
       }
-      const result = await runPhase(ctx, dispatch, issue, phase);
+      const result = await runPhase(
+        ctx,
+        dispatch,
+        issue,
+        phase,
+        phaseIndex === startPhaseIndex ? options.resumeGuidance : undefined,
+      );
       if (result.reason === "halted") {
         setStatus(dispatch, "cancelled");
-        endSession(ctx, dispatch, "response", "🛑 Halted mid-phase — stopped the running work. Re-assign or comment to start again.");
+        await updateDispatchProgress(
+          dispatch.issueIdentifier,
+          { status: "paused", phaseIndex, pausedAt: new Date().toISOString() },
+          ctx.configPath,
+        ).catch(() => {});
         return;
       }
       if (!result.success) {
@@ -929,14 +989,15 @@ async function runPhase(
   dispatch: ActiveDispatch,
   issue: OrchIssue,
   phase: PlanPhase,
+  resumeGuidance?: string,
 ): Promise<{ success: boolean; reason?: string }> {
   if (phase.type === "plan-implement") {
-    return runImplementPhase(ctx, dispatch, issue);
+    return runImplementPhase(ctx, dispatch, issue, resumeGuidance);
   }
   if (phase.type === "review") {
     const role = phase.role ? resolveRole(phase.role) : undefined;
     if (!role) return { success: false, reason: `unknown review role "${phase.role}"` };
-    return runReviewPhase(ctx, dispatch, issue, role, phase.gate !== false);
+    return runReviewPhase(ctx, dispatch, issue, role, phase.gate !== false, resumeGuidance);
   }
   if (phase.type === "product") {
     const role = phase.role ? resolveRole(phase.role) : undefined;
@@ -945,7 +1006,10 @@ async function runPhase(
       role.id === "helm"
         ? "Turn this feature idea into a crisp product brief with goals, scope, and acceptance criteria."
         : "Define the metrics, funnels, and measurement plan for this feature.";
-    const { success, output } = await runRole(ctx, dispatch, role, "product", focus, issue);
+    const productFocus = [focus, resumeGuidance ? `User continuation after pausing: ${resumeGuidance}` : ""]
+      .filter(Boolean)
+      .join("\n\n");
+    const { success, output } = await runRole(ctx, dispatch, role, "product", productFocus, issue);
     if (success) await comment(ctx, dispatch, `## 📄 ${role.label}\n\n${output.slice(0, 4000)}`);
     return { success };
   }

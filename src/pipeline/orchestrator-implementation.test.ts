@@ -1,9 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { runAgentMock, execCodexMock, containerGitStatusMock } = vi.hoisted(() => ({
+const { runAgentMock, execCodexMock, containerGitStatusMock, openPrMock, updateDispatchProgressMock } = vi.hoisted(() => ({
   runAgentMock: vi.fn(),
   execCodexMock: vi.fn(),
   containerGitStatusMock: vi.fn(),
+  openPrMock: vi.fn(),
+  updateDispatchProgressMock: vi.fn(),
 }));
 
 vi.mock("../agent/agent.js", () => ({
@@ -17,8 +19,13 @@ vi.mock("../infra/container-runner.js", async (importOriginal) => {
     ...actual,
     execCodexInContainer: execCodexMock,
     containerGitStatus: containerGitStatusMock,
+    openPrInContainer: openPrMock,
   };
 });
+
+vi.mock("./dispatch-state.js", () => ({
+  updateDispatchProgress: updateDispatchProgressMock,
+}));
 
 import { runStatePlan } from "./orchestrator.js";
 
@@ -34,6 +41,8 @@ describe("plan-implement no-change guard", () => {
       lastCommit: "abc base",
       commitsAhead: 0,
     });
+    openPrMock.mockReset().mockResolvedValue("https://github.com/littledata/api/pull/1");
+    updateDispatchProgressMock.mockReset().mockResolvedValue(undefined);
   });
 
   it("does not launch Apex self-review after a successful but empty implementation", async () => {
@@ -76,5 +85,60 @@ describe("plan-implement no-change guard", () => {
       "issue-1",
       expect.stringContaining("no changes produced"),
     );
+  });
+
+  it("continues a paused implementation through the stable OpenClaw session", async () => {
+    runAgentMock
+      .mockReset()
+      .mockResolvedValueOnce({ success: true, output: "Continued the existing implementation." })
+      .mockResolvedValueOnce({ success: true, output: "REVIEW: pass" });
+    containerGitStatusMock.mockReturnValue({
+      hasChanges: true,
+      lastCommit: "def resumed work",
+      commitsAhead: 1,
+    });
+    const ctx = {
+      api: { logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } },
+      linearApi: {
+        getIssueDetails: vi.fn().mockResolvedValue({ title: "Implement", team: { id: "team-1" } }),
+        emitActivity: vi.fn().mockResolvedValue(undefined),
+        createComment: vi.fn().mockResolvedValue("comment-1"),
+      },
+      notify: vi.fn().mockResolvedValue(undefined),
+      pluginConfig: { workerBackend: "embedded", maxReworkAttempts: 0 },
+    } as any;
+    const dispatch = {
+      issueId: "issue-resume",
+      issueIdentifier: "CORE-RESUME",
+      issueTitle: "Implement",
+      worktreePath: "/tmp/openclaw-linear-resume-test",
+      branch: "CORE-RESUME/work",
+      tier: "medium",
+      model: "test-model",
+      status: "paused",
+      dispatchedAt: "2026-07-14T10:00:00.000Z",
+      attempt: 0,
+      phaseIndex: 0,
+      agentSessionId: "linear-session-resume",
+      containerName: "openclaw-linear-CORE-RESUME",
+      containerRepos: ["api"],
+    } as any;
+
+    await runStatePlan(ctx, dispatch, {
+      stateLabel: "in-progress",
+      phases: [{ type: "plan-implement" }],
+      onSuccess: null,
+    }, {
+      resume: true,
+      resumeGuidance: "Continue, but leave Elasticsearch to infrastructure.",
+    });
+
+    expect(runAgentMock.mock.calls[0][0]).toMatchObject({
+      sessionId: "linear-impl-CORE-RESUME",
+      issueIdentifier: "CORE-RESUME",
+      message: expect.stringContaining("Continue, but leave Elasticsearch to infrastructure."),
+    });
+    expect(runAgentMock.mock.calls[0][0].message).toContain("Continue the existing implementation");
+    expect(openPrMock).toHaveBeenCalled();
   });
 });

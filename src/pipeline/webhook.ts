@@ -5,7 +5,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { LinearAgentApi, resolveLinearToken } from "../api/linear-api.js";
 import { buildProjectContext, type HookContext } from "./pipeline.js";
 import { setActiveSession, clearActiveSession, getActiveSession, getIssueAffinity, _configureAffinityTtl, _resetAffinityForTesting } from "./active-session.js";
-import { readDispatchState, getActiveDispatch, registerDispatch, updateDispatchStatus, completeDispatch, removeActiveDispatch, type ActiveDispatch } from "./dispatch-state.js";
+import { readDispatchState, getActiveDispatch, registerDispatch, updateDispatchStatus, updateDispatchProgress, completeDispatch, removeActiveDispatch, type ActiveDispatch } from "./dispatch-state.js";
 import { createManagedFlowForDispatch } from "./taskflow-bridge.js";
 import { createNotifierFromConfig, type NotifyFn } from "../infra/notify.js";
 import { assessTier } from "./tier-assess.js";
@@ -38,6 +38,7 @@ import { loadAgentProfiles, buildMentionPattern, resolveAgentFromAlias, validate
 import { getActiveTmuxSession } from "../infra/tmux-runner.js";
 import { capturePane } from "../infra/tmux.js";
 import { loadCodingConfig, resolveToolName } from "../tools/code-tool.js";
+import { clearCancel } from "./cancellation.js";
 
 // ── Prompt input sanitization ─────────────────────────────────────
 
@@ -79,6 +80,13 @@ function shouldBlockWorkRequest(
 
 // Track issues with active agent runs to prevent concurrent duplicate runs.
 const activeRuns = new Set<string>();
+// A STOP follow-up can arrive while the aborted pipeline is still unwinding.
+// Claim resumes separately so duplicate prompted webhooks cannot start two turns.
+const resumingRuns = new Set<string>();
+// Fast-path marker set synchronously by STOP. Persistent dispatch state remains
+// authoritative across restarts, but this avoids an async lookup before the
+// active-run/dedup gates on ordinary prompted webhooks.
+const pausedIssues = new Set<string>();
 /**
  * issue id → a Linear AgentSession created by one of our own non-delegation
  * handlers. This only bridges the race between createSessionOnIssue() and its
@@ -121,6 +129,8 @@ function wasRecentlyProcessed(key: string): boolean {
 /** @internal — test-only; clears all in-memory dedup state. */
 export function _resetForTesting(): void {
   activeRuns.clear();
+  resumingRuns.clear();
+  pausedIssues.clear();
   recentlyProcessed.clear();
   recentlyEmittedActivities.clear();
   _resetProfilesCacheForTesting();
@@ -759,12 +769,17 @@ export async function handleLinearWebhook(
       // killing the current sub-run alone lets its loop spawn the next one.
       const { requestCancel } = await import("./cancellation.js");
       requestCancel(issue.id);
+      pausedIssues.add(issue.id);
       const codexKilled = stopContainerRun(containerNameForIssue(stopIdentifier));
       const halted = abortedRuns > 0 || codexKilled;
-      activeRuns.delete(issue.id);
-      try {
-        await removeActiveDispatch(stopIdentifier, pluginConfig?.dispatchStatePath as string | undefined);
-      } catch { /* best effort */ }
+      // Keep the dispatch record: it owns the selected repos, current phase,
+      // Linear session, stable OpenClaw session ids, and warm container needed
+      // by the next prompted turn.
+      await updateDispatchProgress(
+        stopIdentifier,
+        { status: "paused", pausedAt: new Date().toISOString() },
+        pluginConfig?.dispatchStatePath as string | undefined,
+      ).catch((err) => api.logger.warn(`Could not persist paused dispatch for ${stopIdentifier}: ${err}`));
       clearPendingRepoSelection(issue.id);
       clearGrill(issue.id);
       clearLegacyResumeState(issue.id);
@@ -773,8 +788,8 @@ export async function handleLinearWebhook(
         await stopApi.emitActivity(session.id, {
           type: "response",
           body: halted
-            ? `🛑 Stopped — halted the running work and cleared the dispatch for ${stopIdentifier}. Re-assign or comment to start again.`
-            : `🛑 Stop received for ${stopIdentifier} — no active work was running; cleared any pending dispatch state.`,
+            ? `🛑 Paused — halted the running turn for ${stopIdentifier}. Reply in this session to continue with the same context and workspace.`
+            : `🛑 Pause received for ${stopIdentifier}. Reply in this session to continue with the same context and workspace.`,
         }).catch(() => {});
       }
       return true;
@@ -794,6 +809,13 @@ export async function handleLinearWebhook(
     if (isOurFeedback) {
       api.logger.info(`AgentSession prompted: ${session.id} — feedback from own activity (${activityType ?? "hash-match"}), ignoring`);
       return true;
+    }
+
+    // STOP marks this synchronously, so a fast follow-up can queue a resume even
+    // while the aborted pipeline is still unwinding and activeRuns remains set.
+    if (pausedIssues.has(issue.id)) {
+      if (await routePausedPrompt(api, session, issue, activityBody, pluginConfig)) return true;
+      pausedIssues.delete(issue.id);
     }
 
     // ── /grill-me: the user answered an interview question ──
@@ -873,6 +895,10 @@ export async function handleLinearWebhook(
       api.logger.info(`AgentSession prompted: webhook ${webhookId} already processed — skipping`);
       return true;
     }
+
+    // Persistent fallback after a gateway restart, when the in-memory paused
+    // marker is gone but the dispatch record still owns the resumable session.
+    if (await routePausedPrompt(api, session, issue, activityBody, pluginConfig)) return true;
 
     // Extract user message from the activity (not from promptContext which contains issue data + guidance)
     const guidanceCtxPrompted = extractGuidance(payload);
@@ -2850,6 +2876,184 @@ async function handleDispatch(
       activeRuns.delete(issue.id);
       clearActiveSession(issue.id);
     });
+}
+
+/**
+ * Detect and route a prompted message when persistent dispatch state says the
+ * issue is paused. Returns false for ordinary follow-ups so normal routing can
+ * continue.
+ * @param api - OpenClaw plugin API
+ * @param session - prompted Linear Agent Session
+ * @param issue - Linear issue reference from the webhook
+ * @param activityBody - prompted activity body
+ * @param pluginConfig - plugin configuration
+ * @returns true when the prompt belongs to a paused dispatch
+ */
+async function routePausedPrompt(
+  api: OpenClawPluginApi,
+  session: any,
+  issue: any,
+  activityBody: unknown,
+  pluginConfig?: Record<string, unknown>,
+): Promise<boolean> {
+  const identifier = (issue.identifier ?? issue.id) as string;
+  const state = await readDispatchState(
+    pluginConfig?.dispatchStatePath as string | undefined,
+  ).catch(() => null);
+  const dispatch = state ? getActiveDispatch(state, identifier) : null;
+  if (dispatch?.status !== "paused") return false;
+
+  const userMessage = typeof activityBody === "string" ? activityBody.trim() : "";
+  if (!userMessage) {
+    api.logger.info(`AgentSession prompted: ${session.id} — paused dispatch but empty continuation, ignoring`);
+    return true;
+  }
+  if (dispatch.agentSessionId && dispatch.agentSessionId !== session.id) {
+    api.logger.info(
+      `AgentSession prompted: ${session.id} is stale; paused work belongs to ${dispatch.agentSessionId} — ignoring`,
+    );
+    return true;
+  }
+
+  const linearApi = createLinearApi(api);
+  if (!linearApi) {
+    api.logger.error("No Linear access token configured");
+    return true;
+  }
+  api.logger.info(`AgentSession prompted: ${session.id} — resuming paused dispatch ${identifier}`);
+  void resumePausedDispatch(api, linearApi, session, issue, userMessage, pluginConfig)
+    .catch((err) => api.logger.error(`Paused dispatch resume failed for ${identifier}: ${err}`));
+  return true;
+}
+
+/**
+ * Wait for an interrupted run to finish unwinding before starting its resumed
+ * turn. STOP aborts the model immediately, but its async pipeline still needs a
+ * moment to observe cancellation and release the issue claim.
+ * @param issueId - Linear issue id used by the active-run registry
+ * @param timeoutMs - maximum time to wait for the old turn
+ * @returns true once the old turn released its claim
+ */
+async function waitForRunToSettle(issueId: string, timeoutMs = 30_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (activeRuns.has(issueId) && Date.now() < deadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+  }
+  return !activeRuns.has(issueId);
+}
+
+/**
+ * Resume a STOPped dispatch as another turn in the same Linear Agent Session,
+ * stable OpenClaw role session, and warm ticket container.
+ * @param api - OpenClaw plugin API
+ * @param linearApi - authenticated Linear API
+ * @param session - prompted Linear Agent Session
+ * @param issue - Linear issue reference from the webhook
+ * @param userMessage - continuation instructions from the user
+ * @param pluginConfig - plugin configuration
+ */
+async function resumePausedDispatch(
+  api: OpenClawPluginApi,
+  linearApi: LinearAgentApi,
+  session: any,
+  issue: any,
+  userMessage: string,
+  pluginConfig?: Record<string, unknown>,
+): Promise<void> {
+  const issueId = issue.id as string;
+  const identifier = (issue.identifier ?? issue.id) as string;
+  if (resumingRuns.has(issueId)) {
+    api.logger.info(`Paused dispatch resume already claimed for ${identifier}`);
+    return;
+  }
+  resumingRuns.add(issueId);
+  let claimedActiveRun = false;
+
+  try {
+    if (!(await waitForRunToSettle(issueId))) {
+      await linearApi.emitActivity(session.id, {
+        type: "error",
+        body: `Could not resume ${identifier}: the stopped turn did not finish shutting down. Please retry.`,
+      }).catch(() => {});
+      return;
+    }
+
+    const statePath = pluginConfig?.dispatchStatePath as string | undefined;
+    const state = await readDispatchState(statePath);
+    const persisted = getActiveDispatch(state, identifier);
+    if (!persisted || persisted.status !== "paused") {
+      api.logger.info(`Paused dispatch ${identifier} disappeared before resume`);
+      return;
+    }
+    if (persisted.agentSessionId && persisted.agentSessionId !== session.id) {
+      api.logger.info(`Paused dispatch ${identifier} belongs to a different Linear session`);
+      return;
+    }
+
+    const details = await linearApi.getIssueDetails(issueId).catch(() => issue);
+    const workflowState = {
+      name: details?.state?.name ?? "In Progress",
+      type: details?.state?.type ?? "started",
+    };
+    const plan = resolveStatePlan(workflowState, pluginConfig);
+    if (!plan) {
+      await linearApi.emitActivity(session.id, {
+        type: "error",
+        body: `Could not resume ${identifier}: no pipeline is configured for "${workflowState.name}".`,
+      }).catch(() => {});
+      return;
+    }
+
+    clearCancel(issueId);
+    const dispatch = await updateDispatchProgress(
+      identifier,
+      { status: "working", pausedAt: null, agentSessionId: session.id },
+      statePath,
+    );
+    if (!dispatch) return;
+    pausedIssues.delete(issueId);
+
+    const agentId = resolveAgentId(api);
+    setActiveSession({
+      agentSessionId: session.id,
+      issueIdentifier: identifier,
+      issueId,
+      agentId,
+      startedAt: Date.now(),
+    });
+    activeRuns.add(issueId);
+    claimedActiveRun = true;
+
+    await linearApi.emitActivity(session.id, {
+      type: "thought",
+      body: `Continuing ${identifier} in the existing agent session and ticket workspace...`,
+    }).catch(() => {});
+
+    const notify: NotifyFn = createNotifierFromConfig(pluginConfig, api.runtime, api);
+    const hookCtx: HookContext = {
+      api,
+      linearApi,
+      notify,
+      pluginConfig,
+      configPath: statePath,
+    };
+    await runStatePlan(hookCtx, dispatch, plan, {
+      resume: true,
+      resumeGuidance: sanitizePromptInput(userMessage),
+    });
+  } catch (err) {
+    api.logger.error(`Could not resume paused dispatch ${identifier}: ${err}`);
+    await linearApi.emitActivity(session.id, {
+      type: "error",
+      body: `Could not resume ${identifier}: ${String(err).slice(0, 400)}`,
+    }).catch(() => {});
+  } finally {
+    if (claimedActiveRun) {
+      activeRuns.delete(issueId);
+      clearActiveSession(issueId);
+    }
+    resumingRuns.delete(issueId);
+  }
 }
 
 // ── Steering handler ──────────────────────────────────────────────
