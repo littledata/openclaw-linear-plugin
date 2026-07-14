@@ -430,10 +430,15 @@ export async function handleLinearWebhook(api, req, res) {
         // work pipeline from AgentSessionEvent.created, never from the parallel
         // Issue.update webhook. A comment-backed session is an @mention/conversation,
         // even when the issue happens to remain delegated to this app.
-        const viewerId = await linearApi.getViewerId();
+        // Agent webhooks identify the installed app user explicitly. GraphQL
+        // viewer.id can be the OAuth actor and is not guaranteed to equal the
+        // issue's delegate id, so use appUserId whenever Linear provides it.
+        const webhookAppUserId = typeof payload.appUserId === "string"
+            ? payload.appUserId
+            : await linearApi.getViewerId();
         const isDelegationSession = !session?.comment &&
-            typeof viewerId === "string" &&
-            enrichedIssue?.delegate?.id === viewerId;
+            typeof webhookAppUserId === "string" &&
+            enrichedIssue?.delegate?.id === webhookAppUserId;
         if (isDelegationSession) {
             // A prior resume/grill gate deliberately holds activeRuns while waiting.
             // A fresh delegation supersedes that parked interaction, but does not
@@ -1349,11 +1354,13 @@ export async function handleLinearWebhook(api, req, res) {
             api.logger.error("No Linear access token — cannot process issue update");
             return true;
         }
-        const viewerId = await linearApi.getViewerId();
-        const isAssignedToUs = assigneeChanged && assigneeId === viewerId;
-        const isDelegatedToUs = delegateChanged && delegateId === viewerId;
+        const appUserId = typeof payload.appUserId === "string"
+            ? payload.appUserId
+            : await linearApi.getViewerId();
+        const isAssignedToUs = assigneeChanged && assigneeId === appUserId;
+        const isDelegatedToUs = delegateChanged && delegateId === appUserId;
         if (!isAssignedToUs && !isDelegatedToUs) {
-            api.logger.info(`Issue.update: assignee=${assigneeId} delegate=${delegateId}, not us (${viewerId}), ignoring`);
+            api.logger.info(`Issue.update: assignee=${assigneeId} delegate=${delegateId}, not us (${appUserId}), ignoring`);
             return true;
         }
         const trigger = isDelegatedToUs ? "delegated" : "assigned";
@@ -1361,7 +1368,7 @@ export async function handleLinearWebhook(api, req, res) {
         // corresponding AgentSessionEvent.created webhook is the sole work entry
         // point, guaranteeing that every run is bound to the new session rather
         // than racing this webhook and reusing an older awaiting-input session.
-        api.logger.info(`Issue ${trigger} to our app user (${viewerId}) — awaiting Linear's new AgentSession.created event`);
+        api.logger.info(`Issue ${trigger} to our app user (${appUserId}) — awaiting Linear's new AgentSession.created event`);
         return true;
     }
     // ── Issue.create — auto-triage new issues ───────────────────────

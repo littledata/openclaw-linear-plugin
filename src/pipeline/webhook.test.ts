@@ -387,10 +387,12 @@ async function postDelegationSession(
   issue: { id: string; identifier: string; title?: string },
   pluginConfig: Record<string, unknown> = {},
   sessionId = `session-${issue.id}`,
+  appUserId?: string,
 ) {
   return postWebhook({
     type: "AgentSessionEvent",
     action: "created",
+    ...(appUserId ? { appUserId } : {}),
     agentSession: {
       id: sessionId,
       issue,
@@ -2640,6 +2642,37 @@ describe("handleCloseIssue via close_issue intent", () => {
 // ---------------------------------------------------------------------------
 
 describe("handleDispatch via a newly created delegation session", () => {
+  it("uses webhook appUserId instead of the OAuth viewer to identify delegation", async () => {
+    const issueId = "issue-app-user-delegation";
+    mockLinearApiInstance.getViewerId.mockResolvedValue("oauth-human-viewer");
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: issueId,
+      identifier: "CORE-APP",
+      title: "App user delegation",
+      description: "Implement this issue.",
+      state: { name: "In Progress", type: "started" },
+      delegate: { id: "linear-agent-app-user", name: "Vasile" },
+      team: { id: "team-core", key: "CORE" },
+      labels: { nodes: [] },
+      comments: { nodes: [] },
+      attachments: { nodes: [] },
+      project: null,
+    });
+
+    const result = await postDelegationSession(
+      { id: issueId, identifier: "CORE-APP", title: "App user delegation" },
+      { orchestrationMode: "stateplan", grillMode: "off" },
+      "session-app-user-delegation",
+      "linear-agent-app-user",
+    );
+
+    expect(result.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(assessTierMock).toHaveBeenCalled();
+    expect(runAgentMock).not.toHaveBeenCalled();
+    expect(mockLinearApiInstance.getViewerId).not.toHaveBeenCalled();
+  });
+
   it("clears stale interactive state and binds work to the new session", async () => {
     const issueId = "issue-pending-resume";
     const oldSessionId = "session-pending-resume";

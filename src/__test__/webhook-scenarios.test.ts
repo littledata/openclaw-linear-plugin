@@ -593,26 +593,34 @@ describe("webhook scenario tests — full handler flows", () => {
 
   describe("Issue.update", () => {
     it("assignment update waits and the new delegation session triggers dispatch", async () => {
-      // Set viewerId to match the fixture's assigneeId
-      mockGetViewerId.mockResolvedValue("viewer-1");
+      // The OAuth viewer may be a human; Linear's webhook appUserId is the
+      // authoritative identity for assignment/delegation events.
+      mockGetViewerId.mockResolvedValue("oauth-human-viewer");
       mockGetIssueDetails.mockResolvedValue(makeIssueDetails({
         state: { name: "In Progress", type: "started" },
         delegate: { id: "viewer-1", name: "Vasile" },
       }));
 
       const api = createApi();
-      const payload = makeIssueUpdateWithAssignment();
+      const payload = {
+        ...makeIssueUpdateWithAssignment(),
+        appUserId: "viewer-1",
+      };
       await postWebhook(api, payload);
 
       expect(mockRunStatePlan).not.toHaveBeenCalled();
       expect(infoLogs(api).some((line) => line.includes("awaiting Linear's new AgentSession.created"))).toBe(true);
 
-      await postWebhook(api, makeAgentSessionEventCreated());
+      await postWebhook(api, {
+        ...makeAgentSessionEventCreated(),
+        appUserId: "viewer-1",
+      });
 
       // The newly-created delegation session owns the container dispatch.
       await waitForMock(mockRunStatePlan, { timeout: 3000 });
       expect(mockRunStatePlan).toHaveBeenCalledOnce();
       expect(mockCreateSessionOnIssue).not.toHaveBeenCalled();
+      expect(mockGetViewerId).not.toHaveBeenCalled();
     });
   });
 
