@@ -656,6 +656,21 @@ describe("LinearAgentApi", () => {
         },
       });
     });
+
+    it("can clear the Linear agent delegate", async () => {
+      fetchMock.mockResolvedValueOnce(
+        okResponse({ issueUpdate: { success: true } }),
+      );
+
+      const api = new LinearAgentApi(TOKEN);
+      await api.updateIssue("iss-42", { delegateId: null });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.variables).toEqual({
+        id: "iss-42",
+        input: { delegateId: null },
+      });
+    });
   });
 
   describe("getTeams", () => {

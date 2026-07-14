@@ -31,6 +31,8 @@ describe("resolveStatePlan — built-in matchers", () => {
     const p = resolveStatePlan({ name: "In Progress", type: "started" })!;
     expect(p.phases).toEqual([{ type: "plan-implement" }]);
     expect(p.onSuccess?.names).toContain("In Review");
+    expect(p.onFailure?.names).toContain("In Progress");
+    expect(p.clearDelegate).toBe(true);
   });
 
   it("maps Todo → implement", () => {
@@ -43,6 +45,7 @@ describe("resolveStatePlan — built-in matchers", () => {
     expect(p.phases.map((x) => x.role)).toEqual(["warden", "apex"]);
     expect(p.phases.every((x) => x.gate)).toBe(true);
     expect(p.onSuccess?.names).toContain("QA");
+    expect(p.onFailure?.names).toContain("In Progress");
   });
 
   it("maps QA → proof (checked before implement even though type=started)", () => {
@@ -63,6 +66,8 @@ describe("resolveStatePlan — config override", () => {
       "in progress": {
         phases: ["plan-implement", "warden"],
         onSuccess: "Ready for Review",
+        onFailure: ["Coding", "In Progress"],
+        clearDelegate: false,
       },
       Shipping: {
         phases: [{ type: "product", role: "lumen" }],
@@ -77,6 +82,8 @@ describe("resolveStatePlan — config override", () => {
       { type: "review", role: "warden", gate: true },
     ]);
     expect(p.onSuccess?.names).toEqual(["Ready for Review"]);
+    expect(p.onFailure?.names).toEqual(["Coding", "In Progress"]);
+    expect(p.clearDelegate).toBe(false);
   });
 
   it("adds a plan for a custom state name", () => {

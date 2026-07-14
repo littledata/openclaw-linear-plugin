@@ -1,10 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { runAgentMock, checkoutPullRequestMock, publishPullRequestReviewMock, updateDispatchProgressMock } = vi.hoisted(() => ({
+const { runAgentMock, execCodexMock, checkoutPullRequestMock, publishPullRequestReviewMock, updateDispatchProgressMock, completeDispatchMock } = vi.hoisted(() => ({
   runAgentMock: vi.fn(),
+  execCodexMock: vi.fn(),
   checkoutPullRequestMock: vi.fn(),
   publishPullRequestReviewMock: vi.fn(),
   updateDispatchProgressMock: vi.fn(),
+  completeDispatchMock: vi.fn(),
 }));
 
 vi.mock("../agent/agent.js", () => ({
@@ -16,6 +18,7 @@ vi.mock("../infra/container-runner.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../infra/container-runner.js")>();
   return {
     ...actual,
+    execCodexInContainer: execCodexMock,
     checkoutPullRequestInContainer: checkoutPullRequestMock,
     publishPullRequestReviewInContainer: publishPullRequestReviewMock,
   };
@@ -23,6 +26,7 @@ vi.mock("../infra/container-runner.js", async (importOriginal) => {
 
 vi.mock("./dispatch-state.js", () => ({
   updateDispatchProgress: updateDispatchProgressMock,
+  completeDispatch: completeDispatchMock,
 }));
 
 import { runStatePlan } from "./orchestrator.js";
@@ -30,13 +34,15 @@ import { runStatePlan } from "./orchestrator.js";
 describe("review verdict recovery", () => {
   beforeEach(() => {
     runAgentMock.mockReset();
+    execCodexMock.mockReset();
     checkoutPullRequestMock.mockReset().mockResolvedValue({ status: 0, stdout: "", stderr: "" });
     publishPullRequestReviewMock.mockReset().mockResolvedValue({ status: 0, stdout: "", stderr: "" });
     updateDispatchProgressMock.mockReset().mockResolvedValue(undefined);
+    completeDispatchMock.mockReset().mockResolvedValue(undefined);
   });
 
   it("asks the reviewer for a format-only correction when a successful review omits its verdict line", async () => {
-    runAgentMock
+    execCodexMock
       .mockResolvedValueOnce({
         success: true,
         output: "I inspected the linked PR and found no security concerns.",
@@ -48,6 +54,7 @@ describe("review verdict recovery", () => {
 
     const emitActivity = vi.fn().mockResolvedValue(undefined);
     const createComment = vi.fn().mockResolvedValue("comment-1");
+    const updateIssue = vi.fn().mockResolvedValue(true);
     const ctx = {
       api: {
         logger: {
@@ -65,6 +72,7 @@ describe("review verdict recovery", () => {
         }),
         emitActivity,
         createComment,
+        updateIssue,
       },
       notify: vi.fn().mockResolvedValue(undefined),
       pluginConfig: {},
@@ -97,7 +105,8 @@ describe("review verdict recovery", () => {
       onSuccess: null,
     });
 
-    expect(runAgentMock).toHaveBeenCalledTimes(2);
+    expect(execCodexMock).toHaveBeenCalledTimes(2);
+    expect(runAgentMock).not.toHaveBeenCalled();
     expect(checkoutPullRequestMock).toHaveBeenCalledTimes(1);
     expect(checkoutPullRequestMock).toHaveBeenCalledWith(
       "openclaw-linear-CORE-1740",
@@ -106,37 +115,55 @@ describe("review verdict recovery", () => {
       1740,
       {},
     );
-    expect(runAgentMock.mock.calls[1][0].message).toContain("Your review completed, but its verdict format was missing");
-    expect(runAgentMock.mock.calls[0][0]).toMatchObject({ issueIdentifier: "CORE-1740" });
-    expect(runAgentMock.mock.calls[0][0].message).toContain("Never use host bash/exec");
+    expect(execCodexMock.mock.calls[1][0].prompt).toContain("Your review completed, but its verdict format was missing");
+    expect(execCodexMock.mock.calls[0][0]).toMatchObject({
+      containerName: "openclaw-linear-CORE-1740",
+      workdir: "/work/ld-shopify",
+      githubRole: undefined,
+    });
+    expect(execCodexMock.mock.calls[0][0].prompt).toContain("the local checkout is authoritative");
     expect(publishPullRequestReviewMock).toHaveBeenCalledWith(
       "openclaw-linear-CORE-1740",
       "ld-shopify",
       "https://github.com/littledata/ld-shopify/pull/1740",
-      expect.stringContaining("## Warden review"),
+      expect.stringContaining("### Warden"),
       true,
       {},
     );
+    expect(publishPullRequestReviewMock.mock.calls[0][3]).toContain("### Warden");
     expect(createComment).not.toHaveBeenCalled();
+    expect(updateIssue).toHaveBeenCalledWith("issue-1", { delegateId: null });
+    expect(completeDispatchMock).toHaveBeenCalledWith(
+      "CORE-1740",
+      expect.objectContaining({ status: "done" }),
+      undefined,
+    );
     expect(emitActivity).toHaveBeenCalledWith(
       "session-1",
       expect.objectContaining({ type: "response", body: expect.stringContaining("all phases passed") }),
     );
   });
 
-  it("surfaces denied reviewer tooling without converting it into a code verdict", async () => {
-    runAgentMock.mockResolvedValueOnce({
-      success: true,
-      output: '⚠️ check git diff (agent) failed: {"status":"declined"}',
-    });
+  it("runs the full Warden + Apex bundle and publishes one overall failure", async () => {
+    execCodexMock
+      .mockResolvedValueOnce({
+        success: true,
+        output: "The query accepts untrusted input.\nSECURITY: fail — parameterize the query",
+      })
+      .mockResolvedValueOnce({ success: true, output: "REVIEW: pass" });
     const createComment = vi.fn().mockResolvedValue("comment-1");
     const emitActivity = vi.fn().mockResolvedValue(undefined);
+    const updateIssue = vi.fn().mockResolvedValue(true);
     const ctx = {
       api: { logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } },
       linearApi: {
         getIssueDetails: vi.fn().mockResolvedValue({ title: "Review", team: { id: "team-1" } }),
         emitActivity,
         createComment,
+        getTeamStates: vi.fn().mockResolvedValue([
+          { id: "state-progress", name: "In Progress", type: "started" },
+        ]),
+        updateIssue,
       },
       notify: vi.fn().mockResolvedValue(undefined),
       pluginConfig: {},
@@ -165,19 +192,40 @@ describe("review verdict recovery", () => {
 
     await runStatePlan(ctx, dispatch, {
       stateLabel: "code-review",
-      phases: [{ type: "review", role: "apex", gate: true }],
+      phases: [
+        { type: "review", role: "warden", gate: true },
+        { type: "review", role: "apex", gate: true },
+      ],
       onSuccess: null,
+      onFailure: { names: ["In Progress"] },
     });
 
-    expect(runAgentMock).toHaveBeenCalledTimes(1);
-    expect(publishPullRequestReviewMock).not.toHaveBeenCalled();
+    expect(execCodexMock).toHaveBeenCalledTimes(2);
+    expect(runAgentMock).not.toHaveBeenCalled();
+    expect(publishPullRequestReviewMock).toHaveBeenCalledTimes(1);
+    expect(publishPullRequestReviewMock).toHaveBeenCalledWith(
+      "openclaw-linear-CORE-1731",
+      "transaction-monitor-2",
+      "https://github.com/littledata/transaction-monitor-2/pull/1541",
+      expect.stringContaining("### Apex"),
+      false,
+      {},
+    );
+    expect(publishPullRequestReviewMock.mock.calls[0][3]).toContain("### Warden");
+    expect(updateIssue).toHaveBeenNthCalledWith(1, "issue-1", { stateId: "state-progress" });
+    expect(updateIssue).toHaveBeenNthCalledWith(2, "issue-1", { delegateId: null });
+    expect(completeDispatchMock).toHaveBeenCalledWith(
+      "CORE-1731",
+      expect.objectContaining({ status: "failed" }),
+      undefined,
+    );
     expect(createComment).toHaveBeenCalledWith(
       "issue-1",
-      expect.stringContaining("review tooling failed"),
+      expect.stringContaining("parameterize the query"),
     );
     expect(emitActivity).toHaveBeenCalledWith(
       "session-1",
-      expect.objectContaining({ type: "response", body: expect.stringContaining("review tooling failed") }),
+      expect.objectContaining({ type: "response", body: expect.stringContaining("parameterize the query") }),
     );
   });
 });

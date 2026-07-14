@@ -243,20 +243,20 @@ export const GIT_STATUS_SCRIPT = [
 ].join("; ");
 
 /**
- * Shell script to commit pending work, push the branch, and open a PR. Reads
- * REPO_DIR, BRANCH, BASE, TITLE, BODY from env; requires GH_TOKEN. Commits any
- * uncommitted changes (no-op if the agent already committed), pushes, then opens
- * the PR. Prints the PR URL on success; `gh` prints "No commits between …" to
- * stderr when the repo is unchanged (handled by the caller as a skip).
+ * Shell script to publish committed work and open (or locate) its PR. Reads
+ * REPO_DIR, BRANCH, BASE, TITLE, BODY from env; requires GH_TOKEN. A dirty tree
+ * is rejected because coding/self-review fixes must be explicit commits. Prints
+ * the newly-created or existing PR URL on success.
  */
 export const OPEN_PR_SCRIPT = [
   "set -eu",
   'cd "$REPO_DIR"',
-  "git add -A",
-  'git commit -m "$TITLE" >/dev/null 2>&1 || true', // no-op if nothing staged
+  'if [ -n "$(git status --porcelain)" ]; then echo "working tree is not clean; the coding agent must commit before publication" >&2; exit 3; fi',
   'git remote set-url origin "$REMOTE_URL"',
   'git push -u origin "$BRANCH" 1>&2',
-  'gh pr create --repo "$REPOSITORY" --head "$BRANCH" ${BASE:+--base "$BASE"} --title "$TITLE" --body "$BODY"',
+  'if ! gh pr create --repo "$REPOSITORY" --head "$BRANCH" ${BASE:+--base "$BASE"} --title "$TITLE" --body "$BODY"; then',
+  '  gh pr view "$BRANCH" --repo "$REPOSITORY" --json url --jq .url',
+  "fi",
 ].join("\n");
 
 interface ContainerRow {
@@ -817,6 +817,7 @@ export function codeSearchInContainer(
 
 export interface ContainerGitStatus {
   hasChanges: boolean;
+  hasUncommitted: boolean;
   lastCommit: string;
   commitsAhead: number;
 }
@@ -827,7 +828,13 @@ export function parseContainerGitStatus(output: string): ContainerGitStatus {
   const lastCommit = /LASTCOMMIT=(.*)$/m.exec(output)?.[1]?.trim() ?? "";
   const parsedAhead = Number(/COMMITS_AHEAD=(\d+)/.exec(output)?.[1] ?? "0");
   const commitsAhead = Number.isFinite(parsedAhead) ? parsedAhead : 0;
-  return { hasChanges: porcelain.trim().length > 0 || commitsAhead > 0, lastCommit, commitsAhead };
+  const hasUncommitted = porcelain.trim().length > 0;
+  return {
+    hasChanges: hasUncommitted || commitsAhead > 0,
+    hasUncommitted,
+    lastCommit,
+    commitsAhead,
+  };
 }
 
 /** Read git status for a repo inside the container. */
@@ -845,8 +852,8 @@ export function containerGitStatus(name: string, repoName: string): ContainerGit
  * @param body - pull request body
  * @param pluginConfig - OpenClaw plugin configuration
  * @param base - optional base branch
- * @returns the PR URL, or null when the repo had no changes (gh "no commits")
- *   or a PR already exists. Throws on a genuine failure.
+ * @returns the new or existing PR URL, or null when the repo had no commits.
+ *   Throws on a dirty worktree or genuine publication failure.
  */
 export async function openPrInContainer(
   name: string,
@@ -877,8 +884,9 @@ export async function openPrInContainer(
   const combined = `${r.stdout}\n${r.stderr}`;
   const url = /https:\/\/github\.com\/\S+\/pull\/\d+/.exec(combined)?.[0];
   if (url) return url;
-  // Benign "nothing to PR" outcomes → skip, not an error.
-  if (/no commits between|already exists|nothing to compare/i.test(combined)) return null;
+  // Benign "nothing to PR" outcomes → skip, not an error. An existing PR is
+  // resolved by OPEN_PR_SCRIPT and therefore returns its URL above.
+  if (/no commits between|nothing to compare/i.test(combined)) return null;
   throw new Error(`PR creation failed in ${name}/${repoName}: ${combined.slice(0, 400)}`);
 }
 

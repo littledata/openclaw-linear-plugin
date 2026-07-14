@@ -482,6 +482,7 @@ export class LinearAgentApi {
     labelIds?: string[];
     stateId?: string;
     priority?: number;
+    delegateId?: string | null;
   }): Promise<boolean> {
     const data = await this.gql<{
       issueUpdate: { success: boolean };
@@ -831,6 +832,7 @@ export class LinearAgentApi {
     projectId?: string;
     parentId?: string;
     assigneeId?: string;
+    delegateId?: string | null;
     dueDate?: string;
   }): Promise<boolean> {
     const data = await this.gql<{

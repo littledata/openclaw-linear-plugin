@@ -80,15 +80,17 @@
       "workerBackend": { "type": "string", "enum": ["embedded", "codex"], "description": "Worker execution backend. 'embedded' (default): the in-process OpenClaw agent (subject to OpenClaw's exec/tool policy). 'codex': delegate all implementation to `codex exec` in its own --full-auto sandbox (no OpenClaw exec-approval gate) on the codex model — recommended when the embedded runner's writes are blocked by the exec policy.", "default": "embedded" },
       "enableContainerTools": { "type": "boolean", "description": "Expose the per-ticket container_* sandbox tools to embedded agents. Enabled by default.", "default": true },
       "grillMode": { "type": "string", "enum": ["off", "on"], "description": "When 'on', a dispatch first runs a /grill-me interview in the Agent Session (one question at a time) to establish which repo(s) the work belongs in and clarify requirements, BEFORE spawning the worker. The chosen repo(s) + implementation brief are passed to the worker. Default 'off'.", "default": "off" },
-      "orchestrationMode": { "type": "string", "enum": ["single", "stateplan"], "description": "Dispatch pipeline. 'single' (default): the single-worker flow (worker → audit → rework). 'stateplan': the state-driven specialist pipeline — the ticket's Linear workflow state selects a phase plan (see statePlans). Todo/In Progress → Apex plans + routes implementers → they build via codex → Apex self-reviews → PR → move to Code Review; Code Review → Warden + Apex review gate → move to QA; QA → Proof QA gate → move to Done. Transitions are agent-decided (a phase failure never moves the ticket).", "default": "single" },
+      "orchestrationMode": { "type": "string", "enum": ["single", "stateplan"], "description": "Dispatch pipeline. 'single' (default): the single-worker flow (worker → audit → rework). 'stateplan': the state-driven specialist pipeline — the ticket's Linear workflow state selects a phase plan (see statePlans). Todo/In Progress → Apex plans + routes implementers → they build → container-local Apex self-review → PR → configured review state; review state → container-local Warden + Apex gates → configured QA state or back to coding on failure; QA support is configurable. Terminal runs release the Linear delegate by default.", "default": "single" },
       "statePlans": {
         "type": "object",
-        "description": "Override the Linear-state → phase-plan map used when orchestrationMode='stateplan'. Keys are exact Linear state NAMES (case-insensitive); unmatched states fall back to built-in matchers by name/type. Each value is { phases: [...], onSuccess }. A phase is either the string 'plan-implement', a bare role id (e.g. 'warden' → gating review, 'helm' → product), or an object { type: 'plan-implement'|'review'|'product', role?, gate? }. onSuccess is a state name, a list of candidate names, or { names: [...], type? } — the agent moves the ticket there only when every phase passes.",
+        "description": "Override the Linear-state → phase-plan map used when orchestrationMode='stateplan'. Keys are exact Linear state NAMES (case-insensitive); unmatched states fall back to built-in matchers by name/type. Each value is { phases, onSuccess, onFailure, clearDelegate }. A phase is either 'plan-implement', a bare role id, or { type: 'plan-implement'|'review'|'product', role?, gate? }. Review phases always execute in the ticket Docker container. onSuccess/onFailure accept a state name, candidate-name list, or { names, type }. clearDelegate defaults true and releases Issue.delegate after either terminal outcome.",
         "additionalProperties": {
           "type": "object",
           "properties": {
             "phases": { "type": "array", "items": { "type": ["string", "object"] } },
-            "onSuccess": { "type": ["string", "array", "object"] }
+            "onSuccess": { "type": ["string", "array", "object", "null"] },
+            "onFailure": { "type": ["string", "array", "object", "null"] },
+            "clearDelegate": { "type": "boolean", "default": true }
           }
         }
       },
@@ -100,7 +102,7 @@
       },
       "roleBackends": {
         "type": "object",
-        "description": "Per-role execution-backend override for the specialist orchestrator. Keys are role ids; values are 'codex' or 'embedded'. Defaults: implementers (spine/prism/flux/forge) = codex; reviewers/product (apex/warden/proof/helm/lumen) = embedded.",
+        "description": "Per-role execution-backend override for planning, implementation, and product phases. Keys are role ids; values are 'codex' or 'embedded'. Review phases intentionally ignore this override and always run via Codex inside the ticket container so they inspect the local checkout.",
         "additionalProperties": { "type": "string", "enum": ["codex", "embedded"] }
       },
       "codexModel": { "type": "string", "description": "Model passed to the Codex worker CLI (codex exec --model). If unset, Codex uses its own ~/.codex/config.toml default." },

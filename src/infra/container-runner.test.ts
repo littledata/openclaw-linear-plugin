@@ -5,6 +5,7 @@ import {
   buildRunArgs,
   buildCodexInner,
   GIT_STATUS_SCRIPT,
+  OPEN_PR_SCRIPT,
   parseContainerGitStatus,
   PROVISION_SCRIPT,
   CHECKOUT_PR_SCRIPT,
@@ -108,24 +109,45 @@ describe("parseContainerGitStatus", () => {
   it("treats an uncommitted file as implementation activity", () => {
     expect(parseContainerGitStatus(
       "PORCELAIN<<\n M src/a.ts\n>>\nLASTCOMMIT=abc existing\nCOMMITS_AHEAD=0\n",
-    )).toEqual({ hasChanges: true, lastCommit: "abc existing", commitsAhead: 0 });
+    )).toEqual({
+      hasChanges: true,
+      hasUncommitted: true,
+      lastCommit: "abc existing",
+      commitsAhead: 0,
+    });
   });
 
   it("treats a clean committed branch as implementation activity", () => {
     expect(parseContainerGitStatus(
       "PORCELAIN<<\n>>\nLASTCOMMIT=def implementation\nCOMMITS_AHEAD=2\n",
-    )).toEqual({ hasChanges: true, lastCommit: "def implementation", commitsAhead: 2 });
+    )).toEqual({
+      hasChanges: true,
+      hasUncommitted: false,
+      lastCommit: "def implementation",
+      commitsAhead: 2,
+    });
   });
 
   it("recognizes a completely untouched repo", () => {
     expect(parseContainerGitStatus(
       "PORCELAIN<<\n>>\nLASTCOMMIT=abc base\nCOMMITS_AHEAD=0\n",
-    )).toEqual({ hasChanges: false, lastCommit: "abc base", commitsAhead: 0 });
+    )).toEqual({
+      hasChanges: false,
+      hasUncommitted: false,
+      lastCommit: "abc base",
+      commitsAhead: 0,
+    });
   });
 
   it("compares against the provisioned base ref", () => {
     expect(GIT_STATUS_SCRIPT).toContain("refs/openclaw/base");
     expect(GIT_STATUS_SCRIPT).toContain("COMMITS_AHEAD");
+  });
+
+  it("requires a clean committed tree and resolves an existing PR URL", () => {
+    expect(OPEN_PR_SCRIPT).toContain("working tree is not clean");
+    expect(OPEN_PR_SCRIPT).not.toContain("git commit");
+    expect(OPEN_PR_SCRIPT).toContain('gh pr view "$BRANCH"');
   });
 });
 
