@@ -308,13 +308,14 @@ async function runApexPlan(
 
 /**
  * Whether implementers run as a single steerable OpenClaw agent driving the
- * container via tools (the default), vs. the legacy one-shot `codex exec` per
- * specialist. Config `implementMode: "codex"` opts back into the old path.
+ * container via tools, versus direct `codex exec` per specialist. The public
+ * `workerBackend` setting selects the path so stateplan and single-worker
+ * orchestration obey the same configuration.
  * @param cfg - plugin config
  * @returns true when the container-agent path should be used
  */
-function implementerUsesContainer(cfg?: Record<string, unknown>): boolean {
-  return (cfg?.implementMode as string | undefined) !== "codex";
+export function implementerUsesContainerAgent(cfg?: Record<string, unknown>): boolean {
+  return cfg?.workerBackend !== "codex";
 }
 
 /**
@@ -359,6 +360,9 @@ async function runContainerImplement(
     "- container_clone_repo — pull in another repo for cross-repo work",
     "- container_search_code — AST semantic code search; use it to locate code by concept",
     "  (\"where is X handled?\") when you don't know exact names — better than grep for discovery.",
+    "Start repository discovery with ONE bounded container_exec call that batches git status/log,",
+    "targeted rg searches, and small sed excerpts. Keep its output below 20k characters. Use further",
+    "tool calls only for gaps found by that first pass; do not fetch repository files through GitHub.",
     "",
     "## What to do",
     "Implement the change fully, then VERIFY it by running the project's build/tests inside the",
@@ -409,7 +413,7 @@ async function runImplementPhase(
   const limit = maxRework(ctx.pluginConfig);
   let assignments = await runApexPlan(ctx, dispatch, issue);
   let lastReason = "";
-  const useContainerAgent = implementerUsesContainer(ctx.pluginConfig);
+  const useContainerAgent = implementerUsesContainerAgent(ctx.pluginConfig);
 
   for (let attempt = 0; attempt <= limit; attempt++) {
     if (isCancelled(dispatch.issueId)) return { success: false, reason: "halted" };
@@ -421,33 +425,40 @@ async function runImplementPhase(
       attemptOutputs.push(output);
       lastReason = success ? "" : `implementation agent failed: ${output.slice(-300)}`;
     } else {
-      // Legacy: one-shot codex exec per specialist, sharing the container.
+      // Direct codex exec per specialist, sharing the container.
+      let attemptFailure = "";
       for (const a of assignments) {
         if (isCancelled(dispatch.issueId)) return { success: false, reason: "halted" };
         const role = resolveRole(a.role) ?? ROLES.spine;
         const { success, output } = await runRole(ctx, dispatch, role, "implement", a.task, issue);
         attemptOutputs.push(`## ${role.label}\n${output}`);
         if (!success) {
-          lastReason = `${role.label} implementation failed: ${output.slice(-300)}`;
+          attemptFailure = `${role.label} implementation failed: ${output.slice(-300)}`;
           // Keep going to self-review — codex may have partially applied changes.
         }
       }
+      lastReason = attemptFailure;
     }
     // Persist this attempt's implementer output for future-session recall.
     try { saveWorkerOutput(dispatch.worktreePath, attempt, attemptOutputs.join("\n\n")); } catch { /* best effort */ }
     try { appendLog(dispatch.worktreePath, { ts: new Date().toISOString(), phase: "worker", attempt, agent: assignments.map((a) => a.role).join("+"), prompt: "", outputPreview: attemptOutputs.join("\n\n").slice(0, 500), success: !lastReason, durationMs: 0 }); } catch { /* best effort */ }
 
-    // No-diff guard: an implementer failed (lastReason set) AND left zero working
-    // changes — the container is effectively untouched (e.g. codex exited 1 in an
-    // empty container). There's nothing for a self-review to gate on, so it would
-    // just fail to find a verdict line ("no REVIEW verdict line found"). Surface the
-    // REAL reason instead of that cryptic message.
-    if (lastReason && !hasAnyChanges(dispatch)) {
+    // No-change guard: never review an untouched workspace, even when an agent
+    // reports success. containerGitStatus includes both working-tree changes and
+    // commits made since provisioning, so a clean committed implementation passes.
+    if (!hasAnyChanges(dispatch)) {
+      lastReason = lastReason || "implementation agent completed without producing code changes or commits";
       emit(ctx, dispatch, {
         type: "thought",
         body: `⚠️ No code changes were produced (attempt ${attempt + 1}/${limit + 1}): ${lastReason}`,
       });
       if (attempt < limit) {
+        if (!useContainerAgent) {
+          assignments = assignments.map((a) => ({
+            role: a.role,
+            task: `The previous implementation attempt produced no code changes or commits. Implement the assigned work now and verify it:\n${a.task}`,
+          }));
+        }
         continue; // give rework a shot before giving up
       }
       return { success: false, reason: `no changes produced — ${lastReason}` };
@@ -500,14 +511,14 @@ function reworkNoteFrom(lastReason: string, attempt: number): string | undefined
 }
 
 /**
- * Whether any target repo in the container has uncommitted working-tree changes.
+ * Whether any target repo has working-tree changes or commits since provisioning.
  * Best-effort: a git-status probe that throws is treated as "no changes" for that
- * repo. Used only as a negative signal (combined with a failed implementer) to
- * avoid running a self-review over an untouched workspace.
+ * repo. Used as a hard gate to avoid running a self-review over an untouched
+ * workspace, even when the implementation agent reported success.
  * @param dispatch - the active dispatch (needs containerName + containerRepos)
  * @returns true if at least one repo shows changes
  */
-function hasAnyChanges(dispatch: ActiveDispatch): boolean {
+export function hasAnyChanges(dispatch: ActiveDispatch): boolean {
   const repos = dispatch.containerRepos ?? [];
   if (!dispatch.containerName || !repos.length) return false;
   for (const repo of repos) {

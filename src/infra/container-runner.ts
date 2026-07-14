@@ -126,6 +126,7 @@ export const PROVISION_SCRIPT = [
   '  if [ ! -d "/work/$r/.git" ]; then',
   '    git clone --shared "/repos-ro/$r" "/work/$r"',
   '    git -C "/work/$r" checkout -B "$BRANCH"',
+  '    git -C "/work/$r" update-ref refs/openclaw/base HEAD',
   "  fi",
   "done",
 ].join("\n");
@@ -139,6 +140,7 @@ export const CLONE_ONE_SCRIPT = [
   'if [ ! -d "/work/$REPO/.git" ]; then',
   '  git clone --shared "/repos-ro/$REPO" "/work/$REPO"',
   '  git -C "/work/$REPO" checkout -B "$BRANCH"',
+  '  git -C "/work/$REPO" update-ref refs/openclaw/base HEAD',
   "fi",
 ].join("\n");
 
@@ -173,8 +175,17 @@ export function buildCodexInner(workdir: string, model?: string, effort?: string
   return parts.join(" ");
 }
 
-/** Git status + last-commit check inside a repo (porcelain). */
-export const GIT_STATUS_SCRIPT = 'cd "$REPO_DIR" && printf "PORCELAIN<<\\n"; git status --porcelain; printf ">>\\nLASTCOMMIT="; git log --oneline -1 2>/dev/null || true';
+/** Git status + commits since the repo was provisioned. */
+export const GIT_STATUS_SCRIPT = [
+  'cd "$REPO_DIR"',
+  'printf "PORCELAIN<<\\n"',
+  "git status --porcelain",
+  'printf ">>\\nLASTCOMMIT="',
+  "git log --oneline -1 2>/dev/null || true",
+  'BASE=$(git rev-parse refs/openclaw/base 2>/dev/null || git merge-base HEAD refs/remotes/origin/HEAD 2>/dev/null || true)',
+  'AHEAD=0; if [ -n "$BASE" ]; then AHEAD=$(git rev-list --count "$BASE"..HEAD 2>/dev/null || echo 0); fi',
+  'printf "\\nCOMMITS_AHEAD=%s\\n" "$AHEAD"',
+].join("; ");
 
 /**
  * Shell script to commit pending work, push the branch, and open a PR. Reads
@@ -667,14 +678,22 @@ export function codeSearchInContainer(
 export interface ContainerGitStatus {
   hasChanges: boolean;
   lastCommit: string;
+  commitsAhead: number;
+}
+
+/** Parse the output produced by {@link GIT_STATUS_SCRIPT}. */
+export function parseContainerGitStatus(output: string): ContainerGitStatus {
+  const porcelain = /PORCELAIN<<\n([\s\S]*?)\n?>>/.exec(output)?.[1] ?? "";
+  const lastCommit = /LASTCOMMIT=(.*)$/m.exec(output)?.[1]?.trim() ?? "";
+  const parsedAhead = Number(/COMMITS_AHEAD=(\d+)/.exec(output)?.[1] ?? "0");
+  const commitsAhead = Number.isFinite(parsedAhead) ? parsedAhead : 0;
+  return { hasChanges: porcelain.trim().length > 0 || commitsAhead > 0, lastCommit, commitsAhead };
 }
 
 /** Read git status for a repo inside the container. */
 export function containerGitStatus(name: string, repoName: string): ContainerGitStatus {
   const r = dockerSync(["exec", "-e", `REPO_DIR=${repoWorkdir(repoName)}`, name, "sh", "-c", GIT_STATUS_SCRIPT]);
-  const porcelain = /PORCELAIN<<\n([\s\S]*?)\n?>>/.exec(r.stdout)?.[1] ?? "";
-  const lastCommit = /LASTCOMMIT=(.*)$/m.exec(r.stdout)?.[1]?.trim() ?? "";
-  return { hasChanges: porcelain.trim().length > 0, lastCommit };
+  return parseContainerGitStatus(r.stdout);
 }
 
 /**

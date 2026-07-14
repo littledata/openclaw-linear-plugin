@@ -62,10 +62,13 @@ describe("buildRolePrompt", () => {
     const p = buildRolePrompt(ROLES.warden, { identifier: "CORE-2", phase: "review" });
     expect(p).toContain("SECURITY: pass");
     expect(p).toContain("REVIEWING");
+    expect(p).toContain("ONE bounded container_exec");
+    expect(p).toMatch(/Do not browse repository files through GitHub/i);
   });
   it("appends extra instructions", () => {
     const p = buildRolePrompt(ROLES.apex, { identifier: "CORE-3", phase: "plan", extra: "ROUTING-BLOB" });
     expect(p).toContain("ROUTING-BLOB");
+    expect(p).toContain("ONE bounded container_exec");
   });
   it("embedded backend references the skill by name", () => {
     const p = buildRolePrompt(ROLES.warden, { identifier: "CORE-5", phase: "review", backend: "embedded" });
@@ -97,7 +100,13 @@ describe("roleToolsDeny", () => {
   });
   it("denies the code CLIs for read-only roles (review can't rewrite code)", () => {
     expect(roleToolsDeny(ROLES.warden)).toEqual(
-      expect.arrayContaining(["cli_codex", "cli_claude", "cli_gemini"]),
+      expect.arrayContaining([
+        "cli_codex",
+        "cli_claude",
+        "cli_gemini",
+        "codex_apps.github_search",
+        "codex_apps.github_fetch_file",
+      ]),
     );
   });
   it("denies nothing for implementer (codex) roles", () => {

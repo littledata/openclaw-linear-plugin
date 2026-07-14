@@ -200,7 +200,7 @@ export function createContainerTools(api: OpenClawPluginApi, rawCtx: Record<stri
       const status = repos.map((repo) => {
         try {
           const s = containerGitStatus(c.containerName, repo);
-          return { repo, hasChanges: s.hasChanges, lastCommit: s.lastCommit };
+          return { repo, hasChanges: s.hasChanges, commitsAhead: s.commitsAhead, lastCommit: s.lastCommit };
         } catch (err) {
           return { repo, error: String(err).slice(0, 200) };
         }

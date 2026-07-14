@@ -4,6 +4,8 @@ import {
   repoWorkdir,
   buildRunArgs,
   buildCodexInner,
+  GIT_STATUS_SCRIPT,
+  parseContainerGitStatus,
   PROVISION_SCRIPT,
   CHECKOUT_PR_SCRIPT,
   PUBLISH_PR_REVIEW_SCRIPT,
@@ -77,7 +79,33 @@ describe("PROVISION_SCRIPT", () => {
   it("uses --shared (cross-fs safe) and reads REPOS/BRANCH from env", () => {
     expect(PROVISION_SCRIPT).toContain('git clone --shared "/repos-ro/$r" "/work/$r"');
     expect(PROVISION_SCRIPT).toContain('checkout -B "$BRANCH"');
+    expect(PROVISION_SCRIPT).toContain("update-ref refs/openclaw/base HEAD");
     expect(PROVISION_SCRIPT).toContain("for r in $REPOS");
+  });
+});
+
+describe("parseContainerGitStatus", () => {
+  it("treats an uncommitted file as implementation activity", () => {
+    expect(parseContainerGitStatus(
+      "PORCELAIN<<\n M src/a.ts\n>>\nLASTCOMMIT=abc existing\nCOMMITS_AHEAD=0\n",
+    )).toEqual({ hasChanges: true, lastCommit: "abc existing", commitsAhead: 0 });
+  });
+
+  it("treats a clean committed branch as implementation activity", () => {
+    expect(parseContainerGitStatus(
+      "PORCELAIN<<\n>>\nLASTCOMMIT=def implementation\nCOMMITS_AHEAD=2\n",
+    )).toEqual({ hasChanges: true, lastCommit: "def implementation", commitsAhead: 2 });
+  });
+
+  it("recognizes a completely untouched repo", () => {
+    expect(parseContainerGitStatus(
+      "PORCELAIN<<\n>>\nLASTCOMMIT=abc base\nCOMMITS_AHEAD=0\n",
+    )).toEqual({ hasChanges: false, lastCommit: "abc base", commitsAhead: 0 });
+  });
+
+  it("compares against the provisioned base ref", () => {
+    expect(GIT_STATUS_SCRIPT).toContain("refs/openclaw/base");
+    expect(GIT_STATUS_SCRIPT).toContain("COMMITS_AHEAD");
   });
 });
 

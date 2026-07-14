@@ -253,7 +253,20 @@ export function loadSkillGuidance(
  * @returns tool names/groups to deny for this role's embedded run
  */
 export function roleToolsDeny(role: RoleDef): string[] {
-  return role.readOnly ? ["cli_codex", "cli_claude", "cli_gemini"] : [];
+  return role.readOnly
+    ? [
+        "cli_codex",
+        "cli_claude",
+        "cli_gemini",
+        // The prepared ticket container is the authoritative repository. These
+        // connector tools turn a local inspection into dozens of slow remote
+        // calls and cannot see unpushed work.
+        "codex_apps.github_search",
+        "codex_apps.github_fetch_file",
+        "github_search",
+        "github_fetch_file",
+      ]
+    : [];
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +333,10 @@ export function buildRolePrompt(role: RoleDef, opts: RolePromptOpts): string {
   } else if (opts.phase === "review") {
     lines.push(
       "You are REVIEWING, not implementing — read and analyse only, change nothing.",
+      "The prepared ticket container is the authoritative source, including unpushed work. " +
+        "Start with ONE bounded container_exec call that batches git status/diff/log plus targeted " +
+        "rg/sed reads. Use additional container_* calls only when the first result identifies a gap. " +
+        "Do not browse repository files through GitHub search/fetch tools.",
       role.verdictTag
         ? `End your response with EXACTLY one verdict line:\n\`${role.verdictTag}: pass\`  or  \`${role.verdictTag}: fail — <one-line reason>\``
         : "",
@@ -328,6 +345,9 @@ export function buildRolePrompt(role: RoleDef, opts: RolePromptOpts): string {
     lines.push(
       "Produce an implementation plan. Read the issue and the codebase, then decide",
       "which implementer specialists own which concerns and what each must build.",
+      "The prepared ticket container is the authoritative codebase. Start with ONE bounded " +
+        "container_exec call that batches git status/log and targeted rg/sed reads; avoid serial " +
+        "file-fetch calls and do not browse repository files through GitHub search/fetch tools.",
     );
   } else if (opts.phase === "product") {
     lines.push("Produce your written deliverable only — do not write code.");

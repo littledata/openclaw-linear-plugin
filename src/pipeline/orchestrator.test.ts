@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseAssignments } from "./orchestrator.js";
+import { implementerUsesContainerAgent, parseAssignments } from "./orchestrator.js";
 
 const issue = { id: "1", identifier: "CORE-9", title: "t" };
 
@@ -32,5 +32,16 @@ describe("parseAssignments", () => {
   it("extracts JSON embedded in prose", () => {
     const out = 'Here is my plan:\n{"assignments":[{"role":"forge","task":"terraform"}]}\nDone.';
     expect(parseAssignments(out, issue)).toEqual([{ role: "forge", task: "terraform" }]);
+  });
+});
+
+describe("implementerUsesContainerAgent", () => {
+  it("uses direct in-container Codex when workerBackend is codex", () => {
+    expect(implementerUsesContainerAgent({ workerBackend: "codex" })).toBe(false);
+  });
+
+  it("uses the embedded container agent by default or when configured", () => {
+    expect(implementerUsesContainerAgent()).toBe(true);
+    expect(implementerUsesContainerAgent({ workerBackend: "embedded" })).toBe(true);
   });
 });

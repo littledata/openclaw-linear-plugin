@@ -2,7 +2,7 @@
   "id": "openclaw-linear",
   "name": "Linear Agent",
   "description": "Linear integration with OAuth support, agent pipeline, and webhook-driven AI agent lifecycle",
-  "version": "0.9.24",
+  "version": "0.9.26",
   "activation": {
     "onStartup": true
   },
@@ -22,7 +22,14 @@
       "plan_get_project",
       "plan_update_issue",
       "plan_audit",
-      "dispatch_history"
+      "dispatch_history",
+      "container_exec",
+      "container_write_file",
+      "container_read_file",
+      "container_apply_patch",
+      "container_status",
+      "container_clone_repo",
+      "container_search_code"
     ]
   },
   "configSchema": {
@@ -69,6 +76,7 @@
         "required": ["coding", "reviewer"]
       },
       "workerBackend": { "type": "string", "enum": ["embedded", "codex"], "description": "Worker execution backend. 'embedded' (default): the in-process OpenClaw agent (subject to OpenClaw's exec/tool policy). 'codex': delegate all implementation to `codex exec` in its own --full-auto sandbox (no OpenClaw exec-approval gate) on the codex model — recommended when the embedded runner's writes are blocked by the exec policy.", "default": "embedded" },
+      "enableContainerTools": { "type": "boolean", "description": "Expose the per-ticket container_* sandbox tools to embedded agents. Enabled by default.", "default": true },
       "grillMode": { "type": "string", "enum": ["off", "on"], "description": "When 'on', a dispatch first runs a /grill-me interview in the Agent Session (one question at a time) to establish which repo(s) the work belongs in and clarify requirements, BEFORE spawning the worker. The chosen repo(s) + implementation brief are passed to the worker. Default 'off'.", "default": "off" },
       "orchestrationMode": { "type": "string", "enum": ["single", "stateplan"], "description": "Dispatch pipeline. 'single' (default): the single-worker flow (worker → audit → rework). 'stateplan': the state-driven specialist pipeline — the ticket's Linear workflow state selects a phase plan (see statePlans). Todo/In Progress → Apex plans + routes implementers → they build via codex → Apex self-reviews → PR → move to Code Review; Code Review → Warden + Apex review gate → move to QA; QA → Proof QA gate → move to Done. Transitions are agent-decided (a phase failure never moves the ticket).", "default": "single" },
       "statePlans": {
