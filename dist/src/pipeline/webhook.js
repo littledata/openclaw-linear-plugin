@@ -2658,12 +2658,25 @@ async function resumePausedDispatch(api, linearApi, session, issue, userMessage,
         // remaining race immediately before clearCancel/status=working.
         if ((pauseGenerations.get(issueId) ?? 0) !== expectedPauseGeneration)
             return;
+        const effectivePluginConfig = await hydrateGitHubRepositoryCatalog(pluginConfig);
+        if (persisted.containerRepos?.length) {
+            try {
+                await startOrReuseContainer(buildContainerSpec(identifier, persisted.containerRepos, persisted.branch, effectivePluginConfig, Date.now()), api.logger, effectivePluginConfig);
+            }
+            catch (err) {
+                await linearApi.emitActivity(session.id, {
+                    type: "error",
+                    body: `Could not resume ${identifier}: the ticket repositories could not be refreshed (${String(err).slice(0, 250)}).`,
+                }).catch(() => { });
+                return;
+            }
+        }
         const details = await linearApi.getIssueDetails(issueId).catch(() => issue);
         const workflowState = {
             name: details?.state?.name ?? "In Progress",
             type: details?.state?.type ?? "started",
         };
-        const plan = resolveStatePlan(workflowState, pluginConfig);
+        const plan = resolveStatePlan(workflowState, effectivePluginConfig);
         if (!plan) {
             await linearApi.emitActivity(session.id, {
                 type: "error",
@@ -2690,12 +2703,12 @@ async function resumePausedDispatch(api, linearApi, session, issue, userMessage,
             type: "thought",
             body: `Continuing ${identifier} in the existing agent session and ticket workspace...`,
         }).catch(() => { });
-        const notify = createNotifierFromConfig(pluginConfig, api.runtime, api);
+        const notify = createNotifierFromConfig(effectivePluginConfig, api.runtime, api);
         const hookCtx = {
             api,
             linearApi,
             notify,
-            pluginConfig,
+            pluginConfig: effectivePluginConfig,
             configPath: statePath,
         };
         await runStatePlan(hookCtx, dispatch, plan, {

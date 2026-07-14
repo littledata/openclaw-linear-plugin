@@ -22,6 +22,7 @@ import {
   getIssueIdentifierForAgentRun,
 } from "../pipeline/active-session.js";
 import { getContainerRecord, touchContainer } from "../infra/container-registry.js";
+import { hydrateGitHubRepositoryCatalog } from "../infra/github-repository-catalog.js";
 import {
   ensureContainerAlive,
   execInContainer,
@@ -50,8 +51,15 @@ function clip(s: string): string {
 async function resolveContainer(
   api: OpenClawPluginApi,
   ctx: OpenClawPluginToolContext,
-): Promise<{ containerName: string; identifier: string; repos: string[] } | { error: string }> {
-  const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
+): Promise<{
+  containerName: string;
+  identifier: string;
+  repos: string[];
+  pluginConfig?: Record<string, unknown>;
+} | { error: string }> {
+  const pluginConfig = await hydrateGitHubRepositoryCatalog(
+    (api as any).pluginConfig as Record<string, unknown> | undefined,
+  );
   const boundIdentifier = getIssueIdentifierForAgentRun(ctx.sessionId, ctx.sessionKey, ctx.agentId);
   const session =
     (boundIdentifier ? null : ctx.agentId ? getActiveSessionByAgentId(ctx.agentId) : null) ??
@@ -70,7 +78,7 @@ async function resolveContainer(
     return { error: `Could not start the container for ${identifier}.` };
   }
   touchContainer(identifier);
-  return { containerName: name, identifier, repos: rec.repos };
+  return { containerName: name, identifier, repos: rec.repos, pluginConfig };
 }
 
 function githubRoleForAgent(agentId: string | undefined): "coding" | "reviewer" {
@@ -112,8 +120,7 @@ export function createContainerTools(api: OpenClawPluginApi, rawCtx: Record<stri
       const cwd = params.workdir || WORK_ROOT;
       const timeoutMs = Math.min(Math.max((params.timeoutSec ?? 600) * 1000, 1000), 3_600_000);
       api.logger.info(`container_exec [${c.identifier}] ${cwd}$ ${command.slice(0, 200)}`);
-      const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
-      const r = pluginConfig?.repositorySource === "github-app"
+      const r = c.pluginConfig?.repositorySource === "github-app"
         ? await execAuthenticatedInContainer(
             githubRoleForAgent(ctx.agentId),
             c.containerName,
@@ -121,7 +128,7 @@ export function createContainerTools(api: OpenClawPluginApi, rawCtx: Record<stri
             command,
             cwd,
             timeoutMs,
-            pluginConfig,
+            c.pluginConfig,
           )
         : execInContainer(c.containerName, command, cwd, timeoutMs);
       return jsonResult({
@@ -232,12 +239,12 @@ export function createContainerTools(api: OpenClawPluginApi, rawCtx: Record<stri
     label: "Container: clone another repo",
     description:
       "Clone an ADDITIONAL littledata repo into this ticket's container for cross-repo work. " +
-      "The repo must exist in the read-only repos mirror. It lands at /work/<repo>.",
+      "The repo must be installed for the coding GitHub App. It lands at /work/<repo>.",
     promptSnippet: "container_clone_repo — add another repo to the container for cross-repo work",
     parameters: {
       type: "object",
       properties: {
-        repo: { type: "string", description: "Repo name (directory name in the repos mirror)." },
+        repo: { type: "string", description: "Installed GitHub repository name." },
       },
       required: ["repo"],
     },
@@ -247,8 +254,7 @@ export function createContainerTools(api: OpenClawPluginApi, rawCtx: Record<stri
       if (!params.repo) return jsonResult({ success: false, error: "repo is required" });
       const rec = getContainerRecord(c.identifier);
       const branch = rec?.branch ?? "main";
-      const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
-      const r = await cloneRepo(c.containerName, params.repo, branch, pluginConfig);
+      const r = await cloneRepo(c.containerName, params.repo, branch, c.pluginConfig);
       return jsonResult({ success: r.status === 0, exitCode: r.status ?? -1, stderr: clip(r.stderr), path: repoWorkdir(params.repo) });
     },
   } as unknown as AnyAgentTool;

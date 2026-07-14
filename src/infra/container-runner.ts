@@ -153,6 +153,10 @@ export const PROVISION_GITHUB_REPO_SCRIPT = [
   'mkdir -p "$(dirname "$REPO_DIR")" /work/.claw',
   'if [ ! -d "$REPO_DIR/.git" ]; then',
   '  git clone "$REMOTE_URL" "$REPO_DIR"',
+  '  DEFAULT_REF="origin/$DEFAULT_BRANCH"',
+  '  if ! git -C "$REPO_DIR" show-ref --verify --quiet "refs/remotes/$DEFAULT_REF"; then',
+  '    DEFAULT_REF=$(git -C "$REPO_DIR" symbolic-ref --short refs/remotes/origin/HEAD)',
+  "  fi",
   '  if git -C "$REPO_DIR" ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then',
   '    git -C "$REPO_DIR" checkout -B "$BRANCH" "origin/$BRANCH"',
   '    if ! git -C "$REPO_DIR" pull --ff-only origin "$BRANCH"; then',
@@ -162,19 +166,23 @@ export const PROVISION_GITHUB_REPO_SCRIPT = [
   '      git -C "$REPO_DIR" reset --hard "origin/$BRANCH"',
   "    fi",
   "  else",
-  '    git -C "$REPO_DIR" checkout -B "$BRANCH" "origin/$DEFAULT_BRANCH"',
+  '    git -C "$REPO_DIR" checkout -B "$BRANCH" "$DEFAULT_REF"',
   "  fi",
-  '  BASE=$(git -C "$REPO_DIR" merge-base HEAD "origin/$DEFAULT_BRANCH" 2>/dev/null || git -C "$REPO_DIR" rev-parse "origin/$DEFAULT_BRANCH")',
+  '  BASE=$(git -C "$REPO_DIR" merge-base HEAD "$DEFAULT_REF" 2>/dev/null || git -C "$REPO_DIR" rev-parse "$DEFAULT_REF")',
   '  git -C "$REPO_DIR" update-ref refs/openclaw/base "$BASE"',
   "else",
   '  git -C "$REPO_DIR" remote set-url origin "$REMOTE_URL"',
   '  git -C "$REPO_DIR" fetch --prune origin',
+  '  DEFAULT_REF="origin/$DEFAULT_BRANCH"',
+  '  if ! git -C "$REPO_DIR" show-ref --verify --quiet "refs/remotes/$DEFAULT_REF"; then',
+  '    DEFAULT_REF=$(git -C "$REPO_DIR" symbolic-ref --short refs/remotes/origin/HEAD)',
+  "  fi",
   '  if git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$BRANCH"; then',
   '    git -C "$REPO_DIR" checkout "$BRANCH"',
   '  elif git -C "$REPO_DIR" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then',
   '    git -C "$REPO_DIR" checkout -B "$BRANCH" "origin/$BRANCH"',
   "  else",
-  '    git -C "$REPO_DIR" checkout -B "$BRANCH" "origin/$DEFAULT_BRANCH"',
+  '    git -C "$REPO_DIR" checkout -B "$BRANCH" "$DEFAULT_REF"',
   "  fi",
   '  if [ -z "$(git -C "$REPO_DIR" status --porcelain)" ] && git -C "$REPO_DIR" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then',
   '    if ! git -C "$REPO_DIR" pull --ff-only origin "$BRANCH"; then',
@@ -185,7 +193,7 @@ export const PROVISION_GITHUB_REPO_SCRIPT = [
   "    fi",
   "  fi",
   '  if ! git -C "$REPO_DIR" show-ref --verify --quiet refs/openclaw/base; then',
-  '    BASE=$(git -C "$REPO_DIR" merge-base HEAD "origin/$DEFAULT_BRANCH" 2>/dev/null || git -C "$REPO_DIR" rev-parse "origin/$DEFAULT_BRANCH")',
+  '    BASE=$(git -C "$REPO_DIR" merge-base HEAD "$DEFAULT_REF" 2>/dev/null || git -C "$REPO_DIR" rev-parse "$DEFAULT_REF")',
   '    git -C "$REPO_DIR" update-ref refs/openclaw/base "$BASE"',
   "  fi",
   "fi",
@@ -491,6 +499,7 @@ export async function provisionRepos(
   pluginConfig?: Record<string, unknown>,
 ): Promise<string[]> {
   if (!repos.length) return [];
+  const successfulRemoteRepos = new Set<string>();
   if (pluginConfig?.repositorySource === "github-app") {
     for (const repo of repos) {
       const repository = resolveGitHubRepository(repo, pluginConfig);
@@ -512,6 +521,8 @@ export async function provisionRepos(
       );
       if (r.status !== 0) {
         logger.warn(`[container] GitHub provision on ${name}/${repo} exit ${r.status}: ${r.stderr.slice(0, 500)}`);
+      } else {
+        successfulRemoteRepos.add(repo);
       }
     }
   } else {
@@ -524,6 +535,9 @@ export async function provisionRepos(
   // Verify what actually landed — `set -eu` aborts the whole script on the first
   // failed clone, so a non-zero status doesn't tell us which repos made it.
   const present = repos.filter((repo) => {
+    if (pluginConfig?.repositorySource === "github-app" && !successfulRemoteRepos.has(repo)) {
+      return false;
+    }
     const check = dockerSync(["exec", name, "test", "-d", `${repoWorkdir(repo)}/.git`]);
     return check.status === 0;
   });
@@ -542,11 +556,10 @@ export async function cloneRepo(
   pluginConfig?: Record<string, unknown>,
 ): Promise<DockerResult> {
   if (pluginConfig?.repositorySource === "github-app") {
-    await provisionRepos(name, [repo], branch, { warn: () => {} }, pluginConfig);
-    const present = dockerSync(["exec", name, "test", "-d", `${repoWorkdir(repo)}/.git`]);
-    return present.status === 0
+    const provisioned = await provisionRepos(name, [repo], branch, { warn: () => {} }, pluginConfig);
+    return provisioned.includes(repo)
       ? { status: 0, stdout: repoWorkdir(repo), stderr: "" }
-      : { status: present.status, stdout: "", stderr: `repository ${repo} was not cloned` };
+      : { status: 1, stdout: "", stderr: `repository ${repo} was not cloned or checked out` };
   }
   return dockerSync(
     ["exec", "-e", `REPO=${repo}`, "-e", `BRANCH=${branch}`, name, "sh", "-c", CLONE_ONE_SCRIPT],

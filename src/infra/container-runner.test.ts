@@ -96,8 +96,9 @@ describe("PROVISION_GITHUB_REPO_SCRIPT", () => {
   it("continues a remote branch or creates it from the live default branch", () => {
     expect(PROVISION_GITHUB_REPO_SCRIPT).toContain('ls-remote --exit-code --heads origin "$BRANCH"');
     expect(PROVISION_GITHUB_REPO_SCRIPT).toContain('pull --ff-only origin "$BRANCH"');
-    expect(PROVISION_GITHUB_REPO_SCRIPT).toContain('checkout -B "$BRANCH" "origin/$DEFAULT_BRANCH"');
-    expect(PROVISION_GITHUB_REPO_SCRIPT).toContain('merge-base HEAD "origin/$DEFAULT_BRANCH"');
+    expect(PROVISION_GITHUB_REPO_SCRIPT).toContain('symbolic-ref --short refs/remotes/origin/HEAD');
+    expect(PROVISION_GITHUB_REPO_SCRIPT).toContain('checkout -B "$BRANCH" "$DEFAULT_REF"');
+    expect(PROVISION_GITHUB_REPO_SCRIPT).toContain('merge-base HEAD "$DEFAULT_REF"');
     expect(PROVISION_GITHUB_REPO_SCRIPT).toContain('status --porcelain');
     expect(PROVISION_GITHUB_REPO_SCRIPT).toContain("refs/openclaw/base");
   });

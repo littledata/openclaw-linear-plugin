@@ -1138,6 +1138,15 @@ describe("AgentSessionEvent.prompted full flow", () => {
       }),
     );
     expect(runAgentMock).not.toHaveBeenCalled();
+    expect(startOrReuseContainerMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        issueIdentifier: "ENG-RESUME",
+        targetRepos: ["api"],
+        branch: "core-eng-resume",
+      }),
+      expect.any(Object),
+      expect.anything(),
+    );
     expect(setActiveSessionMock).toHaveBeenCalledWith(
       expect.objectContaining({ agentSessionId: "sess-resume", issueIdentifier: "ENG-RESUME" }),
     );
