@@ -5,7 +5,7 @@ import { LinearAgentApi, resolveLinearToken } from "../api/linear-api.js";
 import { buildProjectContext } from "./pipeline.js";
 import { setActiveSession, clearActiveSession, getActiveSession, getIssueAffinity, _resetAffinityForTesting } from "./active-session.js";
 import { readDispatchState, getActiveDispatch, registerDispatch, updateDispatchStatus, updateDispatchProgress, removeActiveDispatch } from "./dispatch-state.js";
-import { codingEnabled, conversationalEnabled, conversationalCommentReply } from "./mode-config.js";
+import { codingEnabled, conversationalEnabled, conversationalCommentReply, conversationalConfig } from "./mode-config.js";
 import { createManagedFlowForDispatch } from "./taskflow-bridge.js";
 import { createNotifierFromConfig } from "../infra/notify.js";
 import { assessTier } from "./tier-assess.js";
@@ -539,6 +539,19 @@ export async function handleLinearWebhook(api, req, res) {
         const mentionPattern = buildMentionPattern(profiles);
         let agentId = resolveAgentId(api);
         let mentionOverride = false;
+        // Conversational-only profile: this gateway serves exactly one Linear app,
+        // so a session that reached it IS a mention of that app — route to the
+        // configured conversational agent and SKIP cross-agent name routing. The
+        // scans below look at promptContext (the issue's description + comment
+        // history), which on a busy coding ticket is full of other agents' names
+        // (e.g. "vasile") and would misroute a LilAgent mention to the coding agent.
+        if (conversationalEnabled(pluginConfig) && !codingEnabled(pluginConfig)) {
+            const convAgent = conversationalConfig(pluginConfig).agentId;
+            if (typeof convAgent === "string" && convAgent)
+                agentId = convAgent;
+            mentionOverride = true;
+            api.logger.info(`AgentSession: conversational-only profile — routing to ${agentId}, skipping cross-agent name matching`);
+        }
         const sessionPrompt = typeof payload.agentSession?.prompt === "string"
             ? payload.agentSession.prompt : "";
         const textsToScan = [userMessage, sessionPrompt, promptContext].filter(Boolean);
@@ -1087,7 +1100,15 @@ export async function handleLinearWebhook(api, req, res) {
         const promptedMentionPattern = buildMentionPattern(promptedProfiles);
         let agentId = resolveAgentId(api);
         let mentionOverride = false;
-        if (promptedMentionPattern && userMessage) {
+        // Conversational-only profile: keep follow-ups on the conversational agent
+        // (see the created handler for rationale).
+        if (conversationalEnabled(pluginConfig) && !codingEnabled(pluginConfig)) {
+            const convAgent = conversationalConfig(pluginConfig).agentId;
+            if (typeof convAgent === "string" && convAgent)
+                agentId = convAgent;
+            mentionOverride = true;
+        }
+        if (!mentionOverride && promptedMentionPattern && userMessage) {
             const mentionMatch = userMessage.match(promptedMentionPattern);
             if (mentionMatch) {
                 const alias = mentionMatch[1];

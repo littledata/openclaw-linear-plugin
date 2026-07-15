@@ -871,6 +871,31 @@ describe("AppUserNotification handling", () => {
 // ---------------------------------------------------------------------------
 
 describe("AgentSessionEvent.created full flow", () => {
+  it("conversational-only profile routes to the conversational agent, ignoring agent names in promptContext", async () => {
+    runAgentMock.mockReset().mockResolvedValue({ success: true, output: "hi" });
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: "issue-conv-1", identifier: "ENG-CONV", title: "Q", description: "d",
+      state: { name: "In Progress", type: "started" }, team: { id: "team-1", key: "ENG" },
+    });
+    const { api } = await postWebhook({
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: { id: "sess-conv-1", issue: { id: "issue-conv-1", identifier: "ENG-CONV" } },
+      // promptContext (issue history) names another agent by bare name — must NOT misroute.
+      promptContext: "kaylee has been working on this; can you help?",
+      previousComments: [],
+    }, "/linear/webhook", {
+      coding: { enabled: false },
+      conversational: { enabled: true, agentId: "mal" },
+    });
+
+    expect(runAgentMock).toHaveBeenCalled();
+    expect(runAgentMock.mock.calls[0][0].agentId).toBe("mal"); // NOT "kaylee"
+    const infos = (api.logger.info as any).mock.calls.map((c: any[]) => String(c[0]));
+    expect(infos.some((l: string) => l.includes("conversational-only profile"))).toBe(true);
+    expect(infos.some((l: string) => l.includes("via bare name"))).toBe(false);
+  });
+
   it("keeps a comment-backed mention conversational even when the issue is delegated", async () => {
     mockLinearApiInstance.getIssueDetails.mockResolvedValue({
       id: "issue-mentioned-while-delegated",
