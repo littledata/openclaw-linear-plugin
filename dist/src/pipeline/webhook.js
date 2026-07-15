@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { LinearAgentApi, resolveLinearToken } from "../api/linear-api.js";
 import { buildProjectContext } from "./pipeline.js";
 import { setActiveSession, clearActiveSession, getActiveSession, getIssueAffinity, _resetAffinityForTesting } from "./active-session.js";
@@ -292,7 +293,7 @@ export async function readJsonBody(req, maxBytes, timeoutMs = 5000) {
             clearTimeout(timer);
             try {
                 const raw = Buffer.concat(chunks).toString("utf8");
-                resolve({ ok: true, value: JSON.parse(raw) });
+                resolve({ ok: true, value: JSON.parse(raw), raw });
             }
             catch {
                 resolve({ ok: false, error: "invalid json" });
@@ -369,6 +370,47 @@ function resolveAgentId(api) {
     }
     return defaultAgent[0];
 }
+/**
+ * Resolve the configured Linear webhook signing secret(s). Supports a
+ * comma-separated list (for rotation) via `webhookSigningSecret` config or the
+ * LINEAR_WEBHOOK_SIGNING_SECRET env var.
+ * @param cfg - plugin config
+ * @returns trimmed non-empty secrets (may be empty when unconfigured)
+ */
+export function resolveWebhookSigningSecrets(cfg) {
+    const fromCfg = typeof cfg?.webhookSigningSecret === "string" ? cfg.webhookSigningSecret : "";
+    const raw = fromCfg || process.env.LINEAR_WEBHOOK_SIGNING_SECRET || "";
+    return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
+/**
+ * Verify a Linear webhook against its HMAC signature. Linear signs the RAW
+ * request body with the webhook's signing secret (HMAC-SHA256, hex) and sends
+ * it in the `Linear-Signature` header. Since the endpoint is publicly reachable,
+ * this is what prevents forged webhooks from driving the pipeline.
+ * @param req - the incoming request (for the header)
+ * @param raw - the exact raw request body bytes as received
+ * @param cfg - plugin config (for the signing secret)
+ * @returns "ok" (valid) | "invalid" (present secret, bad/absent signature) |
+ *          "unconfigured" (no secret set — caller should warn, endpoint open)
+ */
+export function verifyLinearWebhookSignature(req, raw, cfg) {
+    const secrets = resolveWebhookSigningSecrets(cfg);
+    if (!secrets.length)
+        return "unconfigured";
+    const header = req.headers["linear-signature"];
+    const provided = Array.isArray(header) ? header[0] : header;
+    if (!provided || typeof provided !== "string")
+        return "invalid";
+    const providedBuf = Buffer.from(provided, "utf8");
+    for (const secret of secrets) {
+        const expected = createHmac("sha256", secret).update(raw, "utf8").digest("hex");
+        const expectedBuf = Buffer.from(expected, "utf8");
+        if (expectedBuf.length === providedBuf.length && timingSafeEqual(expectedBuf, providedBuf)) {
+            return "ok";
+        }
+    }
+    return "invalid";
+}
 export async function handleLinearWebhook(api, req, res) {
     if (req.method !== "POST") {
         res.statusCode = 405;
@@ -380,6 +422,22 @@ export async function handleLinearWebhook(api, req, res) {
         res.statusCode = 400;
         res.end(body.error);
         return true;
+    }
+    // Authenticate the webhook by its Linear-Signature HMAC. The route is public
+    // (auth:"plugin" = the gateway doesn't gate it), so this is the only thing
+    // stopping a forged POST from triggering the pipeline. Enforced when a signing
+    // secret is configured; warns loudly (but proceeds) when it isn't, so an
+    // existing deployment doesn't hard-break the moment this ships.
+    const sig = verifyLinearWebhookSignature(req, body.raw ?? "", api.pluginConfig);
+    if (sig === "invalid") {
+        api.logger.warn("Linear webhook: signature verification FAILED — rejecting request");
+        res.statusCode = 401;
+        res.end("invalid signature");
+        return true;
+    }
+    if (sig === "unconfigured") {
+        api.logger.warn("Linear webhook: NO signing secret configured — endpoint is UNAUTHENTICATED. " +
+            "Set webhookSigningSecret (or LINEAR_WEBHOOK_SIGNING_SECRET) to the Linear webhook's signing secret.");
     }
     const payload = body.value;
     // Structural validation — reject obviously invalid payloads early
