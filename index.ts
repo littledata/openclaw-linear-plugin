@@ -169,7 +169,14 @@ export default function register(api: OpenClawPluginApi) {
   });
 
   // Register dispatch monitor service (stale detection, session hydration, cleanup)
-  api.registerService(createDispatchService(api));
+  // ONLY when coding is enabled. It reads the (homedir-default, cross-profile-
+  // shared) dispatch-state; a conversational-only profile would otherwise
+  // stale-detect / reconcile another profile's coding dispatches.
+  if (codingEnabled(pluginConfig)) {
+    api.registerService(createDispatchService(api));
+  } else {
+    api.logger.info("Dispatch monitor disabled — coding is disabled on this profile.");
+  }
 
   // Register dispatch gateway RPC methods (list, get, retry, escalate, cancel, stats)
   registerDispatchMethods(api);

@@ -771,19 +771,25 @@ export async function handleLinearWebhook(
     // this session isn't recognized as the delegation — it must NOT spin up a
     // conversational agent. That agent runs and races the pipeline (this is what
     // ran host `git` in ~/repos and failed). Reuse the session and defer instead.
-    try {
-      const dispatchIdentifier = enrichedIssue?.identifier ?? issue.identifier ?? issue.id;
-      const dispatchState = await readDispatchState(pluginConfig?.dispatchStatePath as string | undefined);
-      const activeDispatch = getActiveDispatch(dispatchState, dispatchIdentifier);
-      if (activeDispatch) {
-        linearSessionByIssue.set(issue.id, session.id);
-        api.logger.info(
-          `AgentSession ${session.id}: pipeline dispatch active (${activeDispatch.status}) for ${dispatchIdentifier} — reusing this session, skipping conversational run`,
-        );
-        return true;
+    // ONLY on a coding-enabled profile: a conversational-only profile has no
+    // pipeline to defer to, and the default dispatch-state path is shared across
+    // profiles (homedir-based), so honoring it here would wrongly suppress every
+    // mention reply for an issue another profile happens to be dispatching.
+    if (codingEnabled(pluginConfig)) {
+      try {
+        const dispatchIdentifier = enrichedIssue?.identifier ?? issue.identifier ?? issue.id;
+        const dispatchState = await readDispatchState(pluginConfig?.dispatchStatePath as string | undefined);
+        const activeDispatch = getActiveDispatch(dispatchState, dispatchIdentifier);
+        if (activeDispatch) {
+          linearSessionByIssue.set(issue.id, session.id);
+          api.logger.info(
+            `AgentSession ${session.id}: pipeline dispatch active (${activeDispatch.status}) for ${dispatchIdentifier} — reusing this session, skipping conversational run`,
+          );
+          return true;
+        }
+      } catch (err) {
+        api.logger.warn(`AgentSession ${session.id}: dispatch-state active-check failed: ${err}`);
       }
-    } catch (err) {
-      api.logger.warn(`AgentSession ${session.id}: dispatch-state active-check failed: ${err}`);
     }
 
     const description = enrichedIssue?.description ?? issue?.description ?? "(no description)";
