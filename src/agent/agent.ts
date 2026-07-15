@@ -495,9 +495,28 @@ async function runEmbedded(
     "provided for this ticket's Docker sandbox.",
     "Your only output is your text response.",
   ].join(" ");
-  const composedSystemPrompt = [extraSystemPrompt, readOnly ? readOnlyNotice : undefined]
+  const progressThoughtsEnabled = pluginConfig?.linearProgressThoughts !== false;
+  const progressNotice = progressThoughtsEnabled
+    ? [
+        "LINEAR PROGRESS VISIBILITY: Before the first tool batch and whenever your investigation",
+        "changes direction, write one brief commentary update explaining what you are checking,",
+        "the relevant finding so far, and what comes next. Keep it to one or two sentences.",
+        "Do not reveal private chain-of-thought and do not narrate every individual tool call.",
+      ].join(" ")
+    : undefined;
+  const composedSystemPrompt = [extraSystemPrompt, readOnly ? readOnlyNotice : undefined, progressNotice]
     .filter(Boolean)
     .join("\n\n");
+
+  let pendingAssistantCommentary = "";
+  let lastEmittedCommentary = "";
+  const flushAssistantCommentary = () => {
+    const text = pendingAssistantCommentary.trim();
+    pendingAssistantCommentary = "";
+    if (!progressThoughtsEnabled || text.length <= 10 || text === lastEmittedCommentary) return;
+    lastEmittedCommentary = text;
+    emit({ type: "thought", body: formatToolActivityValue(text, 1_200) });
+  };
 
   let codexBinding: ActiveCodexRunBinding | undefined;
   const linearSessionId = streaming.agentSessionId;
@@ -570,12 +589,15 @@ async function runEmbedded(
       shouldEmitToolOutput: () => false,
       ...(composedSystemPrompt ? { extraSystemPrompt: composedSystemPrompt } : {}),
 
-      // Stream reasoning/thinking to Linear
+      // Stream the model's REASONING SUMMARY to Linear as chain-of-thought.
+      // These are the provider's reasoning-summary blocks (not raw hidden CoT),
+      // surfaced so developers can follow and intervene. Requires the codex config
+      // to emit them (model_reasoning_summary != "none").
       onReasoningStream: (payload) => {
         watchdog.tick();
         const text = payload.text?.trim();
         if (text && text.length > 10) {
-          emit({ type: "thought", body: text.slice(0, 500) });
+          emit({ type: "thought", body: formatToolActivityValue(text, 4_000) });
         }
       },
 
@@ -603,6 +625,9 @@ async function runEmbedded(
 
         // Transient live card. The persistent completion carries args + result.
         if (phase === "start") {
+          // Visible assistant commentary followed by a tool call is a progress
+          // update, not the terminal answer. Emit it before the tool card.
+          flushAssistantCommentary();
           const action = formatToolActivityTitle(toolName);
           const parameter = formatToolActivityParameter(toolName, rawArgs, meta);
           if (toolCallId) pendingTools.set(toolCallId, { name: action, parameter });
@@ -629,9 +654,16 @@ async function runEmbedded(
       },
 
       // Partial assistant text (for long responses)
-      onPartialReply: (_payload) => {
+      onPartialReply: (payload) => {
         watchdog.tick();
-        // We don't emit every partial chunk to avoid flooding Linear.
+        // Buffer visible assistant commentary. It becomes a Linear thought only
+        // if another tool starts afterward; terminal answer text is therefore
+        // left to the caller's response activity and is never duplicated here.
+        const text = payload.text?.trim() ?? "";
+        if (!text) return;
+        if (payload.replace) pendingAssistantCommentary = text;
+        else if (typeof payload.delta === "string") pendingAssistantCommentary += payload.delta;
+        else pendingAssistantCommentary = text;
       },
 
       // Native Codex request_user_input is projected as an elicitation. The

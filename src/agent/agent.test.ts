@@ -379,6 +379,9 @@ describe("embedded tool activity projection", () => {
     const runEmbeddedPiAgent = vi.fn().mockImplementation(async (opts: any) => {
       expect(opts.shouldEmitToolResult()).toBe(false);
       expect(opts.shouldEmitToolOutput()).toBe(false);
+      opts.onPartialReply({
+        text: "I’m checking the local diff first so the review is based on the authoritative workspace.",
+      });
       opts.onAgentEvent({
         stream: "tool",
         data: {
@@ -415,9 +418,18 @@ describe("embedded tool activity projection", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(emitActivity).toHaveBeenCalledTimes(2);
+    expect(emitActivity).toHaveBeenCalledTimes(3);
     expect(emitActivity).toHaveBeenNthCalledWith(
       1,
+      "linear-session",
+      {
+        type: "thought",
+        body: "I’m checking the local diff first so the review is based on the authoritative workspace.",
+      },
+      undefined,
+    );
+    expect(emitActivity).toHaveBeenNthCalledWith(
+      2,
       "linear-session",
       {
         type: "action",
@@ -427,7 +439,7 @@ describe("embedded tool activity projection", () => {
       { ephemeral: true },
     );
     expect(emitActivity).toHaveBeenNthCalledWith(
-      2,
+      3,
       "linear-session",
       expect.objectContaining({
         type: "action",
@@ -439,6 +451,9 @@ describe("embedded tool activity projection", () => {
     );
     expect(runEmbeddedPiAgent.mock.calls[0][0].extraSystemPrompt).toContain(
       "Repository shell commands are allowed only through the container_* tools",
+    );
+    expect(runEmbeddedPiAgent.mock.calls[0][0].extraSystemPrompt).toContain(
+      "LINEAR PROGRESS VISIBILITY",
     );
     expect(runEmbeddedPiAgent.mock.calls[0][0].extraSystemPrompt).not.toContain("Do not run shell commands");
     expect(runEmbeddedPiAgent.mock.calls[0][0]).not.toHaveProperty("agentHarnessRuntimeOverride");
