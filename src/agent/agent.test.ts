@@ -457,6 +457,9 @@ describe("embedded tool activity projection", () => {
     );
     expect(runEmbeddedPiAgent.mock.calls[0][0].extraSystemPrompt).not.toContain("Do not run shell commands");
     expect(runEmbeddedPiAgent.mock.calls[0][0]).not.toHaveProperty("agentHarnessRuntimeOverride");
+    // Cross-agent (isolated) subagent spawns need the gateway subagent runtime
+    // binding (supplies operator.write); every embedded run must request it.
+    expect(runEmbeddedPiAgent.mock.calls[0][0].allowGatewaySubagentBinding).toBe(true);
   });
 
   it("forwards codex app-server stream:\"assistant\" narration to Linear as a thought", async () => {

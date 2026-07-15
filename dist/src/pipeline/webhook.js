@@ -68,6 +68,13 @@ function shouldBlockWorkRequest(intent, stateType, stateName, issueRef) {
 }
 // Track issues with active agent runs to prevent concurrent duplicate runs.
 const activeRuns = new Set();
+// Conversational Linear-issue agent runs must never touch the HOST filesystem —
+// all issue work happens in the per-ticket container (container_*/dispatch). Deny
+// host file mutation + host shell so a conversational run can't run e.g. `git`
+// against ~/repos on the box (which it did, and failed). Orchestration tools
+// (linear_issues, the coding dispatch tool, spawn_agent/ask_agent, read, web)
+// stay available.
+const LINEAR_SESSION_HOST_DENY = ["write", "edit", "apply_patch", "group:runtime"];
 // A STOP follow-up can arrive while the aborted pipeline is still unwinding.
 // Claim resumes separately so duplicate prompted webhooks cannot start two turns.
 const resumingRuns = new Set();
@@ -587,6 +594,25 @@ export async function handleLinearWebhook(api, req, res) {
             }
         }
         api.logger.info(`AgentSession created: ${session.id} for issue ${issue?.identifier ?? issue?.id} agent=${agentId} team=${teamKey ?? "?"} (comments: ${previousComments.length}, guidance: ${guidanceCtx.guidance ? "yes" : "no"})`);
+        // A pipeline dispatch is tracked in dispatch-state.json (NOT the in-memory
+        // activeRuns set), so the earlier guard misses it. When a second AgentSession
+        // is created mid-dispatch — e.g. delegate churn flips the delegate off/on and
+        // this session isn't recognized as the delegation — it must NOT spin up a
+        // conversational agent. That agent runs and races the pipeline (this is what
+        // ran host `git` in ~/repos and failed). Reuse the session and defer instead.
+        try {
+            const dispatchIdentifier = enrichedIssue?.identifier ?? issue.identifier ?? issue.id;
+            const dispatchState = await readDispatchState(pluginConfig?.dispatchStatePath);
+            const activeDispatch = getActiveDispatch(dispatchState, dispatchIdentifier);
+            if (activeDispatch) {
+                linearSessionByIssue.set(issue.id, session.id);
+                api.logger.info(`AgentSession ${session.id}: pipeline dispatch active (${activeDispatch.status}) for ${dispatchIdentifier} — reusing this session, skipping conversational run`);
+                return true;
+            }
+        }
+        catch (err) {
+            api.logger.warn(`AgentSession ${session.id}: dispatch-state active-check failed: ${err}`);
+        }
         const description = enrichedIssue?.description ?? issue?.description ?? "(no description)";
         // Cache guidance for this team (enables Comment webhook paths)
         const teamId = enrichedIssue?.team?.id;
@@ -708,6 +734,8 @@ export async function handleLinearWebhook(api, req, res) {
                     message,
                     timeoutMs: 5 * 60_000,
                     abortKey: issue.id,
+                    // Host-sandbox: issue work belongs in the container, never on the box.
+                    toolsDeny: LINEAR_SESSION_HOST_DENY,
                     streaming: {
                         linearApi,
                         agentSessionId: session.id,
@@ -1120,6 +1148,8 @@ export async function handleLinearWebhook(api, req, res) {
                     message,
                     timeoutMs: 5 * 60_000,
                     abortKey: issue.id,
+                    // Host-sandbox: issue work belongs in the container, never on the box.
+                    toolsDeny: LINEAR_SESSION_HOST_DENY,
                     streaming: {
                         linearApi,
                         agentSessionId: session.id,

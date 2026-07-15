@@ -481,6 +481,15 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
             prompt: message,
             agentId,
             runId,
+            // Bind this run to the gateway subagent runtime so sessions_spawn can
+            // delegate to OTHER agents (context:"isolated"). Cross-agent spawns go
+            // through the gateway "agent" method, which requires operator.write; only
+            // the gateway-subagent-bound path supplies it (via the synthetic operator
+            // client). Every core run path (channels, commands, CLI) sets this — our
+            // embedded runs omitted it, so a coding lead's cross-agent delegation was
+            // rejected with "missing scope: operator.write". Inert for read-only
+            // reviewers (their tool policy denies sessions_spawn anyway).
+            allowGatewaySubagentBinding: true,
             timeoutMs,
             config,
             provider,
