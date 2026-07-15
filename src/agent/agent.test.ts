@@ -36,7 +36,13 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 
-import { formatToolActivityValue, runAgent } from "./agent.js";
+import {
+  formatToolActivityParameter,
+  formatToolActivityResult,
+  formatToolActivityTitle,
+  formatToolActivityValue,
+  runAgent,
+} from "./agent.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 
 function createApi(): OpenClawPluginApi {
@@ -415,8 +421,8 @@ describe("embedded tool activity projection", () => {
       "linear-session",
       {
         type: "action",
-        action: "container_exec",
-        parameter: '{\n  "command": "git diff",\n  "workdir": "/work/repo"\n}',
+        action: "Shell",
+        parameter: "git diff",
       },
       { ephemeral: true },
     );
@@ -425,8 +431,9 @@ describe("embedded tool activity projection", () => {
       "linear-session",
       expect.objectContaining({
         type: "action",
-        action: "container_exec",
-        result: '{\n  "success": true,\n  "stdout": "diff output"\n}',
+        action: "Shell",
+        parameter: "git diff",
+        result: "diff output",
       }),
       undefined,
     );
@@ -440,6 +447,38 @@ describe("embedded tool activity projection", () => {
   it("pretty-prints JSON and caps oversized values", () => {
     expect(formatToolActivityValue('{"a":1}', 100)).toBe('{\n  "a": 1\n}');
     expect(formatToolActivityValue("abcdefgh", 4)).toContain("abcd\n…(4 more characters)");
+  });
+
+  it("formats search and generic tool activities for Linear", () => {
+    expect(formatToolActivityTitle("container_search_code")).toBe("Search Code");
+    expect(formatToolActivityParameter("container_search_code", {
+      query: "where are webhook events routed?",
+      repo: "openclaw-linear-plugin",
+      limit: 5,
+    })).toBe("where are webhook events routed?");
+
+    expect(formatToolActivityTitle("container_read_file")).toBe("Container Read File");
+    expect(formatToolActivityTitle("fetch_pr-details-v2")).toBe("Fetch Pr Details V2");
+    expect(formatToolActivityParameter("container_read_file", {
+      path: "src/agent/agent.ts",
+      repo: "openclaw-linear-plugin",
+    })).toBe('{\n  "path": "src/agent/agent.ts",\n  "repo": "openclaw-linear-plugin"\n}');
+  });
+
+  it("extracts shell output from OpenClaw's structured tool result", () => {
+    expect(formatToolActivityResult("container_exec", {
+      content: [{
+        type: "text",
+        text: JSON.stringify({ success: true, exitCode: 0, stdout: "line one\nline two", stderr: "" }),
+      }],
+      details: { success: true, exitCode: 0, stdout: "line one\nline two", stderr: "" },
+    }, false)).toBe("line one\nline two");
+    expect(formatToolActivityResult("container_exec", {
+      success: false,
+      exitCode: 1,
+      stdout: "",
+      stderr: "command failed",
+    }, true)).toBe("Failed\n\ncommand failed");
   });
 
   it("opts into the Codex harness, binds the stable session, and emits native input as elicitation", async () => {

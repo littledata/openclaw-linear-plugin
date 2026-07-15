@@ -51,6 +51,94 @@ export function formatToolActivityValue(value, maxChars) {
         return text;
     return `${text.slice(0, maxChars)}\n…(${text.length - maxChars} more characters)`;
 }
+function parseToolActivityObject(value) {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+        const record = value;
+        if (record.details && typeof record.details === "object" && !Array.isArray(record.details)) {
+            return record.details;
+        }
+        const content = Array.isArray(record.content) ? record.content : [];
+        const text = content.find((item) => item && typeof item === "object" && item.type === "text");
+        if (text) {
+            const textValue = text.text;
+            if (typeof textValue === "string") {
+                try {
+                    const parsed = JSON.parse(textValue);
+                    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                        return parsed;
+                    }
+                }
+                catch {
+                    // Fall through to the original result object.
+                }
+            }
+        }
+        return record;
+    }
+    if (typeof value === "string") {
+        try {
+            const parsed = JSON.parse(value);
+            return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+                ? parsed
+                : null;
+        }
+        catch {
+            return null;
+        }
+    }
+    return null;
+}
+/** Convert an internal tool identifier into its Linear activity title. */
+export function formatToolActivityTitle(toolName) {
+    if (toolName === "container_exec")
+        return "Shell";
+    if (toolName === "container_search_code")
+        return "Search Code";
+    return toolName
+        .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+        .replace(/[_-]+/g, " ")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+        .join(" ") || "Tool";
+}
+/** Format tool arguments for the expandable Linear action parameter area. */
+export function formatToolActivityParameter(toolName, rawArgs, meta = "") {
+    const args = parseToolActivityObject(rawArgs);
+    if (toolName === "container_exec") {
+        const command = args?.command;
+        if (typeof command === "string")
+            return formatToolActivityValue(command, 4_000) || undefined;
+    }
+    if (toolName === "container_search_code") {
+        const query = args?.query;
+        if (typeof query === "string")
+            return formatToolActivityValue(query, 4_000) || undefined;
+    }
+    return formatToolActivityValue(rawArgs ?? meta, 4_000) || undefined;
+}
+/** Format a completed tool result for the Linear action output area. */
+export function formatToolActivityResult(toolName, rawResult, isError) {
+    if (toolName === "container_exec") {
+        const result = parseToolActivityObject(rawResult);
+        if (result) {
+            const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
+            const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
+            const error = typeof result.error === "string" ? result.error.trim() : "";
+            const shellOutput = stdout || stderr || error;
+            if (shellOutput) {
+                const formatted = formatToolActivityValue(shellOutput, 12_000);
+                return isError ? `Failed\n\n${formatted}` : formatted;
+            }
+            if (typeof result.exitCode === "number") {
+                return isError ? `Failed\n\nExit code ${result.exitCode}` : `Exit code ${result.exitCode}`;
+            }
+        }
+    }
+    const formatted = formatToolActivityValue(rawResult, 12_000) || (isError ? "failed" : "completed");
+    return isError ? `Failed\n\n${formatted}` : formatted;
+}
 /**
  * Run an agent with automatic retry on watchdog kill.
  *
@@ -412,10 +500,11 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
                 const rawArgs = data.args ?? data.input;
                 // Transient live card. The persistent completion carries args + result.
                 if (phase === "start") {
-                    const parameter = formatToolActivityValue(rawArgs ?? meta, 4_000) || undefined;
+                    const action = formatToolActivityTitle(toolName);
+                    const parameter = formatToolActivityParameter(toolName, rawArgs, meta);
                     if (toolCallId)
-                        pendingTools.set(toolCallId, { name: toolName, parameter });
-                    emit({ type: "action", action: toolName, parameter }, { ephemeral: true });
+                        pendingTools.set(toolCallId, { name: action, parameter });
+                    emit({ type: "action", action, parameter }, { ephemeral: true });
                 }
                 if (phase === "result") {
                     const pending = toolCallId ? pendingTools.get(toolCallId) : undefined;
@@ -429,12 +518,11 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
                         pendingTools.delete(toolCallId);
                     const isError = completed?.isError ?? Boolean(data.isError);
                     const rawResult = completed?.result ?? data.result ?? meta ?? (isError ? "failed" : "completed");
-                    const formattedResult = formatToolActivityValue(rawResult, 12_000) || (isError ? "failed" : "completed");
                     emit({
                         type: "action",
-                        action: pending?.name ?? toolName,
+                        action: pending?.name ?? formatToolActivityTitle(toolName),
                         parameter: pending?.parameter,
-                        result: isError ? `Failed\n\n${formattedResult}` : formattedResult,
+                        result: formatToolActivityResult(toolName, rawResult, isError),
                     });
                 }
             },
