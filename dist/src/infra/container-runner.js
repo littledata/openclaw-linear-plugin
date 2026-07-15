@@ -616,6 +616,11 @@ const CODE_SEARCH_SCRIPT = [
     'export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"',
     'command -v ccc >/dev/null 2>&1 || { echo "ccc (cocoindex-code) is not installed in this container" >&2; exit 127; }',
     'if [ -d .git ]; then grep -qx ".cocoindex_code/" .git/info/exclude 2>/dev/null || echo ".cocoindex_code/" >> .git/info/exclude; fi',
+    // First: create project + global settings (local sbert embeddings, no prompt
+    // since the [full] install ships them). `ccc index` does NOT auto-create these,
+    // so skipping init makes index/search fail with "Global settings not found".
+    // `-f` skips the parent-directory warning; guard so we only init once.
+    '[ -f .cocoindex_code/settings.yml ] || ccc init -f >/dev/null 2>&1 || true',
     // Incremental index (first run downloads the embedding model + full index).
     'ccc index >/dev/null 2>&1 || true',
     'ccc search "$CCC_QUERY" --limit "$CCC_LIMIT"',
