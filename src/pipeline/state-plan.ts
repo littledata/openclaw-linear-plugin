@@ -23,12 +23,40 @@
 
 export type PhaseType = "plan-implement" | "review" | "product";
 
+/** Pipeline role an agent plays in a phase (drives GitHub key + tool policy). */
+export type PhaseKind = "plan-implement" | "review" | "qa";
+
 export interface PlanPhase {
   type: PhaseType;
-  /** Role id for `review` / `product` phases. Ignored for `plan-implement`. */
+  /**
+   * The OpenClaw agent id assigned to this phase. Any configured agent can be
+   * mapped to any Linear status. Falls back to `role` (legacy) when unset.
+   */
+  agentId?: string;
+  /**
+   * Legacy role id for `review` / `product` phases. Superseded by `agentId`;
+   * still honored so existing configs keep working. Ignored for plan-implement.
+   */
   role?: string;
+  /**
+   * The pipeline kind this phase runs as — selects the GitHub key, tool policy,
+   * and workspace-prompt mode. Defaults from `type` (review→review, product→qa)
+   * but a review-status running QA can set `kind:"qa"` explicitly.
+   */
+  kind?: PhaseKind;
   /** A failing verdict gates (triggers bounded rework). Defaults true for reviews. */
   gate?: boolean;
+}
+
+/** The effective agent id for a phase: explicit `agentId`, else legacy `role`. */
+export function phaseAgentId(phase: PlanPhase): string | undefined {
+  return phase.agentId ?? phase.role;
+}
+
+/** The effective pipeline kind for a phase (explicit `kind`, else derived from `type`). */
+export function phaseKind(phase: PlanPhase): PhaseKind {
+  if (phase.kind) return phase.kind;
+  return phase.type === "plan-implement" ? "plan-implement" : "review";
 }
 
 export interface SuccessTarget {
@@ -64,21 +92,21 @@ export function isReviewOnlyPlan(plan: StatePlan | null | undefined): plan is St
 // Built-in default plans
 // ---------------------------------------------------------------------------
 
-/** Todo / In Progress → build (Apex-led) → Code Review. */
+/** Todo / In Progress → build (Apex-led, in-session subagents) → Code Review. */
 const IMPLEMENT_PLAN: StatePlan = {
   stateLabel: "implement",
-  phases: [{ type: "plan-implement" }],
+  phases: [{ type: "plan-implement", agentId: "apex", kind: "plan-implement" }],
   onSuccess: { names: ["In Review", "Code Review", "Review"], type: "started" },
   onFailure: { names: ["In Progress", "Doing"], type: "started" },
   clearDelegate: true,
 };
 
-/** Code Review → security + lead review gate → QA. */
+/** Code Review → lead review (apex-reviewer) + security review (warden) gate → QA. */
 const CODE_REVIEW_PLAN: StatePlan = {
   stateLabel: "code-review",
   phases: [
-    { type: "review", role: "warden", gate: true },
-    { type: "review", role: "apex", gate: true },
+    { type: "review", agentId: "apex-reviewer", kind: "review", gate: true },
+    { type: "review", agentId: "warden", kind: "review", gate: true },
   ],
   onSuccess: { names: ["QA", "Testing", "In QA", "Ready for QA"], type: "started" },
   onFailure: { names: ["In Progress", "Doing"], type: "started" },
@@ -88,7 +116,7 @@ const CODE_REVIEW_PLAN: StatePlan = {
 /** QA → Proof QA gate → Done. */
 const QA_PLAN: StatePlan = {
   stateLabel: "qa",
-  phases: [{ type: "review", role: "proof", gate: true }],
+  phases: [{ type: "review", agentId: "proof", kind: "qa", gate: true }],
   onSuccess: { names: ["Done", "Merged", "Complete", "Completed"], type: "completed" },
   onFailure: { names: ["In Review", "Code Review", "Review"], type: "started" },
   clearDelegate: true,
@@ -128,22 +156,27 @@ const MATCHERS: Array<{ test: (s: WorkflowState) => boolean; plan: StatePlan }> 
  */
 function normalizePhase(raw: unknown): PlanPhase | null {
   if (typeof raw === "string") {
-    if (raw === "plan-implement") return { type: "plan-implement" };
-    // Bare role id → infer review vs product isn't possible here; the
-    // orchestrator resolves the role. Treat product roles as product, else review.
+    if (raw === "plan-implement") return { type: "plan-implement", agentId: "apex", kind: "plan-implement" };
+    // Bare agent/role id → infer review vs product. `apex` at a bare mapping is
+    // the coding lead (plan-implement); product agents are product; else review.
+    if (raw === "apex") return { type: "plan-implement", agentId: "apex", kind: "plan-implement" };
     const productRoles = ["helm", "lumen"];
     return productRoles.includes(raw)
-      ? { type: "product", role: raw }
-      : { type: "review", role: raw, gate: true };
+      ? { type: "product", agentId: raw }
+      : { type: "review", agentId: raw, kind: raw === "proof" ? "qa" : "review", gate: true };
   }
   if (raw && typeof raw === "object") {
     const o = raw as Record<string, unknown>;
     const type = o.type as PhaseType | undefined;
-    if (type === "plan-implement") return { type };
+    const agentId = typeof o.agentId === "string" ? o.agentId : typeof o.role === "string" ? o.role : undefined;
+    const kind = o.kind === "plan-implement" || o.kind === "review" || o.kind === "qa" ? (o.kind as PhaseKind) : undefined;
+    if (type === "plan-implement") return { type, agentId: agentId ?? "apex", kind: kind ?? "plan-implement" };
     if (type === "review" || type === "product") {
       return {
         type,
+        agentId,
         role: typeof o.role === "string" ? o.role : undefined,
+        kind: kind ?? (type === "product" ? "qa" : "review"),
         gate: type === "review" ? o.gate !== false : undefined,
       };
     }

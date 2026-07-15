@@ -15,6 +15,7 @@ import { hydrateGitHubRepositoryCatalog } from "../infra/github-repository-catal
 import { repoSelectSignal, optionsSignal } from "./select-signal.js";
 import { savePendingRepoSelection, getPendingRepoSelection, clearPendingRepoSelection, parseRepoSelection, } from "./repo-selection-state.js";
 import { getGrill, saveGrill, clearGrill } from "./grill-state.js";
+import { getPlanApproval, savePlanApproval, isApprovalReply } from "./plan-approval-state.js";
 import { runStatePlan } from "./orchestrator.js";
 import { resolveStatePlan, orchestrationMode, isReviewOnlyPlan } from "./state-plan.js";
 import { gatherPriorWork, synthesizePriorContext } from "./prior-work.js";
@@ -2728,6 +2729,19 @@ async function routePausedPrompt(api, session, issue, activityBody, pluginConfig
     if (!linearApi) {
         api.logger.error("No Linear access token configured");
         return true;
+    }
+    // Plan-approval gate: a reply to a pending plan is either an approval (mark
+    // approved so the resume implements it) or a change request (stay pending; the
+    // reply flows through as feedback and Apex revises + re-presents).
+    const approval = getPlanApproval(issue.id);
+    if (approval?.status === "pending") {
+        if (isApprovalReply(userMessage)) {
+            savePlanApproval({ ...approval, status: "approved" });
+            api.logger.info(`AgentSession prompted: ${identifier} — plan approved, resuming to implement`);
+        }
+        else {
+            api.logger.info(`AgentSession prompted: ${identifier} — plan change request, Apex will revise`);
+        }
     }
     api.logger.info(`AgentSession prompted: ${session.id} — resuming paused dispatch ${identifier}`);
     const pauseGeneration = pauseGenerations.get(issue.id) ?? 0;

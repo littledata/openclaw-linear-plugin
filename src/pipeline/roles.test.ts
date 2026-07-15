@@ -23,7 +23,7 @@ describe("resolveRole", () => {
 describe("implementerRoles", () => {
   it("returns only the implement-kind roles", () => {
     const ids = implementerRoles().map((r) => r.id).sort();
-    expect(ids).toEqual(["flux", "forge", "prism", "spine"]);
+    expect(ids).toEqual(["flux", "forge", "prism", "relay", "spine"]);
   });
 });
 
@@ -54,7 +54,7 @@ describe("resolveRoleModel", () => {
 describe("buildRolePrompt", () => {
   it("binds the skill and names the issue", () => {
     const p = buildRolePrompt(ROLES.spine, { identifier: "CORE-1", phase: "implement" });
-    expect(p).toContain("spine-backend");
+    expect(p).toContain("spine-api");
     expect(p).toContain("CORE-1");
     expect(p).toContain("worktree");
   });
@@ -72,12 +72,12 @@ describe("buildRolePrompt", () => {
   });
   it("embedded backend references the skill by name", () => {
     const p = buildRolePrompt(ROLES.warden, { identifier: "CORE-5", phase: "review", backend: "embedded" });
-    expect(p).toContain("warden-security");
+    expect(p).toContain("warden-audit");
     expect(p).toMatch(/Use the .* skill/);
   });
   it("codex backend does NOT tell it to use a skill or cli_ tool", () => {
     const p = buildRolePrompt(ROLES.spine, { identifier: "CORE-6", phase: "implement", backend: "codex" });
-    expect(p).not.toMatch(/Use the `spine-backend` skill/);
+    expect(p).not.toMatch(/Use the `spine-api` skill/);
     expect(p).toMatch(/implement DIRECTLY/i);
     expect(p).toMatch(/no.*cli_\* tools|do NOT have/i);
   });

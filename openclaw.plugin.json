@@ -213,7 +213,17 @@
       "teamGuidanceOverrides": { "type": "object", "description": "Per-team guidance toggle. Key = Linear team ID, value = boolean. Unset teams inherit enableGuidance.", "additionalProperties": { "type": "boolean" } },
       "enableTmux": { "type": "boolean", "default": true, "description": "Enable tmux wrapping for code_run CLI backends (enables steering)" },
       "enableRetro": { "type": "boolean", "default": true, "description": "Enable post-task retrospective analysis" },
-      "retroDir": { "type": "string", "description": "Override path for coding retrospective files (default: {stateDir}/shared/coding)" }
+      "retroDir": { "type": "string", "description": "Override path for coding retrospective files (default: {stateDir}/shared/coding)" },
+      "tononeRepo": { "type": "string", "description": "Git URL of the tonone agent stack fetched at provisioning.", "default": "https://github.com/tonone-ai/tonone.git" },
+      "tononeRef": { "type": "string", "description": "Branch, tag, or commit SHA of the tonone repo to install (pin for reproducibility).", "default": "main" },
+      "tononeCacheDir": { "type": "string", "description": "Cache directory for the tonone checkout (default: ~/.openclaw/tonone-cache)." },
+      "skillsInstallDir": { "type": "string", "description": "Where provisioned tonone skills are installed (default: <workspace-coding>/skills/tonone)." },
+      "provisionAgents": { "type": "array", "items": { "type": "string" }, "description": "Which roster agent ids to provision (default: the full built-in roster). e.g. [\"apex\",\"spine\",\"warden\",\"proof\"]." },
+      "agentOverrides": { "type": "object", "description": "Per-agent roster patches keyed by agent id (skills, subagents, label, summary).", "additionalProperties": { "type": "object" } },
+      "autoRegisterAgents": { "type": "boolean", "description": "Register provisioned agents in agents.list during provisioning.", "default": true },
+      "codingLeadAgentId": { "type": "string", "description": "Agent id that leads the coding phase and delegates to implementer subagents.", "default": "apex" },
+      "planApprovalGate": { "type": "boolean", "description": "Pause after Apex plans and require user approval before implementing.", "default": true },
+      "orchestratorPublishesReviews": { "type": "boolean", "description": "Force the orchestrator to publish the review bundle even when reviewers self-publish (embedded path).", "default": false }
     }
   }
 }

@@ -29,7 +29,7 @@ describe("isReviewOnlyPlan", () => {
 describe("resolveStatePlan — built-in matchers", () => {
   it("maps In Progress → implement", () => {
     const p = resolveStatePlan({ name: "In Progress", type: "started" })!;
-    expect(p.phases).toEqual([{ type: "plan-implement" }]);
+    expect(p.phases).toEqual([{ type: "plan-implement", agentId: "apex", kind: "plan-implement" }]);
     expect(p.onSuccess?.names).toContain("In Review");
     expect(p.onFailure?.names).toContain("In Progress");
     expect(p.clearDelegate).toBe(true);
@@ -42,7 +42,7 @@ describe("resolveStatePlan — built-in matchers", () => {
 
   it("maps In Review → code-review gates (checked before implement)", () => {
     const p = resolveStatePlan({ name: "In Review", type: "started" })!;
-    expect(p.phases.map((x) => x.role)).toEqual(["warden", "apex"]);
+    expect(p.phases.map((x) => x.agentId)).toEqual(["apex-reviewer", "warden"]);
     expect(p.phases.every((x) => x.gate)).toBe(true);
     expect(p.onSuccess?.names).toContain("QA");
     expect(p.onFailure?.names).toContain("In Progress");
@@ -50,7 +50,7 @@ describe("resolveStatePlan — built-in matchers", () => {
 
   it("maps QA → proof (checked before implement even though type=started)", () => {
     const p = resolveStatePlan({ name: "QA", type: "started" })!;
-    expect(p.phases).toEqual([{ type: "review", role: "proof", gate: true }]);
+    expect(p.phases).toEqual([{ type: "review", agentId: "proof", kind: "qa", gate: true }]);
     expect(p.onSuccess?.names).toContain("Done");
   });
 
@@ -78,8 +78,8 @@ describe("resolveStatePlan — config override", () => {
   it("overrides a built-in state by exact name (case-insensitive)", () => {
     const p = resolveStatePlan({ name: "In Progress", type: "started" }, cfg)!;
     expect(p.phases).toEqual([
-      { type: "plan-implement" },
-      { type: "review", role: "warden", gate: true },
+      { type: "plan-implement", agentId: "apex", kind: "plan-implement" },
+      { type: "review", agentId: "warden", kind: "review", gate: true },
     ]);
     expect(p.onSuccess?.names).toEqual(["Ready for Review"]);
     expect(p.onFailure?.names).toEqual(["Coding", "In Progress"]);
@@ -88,7 +88,7 @@ describe("resolveStatePlan — config override", () => {
 
   it("adds a plan for a custom state name", () => {
     const p = resolveStatePlan({ name: "Shipping", type: "started" }, cfg)!;
-    expect(p.phases).toEqual([{ type: "product", role: "lumen" }]);
+    expect(p.phases).toEqual([{ type: "product", agentId: "lumen", role: "lumen", kind: "qa", gate: undefined }]);
   });
 
   it("treats a bare product role id as a product phase", () => {
@@ -96,7 +96,7 @@ describe("resolveStatePlan — config override", () => {
       { name: "Discovery", type: "backlog" },
       { statePlans: { Discovery: { phases: ["helm"] } } },
     )!;
-    expect(p.phases).toEqual([{ type: "product", role: "helm" }]);
+    expect(p.phases).toEqual([{ type: "product", agentId: "helm" }]);
   });
 
   it("falls back to matcher when config plan has no usable phases", () => {

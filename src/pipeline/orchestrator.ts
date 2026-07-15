@@ -48,10 +48,32 @@ import {
   type RoleKind,
   type ReviewVerdict,
 } from "./roles.js";
-import { resolveTargetState, type StatePlan, type PlanPhase } from "./state-plan.js";
+import { resolveTargetState, phaseAgentId, phaseKind, type StatePlan, type PlanPhase, type PhaseKind } from "./state-plan.js";
+import { buildWorkspacePrompt } from "./workspace-prompt.js";
+import { getPlanApproval, savePlanApproval, clearPlanApproval } from "./plan-approval-state.js";
+import { optionsSignal } from "./select-signal.js";
 import { isCancelled, clearCancel } from "./cancellation.js";
 import { getActiveSession } from "./active-session.js";
 import { isCodexHarnessSteeringEnabled } from "../agent/codex-steering.js";
+
+/**
+ * Deny list for the coding LEAD: host writes/exec are blocked (all mutation goes
+ * through container_* tools), but sessions_spawn/sessions_send stay ALLOWED so
+ * the lead can delegate to its implementer subagents in-session.
+ */
+const CODING_LEAD_DENY: string[] = READ_ONLY_DENY.filter(
+  (tool) => tool !== "sessions_spawn" && tool !== "sessions_send",
+);
+
+/** The agent id that leads the coding phase (delegates to subagents). */
+function codingLeadAgentId(pluginConfig?: Record<string, unknown>): string {
+  return (pluginConfig?.codingLeadAgentId as string) || (pluginConfig?.implementerAgentId as string) || "apex";
+}
+
+/** Whether the Apex plan-approval gate is active (default on). */
+function planApprovalEnabled(pluginConfig?: Record<string, unknown>): boolean {
+  return pluginConfig?.planApprovalGate !== false;
+}
 
 interface OrchIssue {
   id: string;
@@ -315,6 +337,7 @@ async function runApexPlan(
   ctx: HookContext,
   dispatch: ActiveDispatch,
   issue: OrchIssue,
+  feedback?: string,
 ): Promise<Assignment[]> {
   const roster = implementerRoles()
     .map((r) => `- ${r.id}: ${r.summary}`)
@@ -326,10 +349,11 @@ async function runApexPlan(
     "Decide which specialists are needed and exactly what each must build.",
     "Assign the MINIMUM set that covers the work — prefer a single specialist unless",
     "the issue clearly spans concerns (e.g. backend + frontend).",
+    feedback ? `\nThe user reviewed your previous plan and asked for changes:\n${feedback}\nRevise the plan accordingly.` : "",
     "",
     "Respond with ONLY this JSON object (no prose):",
     '{"assignments":[{"role":"<id>","task":"<what this specialist must implement>"}],"notes":"<optional>"}',
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 
   const { output } = await runRole(ctx, dispatch, ROLES.apex, "plan", extra, issue);
   const assignments = parseAssignments(output, issue);
@@ -341,6 +365,34 @@ async function runApexPlan(
   // Persist the plan so a future session can read it back on resume.
   try { savePlan(dispatch.worktreePath, `# Plan for ${dispatch.issueIdentifier}\n\n${planText}`); } catch { /* best effort */ }
   return assignments;
+}
+
+/**
+ * Present Apex's plan to the user and ask for approval before any implementer
+ * runs. Emits a clickable Approve / Request-changes elicitation into the agent
+ * session (falls back to a Linear comment when there is no session).
+ * @param ctx - hook context
+ * @param dispatch - the active dispatch
+ * @param assignments - the plan to present
+ */
+async function presentPlanForApproval(
+  ctx: HookContext,
+  dispatch: ActiveDispatch,
+  assignments: Assignment[],
+): Promise<void> {
+  const planText = assignments
+    .map((a) => `- **${ROLES[a.role]?.label ?? a.role}** — ${a.task}`)
+    .join("\n");
+  const body =
+    `## 🧭 Plan ready for your approval\n\n${planText}\n\n` +
+    `Reply **approve** to proceed, or tell me what to change.`;
+  if (dispatch.agentSessionId) {
+    await ctx.linearApi
+      .emitActivity(dispatch.agentSessionId, { type: "elicitation", body }, optionsSignal(["Approve", "Request changes"]))
+      .catch((err) => ctx.api.logger.warn(`[orchestrator] plan-approval elicitation failed for ${dispatch.issueIdentifier}: ${err}`));
+  } else {
+    await comment(ctx, dispatch, body);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -380,35 +432,30 @@ async function runContainerImplement(
   reworkNote?: string,
 ): Promise<RoleRunResult> {
   const repos = dispatch.containerRepos ?? [];
-  const repoLines = repos.map((r) => `- ${r}: ${repoWorkdir(r)}`).join("\n") || WORK_ROOT;
   const plan = assignments
     .map((a) => `- ${resolveRole(a.role)?.label ?? a.role}: ${a.task}`)
     .join("\n");
+  const lead = resolveRole(codingLeadAgentId(ctx.pluginConfig)) ?? ROLES.apex;
+  const workspace = buildWorkspacePrompt({
+    identifier: dispatch.issueIdentifier,
+    repos: repos.map((r) => ({ name: r, workdir: repoWorkdir(r) })),
+    kind: "plan-implement",
+  });
+  const delegates = (lead.subagents ?? [])
+    .map((id) => `${id} (${resolveRole(id)?.summary ?? id})`)
+    .join("\n- ");
   const system = [
-    `You are implementing Linear issue ${issue.identifier} end to end.`,
+    `You are ${lead.label}, ${lead.summary}`,
+    workspace,
     "",
-    "## Your sandbox",
-    `You have a DEDICATED Docker container for this ticket — your private workspace.`,
-    `These repositories are already cloned and WRITABLE inside it:`,
-    repoLines,
-    "",
-    "Your host filesystem is READ-ONLY. The ONLY way to change files, run commands, run tests,",
-    "or run the app is via the container_* tools:",
-    "- container_exec — run any shell command (build, test, run the app, git, install deps)",
-    "- container_write_file / container_read_file — edit/read files",
-    "- container_apply_patch — apply a unified diff in a repo",
-    "- container_status — git status of the repos",
-    "- container_clone_repo — pull in another repo for cross-repo work",
-    "- container_search_code — AST semantic code search; use it to locate code by concept",
-    "  (\"where is X handled?\") when you don't know exact names — better than grep for discovery.",
-    "Start repository discovery with ONE bounded container_exec call that batches git status/log,",
-    "targeted rg searches, and small sed excerpts. Keep its output below 20k characters. Use further",
-    "tool calls only for gaps found by that first pass; do not fetch repository files through GitHub.",
-    "",
-    "## What to do",
-    "Implement the change fully, then VERIFY it by running the project's build/tests inside the",
-    `container. Commit your work in each changed repo (git add -A && git commit) on branch`,
-    `\`${dispatch.branch}\`. Use this structured commit message:`,
+    "## Leading this implementation",
+    "Scope the change, then DELEGATE each piece to the right specialist SUBAGENT in this same session via",
+    `sessions_spawn — do not write the code yourself. Your subagents:`,
+    delegates ? `- ${delegates}` : "- (no subagents configured — implement directly via container_* tools)",
+    "Each subagent shares THIS container and may only mutate through the container_* tools (host is read-only),",
+    "so all their work lands in the same workspace. Give each a precise task and the repos/paths to touch.",
+    "After they finish, VERIFY by running the project's build/tests via container_exec, and make sure every",
+    `change is committed in each repo on branch \`${dispatch.branch}\` with this structured message:`,
     "",
     `  ${issue.identifier}: <concise summary>`,
     "",
@@ -418,11 +465,9 @@ async function runContainerImplement(
     "  Validation:",
     "  - <command>: pass",
     "",
-    "On a self-review remediation turn, create a NEW commit with the same structure; never amend,",
-    "squash, or overwrite the coder commit. Do NOT open a pull request — that happens after review.",
-    "Do NOT push or launch another Codex/agent/reviewer. Return control after committing;",
-    "the orchestrator runs Apex and publishes the reviewed branch.",
-    "Never base64-encode repository files or read them one-by-one with git show.",
+    "On a self-review remediation turn, create a NEW commit with the same structure; never amend, squash, or",
+    "overwrite an earlier commit. Do NOT push, open a PR, or start a reviewer — the orchestrator owns push, PR",
+    "creation, and review after you return control.",
     dispatch.grillGuidance ? `\n## Clarified requirements\n${dispatch.grillGuidance}` : "",
   ]
     .filter(Boolean)
@@ -430,27 +475,25 @@ async function runContainerImplement(
   const task = [
     `Issue ${issue.identifier}: ${issue.title}`,
     issue.description ? `\nIssue body:\n${issue.description}` : "",
-    plan ? `\nImplementation plan (from Apex):\n${plan}` : "",
+    plan ? `\nSuggested breakdown:\n${plan}` : "",
     reworkNote ? `\n${reworkNote}` : "",
   ]
     .filter(Boolean)
     .join("\n");
 
-  // Match the agentId the dispatch registered its active session under, so the
-  // container tools resolve this issue's container via getActiveSessionByAgentId.
-  const agentId =
-    (ctx.pluginConfig?.implementerAgentId as string) ??
-    getActiveSession(dispatch.issueId)?.agentId ??
-    "main";
+  // Run as the coding LEAD agent (default "apex") so its configured
+  // subagents.allowAgents apply and it can delegate via sessions_spawn.
+  const agentId = codingLeadAgentId(ctx.pluginConfig);
   const r = await runAgent({
     api: ctx.api,
     agentId,
-    // Stable per-ticket session → one continuous, steerable implementer.
+    // Stable per-ticket session → one continuous, steerable lead.
     sessionId: `linear-impl-${dispatch.issueIdentifier}`,
     message: task,
     extraSystemPrompt: system,
-    // Deny host writes/exec — the agent acts ONLY through the container tools.
-    toolsDeny: READ_ONLY_DENY,
+    // Deny host writes/exec (mutations go through container_* only) but KEEP
+    // sessions_spawn/sessions_send so the lead can delegate to subagents.
+    toolsDeny: CODING_LEAD_DENY,
     issueIdentifier: dispatch.issueIdentifier,
     streaming: dispatch.agentSessionId
       ? { linearApi: ctx.linearApi, agentSessionId: dispatch.agentSessionId }
@@ -467,16 +510,54 @@ async function runImplementPhase(
   resumeGuidance?: string,
 ): Promise<PhaseResult> {
   const limit = maxRework(ctx.pluginConfig);
-  let assignments = resumeGuidance
-    ? [{
-      role: "spine",
-      task: [
-        "Continue the existing implementation in the preserved ticket workspace and OpenClaw session.",
-        "Inspect the current work before changing it; do not restart completed work.",
-        `User continuation: ${resumeGuidance}`,
-      ].join("\n"),
-    }]
-    : await runApexPlan(ctx, dispatch, issue);
+  const gateOn = planApprovalEnabled(ctx.pluginConfig);
+  const approval = gateOn ? getPlanApproval(dispatch.issueId) : undefined;
+  const inApprovalLoop = gateOn && approval && approval.status !== "approved";
+
+  const continuationAssignment = (guidance: string): Assignment[] => [{
+    role: "spine",
+    task: [
+      "Continue the existing implementation in the preserved ticket workspace and OpenClaw session.",
+      "Inspect the current work before changing it; do not restart completed work.",
+      `User continuation: ${guidance}`,
+    ].join("\n"),
+  }];
+
+  // Resolve the plan. Approved plans win (use the exact assignments the user
+  // signed off on). In the approval loop a user reply is change-request feedback
+  // → re-plan with it. Otherwise: a normal resume continues, a fresh turn plans.
+  let assignments: Assignment[];
+  if (approval?.status === "approved") {
+    assignments = approval.assignments?.length ? approval.assignments : await runApexPlan(ctx, dispatch, issue);
+  } else if (inApprovalLoop) {
+    assignments = await runApexPlan(ctx, dispatch, issue, resumeGuidance);
+  } else if (resumeGuidance) {
+    assignments = continuationAssignment(resumeGuidance);
+  } else {
+    assignments = await runApexPlan(ctx, dispatch, issue);
+  }
+
+  // Plan-approval gate: pause for the user's sign-off BEFORE any implementer runs.
+  // Fires on a fresh planning turn or while iterating the plan (pending approval);
+  // a plain STOP→continue (resumeGuidance with no pending approval) is NOT gated.
+  if (gateOn && approval?.status === "approved") {
+    clearPlanApproval(dispatch.issueId);
+    emit(ctx, dispatch, { type: "thought", body: "✅ Plan approved — implementing." });
+  } else if (gateOn && (approval?.status === "pending" || !resumeGuidance)) {
+    await presentPlanForApproval(ctx, dispatch, assignments);
+    const rounds = (approval?.rounds ?? 0) + 1;
+    savePlanApproval({
+      issueId: dispatch.issueId,
+      issueIdentifier: dispatch.issueIdentifier,
+      agentSessionId: dispatch.agentSessionId,
+      status: "pending",
+      assignments,
+      rounds,
+      createdAt: new Date().toISOString(),
+    });
+    // Pause like a STOP — the webhook resumes on the user's approve/feedback reply.
+    return { success: false, reason: "halted" };
+  }
   let lastReason = "";
   let lastReviewFindings = "";
   const useContainerAgent = implementerUsesContainerAgent(ctx.pluginConfig);
@@ -639,7 +720,8 @@ async function runImplementPhase(
       ctx,
       dispatch,
       issue,
-      ROLES.apex,
+      // Read-only reviewer for the self-review gate (apex is now the writable lead).
+      ROLES["apex-reviewer"] ?? ROLES.apex,
       [
         "Self-review the coder commits in the existing Docker workspace against the issue's acceptance criteria.",
         "Inspect the local refs/openclaw/base..HEAD diff in every changed repository; do not use GitHub APIs or connector tools.",
@@ -808,22 +890,18 @@ async function openPr(
 // Phase: review (Warden / Apex code-review / Proof QA) — gates
 // ---------------------------------------------------------------------------
 
-function reviewFocus(role: RoleDef): string {
-  const prInstruction =
-    "You are already running inside the ticket's Docker container. Review the exact linked pull request head " +
-    "that the orchestrator freshly fetched and checked out before this turn. Use local read-only shell commands " +
-    "such as git diff, rg, sed, and the project's tests. Do not call GitHub APIs, connector tools, container_* tools, " +
-    "or host commands; the local checkout is authoritative. " +
-    "Do not edit, commit, push, or open a PR. Write a detailed review; the orchestrator will publish it to GitHub. ";
+/** The role-specific audit angle appended to the shared workspace prompt. */
+function reviewAuditFocus(role: RoleDef): string {
   switch (role.id) {
     case "warden":
-      return prInstruction + "Audit this change for security issues: authz/authn, secrets, injection, unsafe deserialization, and supply-chain risk.";
+      return "Audit this change for security issues: authz/authn, secrets, injection, unsafe deserialization, and supply-chain risk.";
     case "proof":
-      return prInstruction + "QA this change against the issue's acceptance criteria. Run the test suite. Check edge cases and regressions.";
+      return "QA this change against the issue's acceptance criteria. Run the test suite. Check edge cases and regressions.";
     case "apex":
-      return prInstruction + "Code-review this change for correctness, design, and adherence to project conventions.";
+    case "apex-reviewer":
+      return "Code-review this change for correctness, design, and adherence to project conventions.";
     default:
-      return prInstruction + "Review this change.";
+      return "Review this change.";
   }
 }
 
@@ -859,13 +937,28 @@ function reviewInfrastructureFailure(output: string): string | null {
   return patterns.some((pattern) => pattern.test(output)) ? compact : null;
 }
 
-/** Publish one formal verdict for the complete review bundle to every linked PR. */
+/**
+ * Publish one formal verdict for the complete review bundle to every linked PR.
+ *
+ * Reviewers now publish their OWN reviews from inside the container (agent-driven,
+ * like a human — see the workspace prompt), so this orchestrator-side publication
+ * is an opt-in FALLBACK only, enabled with `orchestratorPublishesReviews: true`.
+ * The verdict GATE is independent of publication, so leaving this off never
+ * affects whether a ticket advances.
+ */
 async function publishReviewBundle(
   ctx: HookContext,
   dispatch: ActiveDispatch,
   reviews: ReviewRecord[],
   failures: Array<{ label: string; result: PhaseResult }>,
 ): Promise<void> {
+  // On the embedded/harness path reviewers self-publish (they hold the reviewer
+  // App token in-container), so the orchestrator stays out of the way. On the
+  // legacy codex path the reviewer has no token, so the orchestrator publishes.
+  // `orchestratorPublishesReviews: true` forces orchestrator publication either way.
+  const agentSelfPublishes =
+    isCodexHarnessSteeringEnabled(ctx.pluginConfig) && ctx.pluginConfig?.orchestratorPublishesReviews !== true;
+  if (agentSelfPublishes) return;
   const pullRequests = dispatch.reviewPullRequests ?? [];
   if (!pullRequests.length || (!reviews.length && !failures.length)) return;
   if (failures.some(({ result }) => result.infrastructureFailure)) return;
@@ -1014,6 +1107,7 @@ async function runReviewPhase(
   role: RoleDef,
   gate: boolean,
   resumeGuidance?: string,
+  kind: PhaseKind = "review",
 ): Promise<PhaseResult> {
   const syncFailure = await syncReviewSandbox(ctx, dispatch);
   if (syncFailure) {
@@ -1024,8 +1118,18 @@ async function runReviewPhase(
       infrastructureFailure: true,
     };
   }
+  const workspace = buildWorkspacePrompt({
+    identifier: dispatch.issueIdentifier,
+    repos: (dispatch.containerRepos ?? []).map((r) => ({ name: r, workdir: repoWorkdir(r) })),
+    kind,
+    reviewStyle: role.reviewStyle,
+    inlineComments: role.inlineComments,
+    verdictTag: role.verdictTag,
+    pullRequests: (dispatch.reviewPullRequests ?? []).map((pr) => ({ repoName: pr.repoName, url: pr.url })),
+  });
   const focus = [
-    reviewFocus(role),
+    workspace,
+    reviewAuditFocus(role),
     resumeGuidance ? `User continuation after pausing: ${resumeGuidance}` : "",
   ].filter(Boolean).join("\n\n");
   const verdict = await runStructuredReview(ctx, dispatch, issue, role, focus);
@@ -1229,7 +1333,7 @@ export async function runStatePlan(
       : `Orchestrating "${plan.stateLabel}" — ${plan.phases.length} phase(s)`,
   });
   ctx.api.logger.info(
-    `[orchestrator] ${issue.identifier} plan=${plan.stateLabel} phases=${plan.phases.map((p) => p.role ?? p.type).join(",")}`,
+    `[orchestrator] ${issue.identifier} plan=${plan.stateLabel} phases=${plan.phases.map((p) => phaseAgentId(p) ?? p.type).join(",")}`,
   );
 
   try {
@@ -1273,7 +1377,7 @@ export async function runStatePlan(
       }
       if (result.review) reviewRecords.push(result.review);
       if (!result.success) {
-        const label = phase.role ? `${phase.type}:${phase.role}` : phase.type;
+        const label = phaseAgentId(phase) ? `${phase.type}:${phaseAgentId(phase)}` : phase.type;
         const nextPhase = plan.phases[phaseIndex + 1];
         if (phase.type === "review") {
           reviewFailures.push({ label, result });
@@ -1406,13 +1510,15 @@ async function runPhase(
     return runImplementPhase(ctx, dispatch, issue, resumeGuidance);
   }
   if (phase.type === "review") {
-    const role = phase.role ? resolveRole(phase.role) : undefined;
-    if (!role) return { success: false, reason: `unknown review role "${phase.role}"` };
-    return runReviewPhase(ctx, dispatch, issue, role, phase.gate !== false, resumeGuidance);
+    const agentId = phaseAgentId(phase);
+    const role = agentId ? resolveRole(agentId) : undefined;
+    if (!role) return { success: false, reason: `unknown review agent "${agentId}"` };
+    return runReviewPhase(ctx, dispatch, issue, role, phase.gate !== false, resumeGuidance, phaseKind(phase));
   }
   if (phase.type === "product") {
-    const role = phase.role ? resolveRole(phase.role) : undefined;
-    if (!role) return { success: false, reason: `unknown product role "${phase.role}"` };
+    const agentId = phaseAgentId(phase);
+    const role = agentId ? resolveRole(agentId) : undefined;
+    if (!role) return { success: false, reason: `unknown product agent "${agentId}"` };
     const focus =
       role.id === "helm"
         ? "Turn this feature idea into a crisp product brief with goals, scope, and acceptance criteria."

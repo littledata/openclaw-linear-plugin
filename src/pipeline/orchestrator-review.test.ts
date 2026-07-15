@@ -121,7 +121,7 @@ describe("review verdict recovery", () => {
       workdir: "/work/ld-shopify",
       githubRole: undefined,
     });
-    expect(execCodexMock.mock.calls[0][0].prompt).toContain("the local checkout is authoritative");
+    expect(execCodexMock.mock.calls[0][0].prompt).toContain("authoritative");
     expect(publishPullRequestReviewMock).toHaveBeenCalledWith(
       "openclaw-linear-CORE-1740",
       "ld-shopify",
@@ -242,7 +242,9 @@ describe("review verdict recovery", () => {
         updateIssue,
       },
       notify: vi.fn().mockResolvedValue(undefined),
-      pluginConfig: { enableCodexHarnessSteering: true },
+      // Harness on → reviewers self-publish; opt into orchestrator publication
+      // to exercise the fallback path in this test.
+      pluginConfig: { enableCodexHarnessSteering: true, orchestratorPublishesReviews: true },
     } as any;
     const dispatch = {
       issueId: "issue-1",

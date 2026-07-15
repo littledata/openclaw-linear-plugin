@@ -49,8 +49,17 @@ async function resolveContainer(api, ctx) {
     touchContainer(identifier);
     return { containerName: name, identifier, repos: rec.repos, pluginConfig };
 }
+/**
+ * Which GitHub App identity a given agent's container commands run as. Reviewers
+ * (apex-reviewer / warden / proof) get the reviewer App (contents:read +
+ * pull_requests:write) so they can publish PR reviews/comments themselves but
+ * cannot push. Everyone else — the coding lead (apex) and its implementer
+ * subagents — gets the coding App.
+ * @param agentId - the running agent's id
+ * @returns "reviewer" for review agents, else "coding"
+ */
 function githubRoleForAgent(agentId) {
-    return agentId && ["apex", "warden", "proof", "helm", "lumen"].includes(agentId)
+    return agentId && ["apex-reviewer", "warden", "proof"].includes(agentId)
         ? "reviewer"
         : "coding";
 }

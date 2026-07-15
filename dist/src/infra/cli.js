@@ -11,6 +11,9 @@ import { LINEAR_OAUTH_AUTH_URL, LINEAR_OAUTH_TOKEN_URL, LINEAR_AGENT_SCOPES } fr
 import { listWorktrees } from "./codex-worktree.js";
 import { loadPrompts, clearPromptCache } from "../pipeline/pipeline.js";
 import { PROFILES_PATH, createAgentProfilesFile, loadAgentProfiles } from "./shared-profiles.js";
+import { provisionTononeAgents } from "../provisioning/provision.js";
+import { resolveRoster } from "../provisioning/agent-roster.js";
+import { listInstalledSkills } from "../provisioning/install-skills.js";
 import { formatMessage, parseNotificationsConfig, sendToTarget, } from "./notify.js";
 function prompt(question) {
     const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -579,6 +582,58 @@ export function registerCli(program, api) {
         }
         catch (err) {
             console.error(`  Migration failed: ${err instanceof Error ? err.message : String(err)}`);
+            process.exitCode = 1;
+        }
+    });
+    // --- openclaw openclaw-linear agents ---
+    const agents = linear
+        .command("agents")
+        .description("Provision the tonone agent stack (fetch skills, register agents)");
+    agents
+        .command("list")
+        .description("Show the configured roster and which skills are installed")
+        .action(async () => {
+        const pluginConfig = api.pluginConfig ?? {};
+        const roster = resolveRoster(pluginConfig);
+        const installed = new Set(listInstalledSkills(pluginConfig.skillsInstallDir));
+        console.log("\nProvisioned Agent Roster");
+        console.log("─".repeat(60));
+        if (roster.length === 0) {
+            console.log("  provisionAgents resolved to an empty roster.\n");
+            return;
+        }
+        for (const agent of roster) {
+            const skills = agent.skills.map((s) => (installed.has(s) ? s : `${s} (not installed)`));
+            const delegates = agent.subagents?.length ? `  → delegates: ${agent.subagents.join(", ")}` : "";
+            console.log(`  ${agent.id.padEnd(14)} ${agent.kind.padEnd(14)} ${agent.label}${delegates}`);
+            console.log(`  ${" ".padEnd(14)} skills: ${skills.join(", ")}`);
+        }
+        console.log(`\n  Run "openclaw openclaw-linear agents provision" to install + register.\n`);
+    });
+    agents
+        .command("provision")
+        .description("Fetch tonone skills at the configured ref, install them, and register the agents")
+        .option("--overwrite", "Re-sync skills/subagents on agents that already exist in agents.list")
+        .action(async (opts) => {
+        console.log("\nProvisioning tonone agents");
+        console.log("─".repeat(60));
+        try {
+            const result = await provisionTononeAgents(api, { overwrite: opts.overwrite });
+            console.log(`  ✓ Source ref:      ${result.ref} (${result.sha.slice(0, 8)})`);
+            console.log(`  ✓ Roster:          ${result.roster.join(", ")}`);
+            console.log(`  ✓ Skills installed: ${result.installedSkills.length}`);
+            if (result.missingSkills.length) {
+                console.log(`  ⚠ Skills missing:   ${result.missingSkills.join(", ")}`);
+            }
+            console.log(`  ✓ Agents created:  ${result.created.join(", ") || "(none)"}`);
+            if (result.updated.length)
+                console.log(`  ✓ Agents updated:  ${result.updated.join(", ")}`);
+            if (result.skipped.length)
+                console.log(`  · Agents skipped:  ${result.skipped.join(", ")}`);
+            console.log(`\n  Restart the gateway to fully apply agent registration.\n`);
+        }
+        catch (err) {
+            console.error(`  ✗ Provisioning failed: ${err instanceof Error ? err.message : String(err)}\n`);
             process.exitCode = 1;
         }
     });

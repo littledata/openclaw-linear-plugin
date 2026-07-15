@@ -30,6 +30,7 @@ vi.mock("./dispatch-state.js", () => ({
 }));
 
 import { runStatePlan, summarizeImplementationFailure } from "./orchestrator.js";
+import { getPlanApproval, savePlanApproval, clearPlanApproval } from "./plan-approval-state.js";
 
 describe("plan-implement no-change guard", () => {
   it("removes encoded tool payloads from implementation failures", () => {
@@ -66,7 +67,7 @@ describe("plan-implement no-change guard", () => {
         createComment,
       },
       notify: vi.fn().mockResolvedValue(undefined),
-      pluginConfig: { workerBackend: "codex", maxReworkAttempts: 0 },
+      pluginConfig: { workerBackend: "codex", maxReworkAttempts: 0, planApprovalGate: false },
     } as any;
     const dispatch = {
       issueId: "issue-1",
@@ -115,7 +116,7 @@ describe("plan-implement no-change guard", () => {
         createComment,
       },
       notify: vi.fn().mockResolvedValue(undefined),
-      pluginConfig: { workerBackend: "codex", maxReworkAttempts: 0 },
+      pluginConfig: { workerBackend: "codex", maxReworkAttempts: 0, planApprovalGate: false },
     } as any;
     const dispatch = {
       issueId: "issue-remediate",
@@ -167,7 +168,7 @@ describe("plan-implement no-change guard", () => {
         createComment: vi.fn().mockResolvedValue("comment-1"),
       },
       notify: vi.fn().mockResolvedValue(undefined),
-      pluginConfig: { workerBackend: "embedded", maxReworkAttempts: 0 },
+      pluginConfig: { workerBackend: "embedded", maxReworkAttempts: 0, planApprovalGate: false },
     } as any;
     const dispatch = {
       issueId: "issue-resume",
@@ -259,7 +260,7 @@ describe("plan-implement no-change guard", () => {
         createComment: vi.fn().mockResolvedValue("comment-1"),
       },
       notify: vi.fn().mockResolvedValue(undefined),
-      pluginConfig: { workerBackend: "embedded", maxReworkAttempts: 1 },
+      pluginConfig: { workerBackend: "embedded", maxReworkAttempts: 1, planApprovalGate: false },
     } as any;
     const dispatch = {
       issueId: "issue-fix",
@@ -291,5 +292,74 @@ describe("plan-implement no-change guard", () => {
     expect(runAgentMock.mock.calls[1][0].message).toContain("Found an unhandled null path");
     expect(runAgentMock.mock.calls[1][0].extraSystemPrompt).toContain("create a NEW commit");
     expect(openPrMock).toHaveBeenCalledOnce();
+  });
+});
+
+describe("plan-approval gate", () => {
+  const ISSUE = "issue-approval-gate";
+  beforeEach(() => {
+    clearPlanApproval(ISSUE);
+    runAgentMock.mockReset().mockResolvedValue({
+      success: true,
+      output: '{"assignments":[{"role":"spine","task":"Implement the change"}]}',
+    });
+    execCodexMock.mockReset().mockResolvedValue({ success: true, output: "Done" });
+    containerGitStatusMock.mockReset().mockReturnValue({
+      hasChanges: false, hasUncommitted: false, lastCommit: "abc base", lastCommitMessage: "base", commitsAhead: 0,
+    });
+    openPrMock.mockReset().mockResolvedValue("https://github.com/littledata/api/pull/1");
+    updateDispatchProgressMock.mockReset().mockResolvedValue(undefined);
+    completeDispatchMock.mockReset().mockResolvedValue(undefined);
+  });
+
+  function ctxFor(emitActivity: any) {
+    return {
+      api: { logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } },
+      linearApi: {
+        getIssueDetails: vi.fn().mockResolvedValue({ title: "Implement", team: { id: "team-1" } }),
+        emitActivity,
+        createComment: vi.fn().mockResolvedValue("comment-1"),
+      },
+      notify: vi.fn().mockResolvedValue(undefined),
+      pluginConfig: { workerBackend: "codex", maxReworkAttempts: 0, planApprovalGate: true },
+    } as any;
+  }
+  const dispatch = () => ({
+    issueId: ISSUE, issueIdentifier: "CORE-GATE", issueTitle: "Implement",
+    worktreePath: "/tmp/openclaw-linear-gate-test", branch: "CORE-GATE/work",
+    tier: "medium", model: "test-model", status: "dispatched",
+    dispatchedAt: "2026-07-15T10:00:00.000Z", attempt: 0, agentSessionId: "session-1",
+    containerName: "openclaw-linear-CORE-GATE", containerRepos: ["api"],
+  }) as any;
+
+  it("presents the plan and pauses before implementing on a fresh turn", async () => {
+    const emitActivity = vi.fn().mockResolvedValue(undefined);
+    await runStatePlan(ctxFor(emitActivity), dispatch(), {
+      stateLabel: "in-progress", phases: [{ type: "plan-implement" }], onSuccess: null,
+    });
+    // Apex planned, plan presented for approval, NO implementation ran.
+    expect(runAgentMock).toHaveBeenCalledTimes(1);
+    expect(execCodexMock).not.toHaveBeenCalled();
+    expect(openPrMock).not.toHaveBeenCalled();
+    const elicitation = emitActivity.mock.calls.find((c: any[]) => c[1]?.type === "elicitation");
+    expect(elicitation?.[1].body).toContain("approval");
+    expect(getPlanApproval(ISSUE)?.status).toBe("pending");
+    clearPlanApproval(ISSUE);
+  });
+
+  it("implements the approved plan once the user signs off", async () => {
+    savePlanApproval({
+      issueId: ISSUE, issueIdentifier: "CORE-GATE", agentSessionId: "session-1",
+      status: "approved", assignments: [{ role: "spine", task: "Implement the change" }],
+      rounds: 1, createdAt: "2026-07-15T10:00:00.000Z",
+    });
+    const emitActivity = vi.fn().mockResolvedValue(undefined);
+    await runStatePlan(ctxFor(emitActivity), dispatch(), {
+      stateLabel: "in-progress", phases: [{ type: "plan-implement" }], onSuccess: null,
+    });
+    // Approved plan → implementer ran (no re-plan needed), approval consumed.
+    expect(execCodexMock).toHaveBeenCalled();
+    expect(getPlanApproval(ISSUE)).toBeUndefined();
+    clearPlanApproval(ISSUE);
   });
 });

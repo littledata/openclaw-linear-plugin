@@ -49,6 +49,19 @@ export interface RoleDef {
    * non-gating roles.
    */
   verdictTag?: string;
+  /**
+   * How a reviewer publishes on the PR: "comment" (post findings, never approve
+   * — Warden) or "approve" (approve/request-changes, may leave inline comments —
+   * Apex Reviewer). Undefined for non-review roles.
+   */
+  reviewStyle?: "comment" | "approve";
+  /** Reviewer leaves inline line-level comments (Apex Reviewer). */
+  inlineComments?: boolean;
+  /**
+   * Agent ids this role may delegate to as in-session subagents (sessions_spawn).
+   * Set for the coding lead (Apex) and reviewer lead (Apex Reviewer).
+   */
+  subagents?: string[];
   /** One-line persona used in the system prompt (skill carries the detail). */
   summary: string;
 }
@@ -62,27 +75,49 @@ export const ROLES: Record<string, RoleDef> = {
   apex: {
     id: "apex",
     label: "Apex",
-    skill: "apex-lead",
+    skill: "apex-plan",
+    backend: "embedded",
+    readOnly: false,
+    kind: "plan",
+    subagents: ["spine", "relay", "flux", "prism", "forge"],
+    summary:
+      "the engineering lead — you scope the work, delegate to your specialist subagents in-session, and review the result before it moves on.",
+  },
+  "apex-reviewer": {
+    id: "apex-reviewer",
+    label: "Apex Reviewer",
+    skill: "apex-review",
     backend: "embedded",
     readOnly: true,
-    kind: "plan",
+    kind: "review",
     verdictTag: "REVIEW",
-    summary:
-      "the engineering lead — you scope the work, decide which implementers own which concerns, and review the result before it moves on.",
+    reviewStyle: "approve",
+    inlineComments: true,
+    subagents: ["spine", "warden", "proof", "forge", "prism"],
+    summary: "the lead code reviewer — you review correctness, design, and conventions, and can delegate review facets to specialists.",
   },
   spine: {
     id: "spine",
     label: "Spine",
-    skill: "spine-backend",
+    skill: "spine-api",
     backend: "codex",
     readOnly: false,
     kind: "implement",
     summary: "the backend specialist — APIs, services, business logic, data access.",
   },
+  relay: {
+    id: "relay",
+    label: "Relay",
+    skill: "relay-pipeline",
+    backend: "codex",
+    readOnly: false,
+    kind: "implement",
+    summary: "the CI/CD & deployment specialist — pipelines, containers, release strategy.",
+  },
   prism: {
     id: "prism",
     label: "Prism",
-    skill: "prism-frontend",
+    skill: "prism-ui",
     backend: "codex",
     readOnly: false,
     kind: "implement",
@@ -91,7 +126,7 @@ export const ROLES: Record<string, RoleDef> = {
   flux: {
     id: "flux",
     label: "Flux",
-    skill: "flux-data",
+    skill: "flux-schema",
     backend: "codex",
     readOnly: false,
     kind: "implement",
@@ -109,27 +144,29 @@ export const ROLES: Record<string, RoleDef> = {
   warden: {
     id: "warden",
     label: "Warden",
-    skill: "warden-security",
+    skill: "warden-audit",
     backend: "embedded",
     readOnly: true,
     kind: "review",
     verdictTag: "SECURITY",
+    reviewStyle: "comment",
     summary: "the security reviewer — you audit the change for authz, secrets, injection, and supply-chain risk.",
   },
   proof: {
     id: "proof",
     label: "Proof",
-    skill: "proof-qa",
+    skill: "proof-strategy",
     backend: "embedded",
     readOnly: true,
     kind: "review",
     verdictTag: "QA",
+    reviewStyle: "comment",
     summary: "the QA specialist — you verify the change against its acceptance criteria and run the tests.",
   },
   helm: {
     id: "helm",
     label: "Helm",
-    skill: "helm-product",
+    skill: "helm-brief",
     backend: "embedded",
     readOnly: true,
     kind: "product",
@@ -138,7 +175,7 @@ export const ROLES: Record<string, RoleDef> = {
   lumen: {
     id: "lumen",
     label: "Lumen",
-    skill: "lumen-analytics",
+    skill: "lumen-metrics",
     backend: "embedded",
     readOnly: true,
     kind: "product",

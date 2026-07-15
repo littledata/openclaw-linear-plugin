@@ -1156,7 +1156,7 @@ describe("AgentSessionEvent.prompted full flow", () => {
         agentSessionId: "sess-resume",
         containerName: "openclaw-linear-ENG-RESUME",
       }),
-      expect.objectContaining({ phases: [{ type: "plan-implement" }] }),
+      expect.objectContaining({ phases: [{ type: "plan-implement", agentId: "apex", kind: "plan-implement" }] }),
       expect.objectContaining({
         resume: true,
         resumeGuidance: "Continue, but leave Elasticsearch to the infrastructure repo.",
