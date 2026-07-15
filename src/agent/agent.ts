@@ -515,7 +515,8 @@ async function runEmbedded(
     pendingAssistantCommentary = "";
     if (!progressThoughtsEnabled || text.length <= 10 || text === lastEmittedCommentary) return;
     lastEmittedCommentary = text;
-    emit({ type: "thought", body: formatToolActivityValue(text, 1_200) });
+    api.logger.info(`[linear] emitting agent commentary as thought (${text.length} chars)`);
+    emit({ type: "thought", body: formatToolActivityValue(text, 4_000) });
   };
 
   let codexBinding: ActiveCodexRunBinding | undefined;
@@ -672,10 +673,18 @@ async function runEmbedded(
       onBlockReply: (payload) => {
         watchdog.tick();
         const text = payload.text?.trim();
-        if (text && /^(?:agent|codex) needs input:/i.test(text)) {
+        if (!text) return;
+        if (/^(?:agent|codex) needs input:/i.test(text)) {
           watchdog.pause();
           emit({ type: "elicitation", body: text });
+          return;
         }
+        // Codex delivers its "thinking"/preamble narration ("what I'm about to do
+        // and why") as full block replies — this is the channel, NOT onPartialReply.
+        // Buffer it as commentary; flushAssistantCommentary() emits it as a Linear
+        // `thought` when a tool follows. The FINAL block has no tool after it, so it
+        // is never flushed here and remains the caller's response (no duplication).
+        pendingAssistantCommentary = text;
       },
     });
 
