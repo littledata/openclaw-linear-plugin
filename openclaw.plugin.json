@@ -2,7 +2,7 @@
   "id": "openclaw-linear",
   "name": "Linear Agent",
   "description": "Linear integration with OAuth support, agent pipeline, and webhook-driven AI agent lifecycle",
-  "version": "0.9.24",
+  "version": "0.9.33",
   "activation": {
     "onStartup": true
   },
@@ -22,7 +22,14 @@
       "plan_get_project",
       "plan_update_issue",
       "plan_audit",
-      "dispatch_history"
+      "dispatch_history",
+      "container_exec",
+      "container_write_file",
+      "container_read_file",
+      "container_apply_patch",
+      "container_status",
+      "container_clone_repo",
+      "container_search_code"
     ]
   },
   "configSchema": {
@@ -40,6 +47,9 @@
       "executionMode": { "type": "string", "enum": ["worktree", "container"], "description": "Worker isolation mode. 'worktree' (default): git worktree off a shared local clone. 'container': a per-session Docker container that clones the repo fresh (removes shared git state → safe for concurrent dispatches on the same repo).", "default": "worktree" },
       "workerImage": { "type": "string", "description": "Docker image for container execution mode (built from docker/worker.Dockerfile).", "default": "openclaw-linear-worker:latest" },
       "githubOwner": { "type": "string", "description": "Default GitHub organization for repo entries that omit an explicit github owner/repo identity." },
+      "repositorySource": { "type": "string", "enum": ["local", "github-app"], "description": "Repository source for ticket containers. 'github-app' discovers installed repositories and clones/pulls them directly with short-lived App tokens; 'local' retains the legacy read-only host mirror.", "default": "local" },
+      "repositoryCatalogCacheSec": { "type": "number", "description": "Seconds to cache the GitHub App installation repository list before refreshing it.", "default": 300 },
+      "delegationSessionGraceMs": { "type": "number", "minimum": 0, "description": "Milliseconds to wait for Linear to create its native AgentSession after delegation before the plugin creates one through agentSessionCreateOnIssue.", "default": 3000 },
       "githubApps": {
         "type": "object",
         "additionalProperties": false,
@@ -68,17 +78,23 @@
         },
         "required": ["coding", "reviewer"]
       },
-      "workerBackend": { "type": "string", "enum": ["embedded", "codex"], "description": "Worker execution backend. 'embedded' (default): the in-process OpenClaw agent (subject to OpenClaw's exec/tool policy). 'codex': delegate all implementation to `codex exec` in its own --full-auto sandbox (no OpenClaw exec-approval gate) on the codex model — recommended when the embedded runner's writes are blocked by the exec policy.", "default": "embedded" },
+      "workerBackend": { "type": "string", "enum": ["embedded", "codex"], "description": "Worker execution backend. 'embedded' (default): the in-process OpenClaw agent (subject to OpenClaw's exec/tool policy). 'codex': delegate implementation to `codex exec` in its own --full-auto sandbox. When enableCodexHarnessSteering is true, the embedded Codex harness intentionally takes precedence so the live turn remains steerable.", "default": "embedded" },
+      "enableCodexHarnessSteering": { "type": "boolean", "description": "Opt in to the OpenClaw Codex app-server harness for embedded Linear AgentSession turns. Requires the OpenClaw Codex harness plugin and Codex authentication. Enables same-run turn/steer, native /codex stop, deferred follow-ups during review/compaction, and request_user_input elicitation. This deliberately changes the embedded runtime and remains disabled by default.", "default": false },
+      "codexHarnessModel": { "type": "string", "description": "Optional provider/model used only by opt-in Codex harness turns (in openai/<codex-compatible-model> form). If omitted, the selected OpenClaw agent model is retained and must be compatible with the Codex harness." },
+      "enableContainerTools": { "type": "boolean", "description": "Expose the per-ticket container_* sandbox tools to embedded agents. Enabled by default.", "default": true },
+      "linearProgressThoughts": { "type": "boolean", "description": "Ask embedded agents for concise, user-visible progress commentary and project commentary that precedes tool work as Linear thought activities. This reports objectives/findings, not private chain-of-thought.", "default": true },
       "grillMode": { "type": "string", "enum": ["off", "on"], "description": "When 'on', a dispatch first runs a /grill-me interview in the Agent Session (one question at a time) to establish which repo(s) the work belongs in and clarify requirements, BEFORE spawning the worker. The chosen repo(s) + implementation brief are passed to the worker. Default 'off'.", "default": "off" },
-      "orchestrationMode": { "type": "string", "enum": ["single", "stateplan"], "description": "Dispatch pipeline. 'single' (default): the single-worker flow (worker → audit → rework). 'stateplan': the state-driven specialist pipeline — the ticket's Linear workflow state selects a phase plan (see statePlans). Todo/In Progress → Apex plans + routes implementers → they build via codex → Apex self-reviews → PR → move to Code Review; Code Review → Warden + Apex review gate → move to QA; QA → Proof QA gate → move to Done. Transitions are agent-decided (a phase failure never moves the ticket).", "default": "single" },
+      "orchestrationMode": { "type": "string", "enum": ["single", "stateplan"], "description": "Dispatch pipeline. 'single' (default): the single-worker flow (worker → audit → rework). 'stateplan': the state-driven specialist pipeline — the ticket's Linear workflow state selects a phase plan (see statePlans). Todo/In Progress → Apex plans + routes implementers → they build → container-local Apex self-review → PR → configured review state; review state → container-local Warden + Apex gates → configured QA state or back to coding on failure; QA support is configurable. Terminal runs release the Linear delegate by default.", "default": "single" },
       "statePlans": {
         "type": "object",
-        "description": "Override the Linear-state → phase-plan map used when orchestrationMode='stateplan'. Keys are exact Linear state NAMES (case-insensitive); unmatched states fall back to built-in matchers by name/type. Each value is { phases: [...], onSuccess }. A phase is either the string 'plan-implement', a bare role id (e.g. 'warden' → gating review, 'helm' → product), or an object { type: 'plan-implement'|'review'|'product', role?, gate? }. onSuccess is a state name, a list of candidate names, or { names: [...], type? } — the agent moves the ticket there only when every phase passes.",
+        "description": "Override the Linear-state → phase-plan map used when orchestrationMode='stateplan'. Keys are exact Linear state NAMES (case-insensitive); unmatched states fall back to built-in matchers by name/type. Each value is { phases, onSuccess, onFailure, clearDelegate }. A phase is either 'plan-implement', a bare role id, or { type: 'plan-implement'|'review'|'product', role?, gate? }. Review phases always execute in the ticket Docker container. onSuccess/onFailure accept a state name, candidate-name list, or { names, type }. clearDelegate defaults true and releases Issue.delegate after either terminal outcome.",
         "additionalProperties": {
           "type": "object",
           "properties": {
             "phases": { "type": "array", "items": { "type": ["string", "object"] } },
-            "onSuccess": { "type": ["string", "array", "object"] }
+            "onSuccess": { "type": ["string", "array", "object", "null"] },
+            "onFailure": { "type": ["string", "array", "object", "null"] },
+            "clearDelegate": { "type": "boolean", "default": true }
           }
         }
       },
@@ -90,7 +106,7 @@
       },
       "roleBackends": {
         "type": "object",
-        "description": "Per-role execution-backend override for the specialist orchestrator. Keys are role ids; values are 'codex' or 'embedded'. Defaults: implementers (spine/prism/flux/forge) = codex; reviewers/product (apex/warden/proof/helm/lumen) = embedded.",
+        "description": "Per-role execution-backend override for planning, implementation, and product phases. Keys are role ids; values are 'codex' or 'embedded'. Review phases normally ignore this override and run via Codex inside the ticket container; when enableCodexHarnessSteering is true they use the embedded Codex harness and inspect the same container through container_* tools.",
         "additionalProperties": { "type": "string", "enum": ["codex", "embedded"] }
       },
       "codexModel": { "type": "string", "description": "Model passed to the Codex worker CLI (codex exec --model). If unset, Codex uses its own ~/.codex/config.toml default." },
@@ -113,17 +129,17 @@
       "worktreeBaseDir": { "type": "string", "description": "Base directory for persistent git worktrees (default: ~/.openclaw/worktrees)" },
       "repos": {
         "type": "object",
-        "description": "Multi-repo map — each key is a repo name, value is a path string or object with path + GitHub identity",
+        "description": "Optional repository overrides. In github-app mode the live installation catalog supplies entries automatically; paths are only needed in legacy local mode.",
         "additionalProperties": {
           "oneOf": [
             { "type": "string", "description": "Filesystem path (backward compat)" },
             {
               "type": "object",
-              "required": ["path"],
               "properties": {
-                "path": { "type": "string", "description": "Absolute filesystem path to git repo" },
+                "path": { "type": "string", "description": "Absolute filesystem path to git repo (legacy local mode)" },
                 "github": { "type": "string", "description": "GitHub owner/repo (e.g. 'calltelemetry/cisco-cdr')" },
-                "hostname": { "type": "string", "description": "Git host (default: 'github.com')", "default": "github.com" }
+                "hostname": { "type": "string", "description": "Git host (default: 'github.com')", "default": "github.com" },
+                "defaultBranch": { "type": "string", "description": "Default branch from the GitHub installation catalog" }
               }
             }
           ]

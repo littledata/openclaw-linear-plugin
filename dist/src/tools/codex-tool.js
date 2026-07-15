@@ -27,24 +27,20 @@ export function mapCodexEventToActivity(event) {
     }
     if (eventType === "item.started" && item?.type === "command_execution") {
         const cmd = item.command ?? "unknown";
-        const cleaned = typeof cmd === "string"
-            ? cmd.replace(/^\/usr\/bin\/\w+ -lc ['"]?/, "").replace(/['"]?$/, "")
-            : JSON.stringify(cmd);
-        return [{ type: "action", action: "Running", parameter: cleaned.slice(0, 200) }];
+        const cleaned = typeof cmd === "string" ? cmd : JSON.stringify(cmd);
+        return [{ type: "action", action: "Bash", parameter: cleaned.slice(0, 4_000) }];
     }
     if (eventType === "item.completed" && item?.type === "command_execution") {
         const cmd = item.command ?? "unknown";
         const exitCode = item.exit_code ?? "?";
         const output = item.aggregated_output ?? item.output ?? "";
-        const cleaned = typeof cmd === "string"
-            ? cmd.replace(/^\/usr\/bin\/\w+ -lc ['"]?/, "").replace(/['"]?$/, "")
-            : JSON.stringify(cmd);
-        const truncated = output.length > 1000 ? output.slice(0, 1000) + "..." : output;
+        const cleaned = typeof cmd === "string" ? cmd : JSON.stringify(cmd);
+        const truncated = formatCodexCommandOutput(cmd, output, 12_000);
         return [{
                 type: "action",
-                action: `${cleaned.slice(0, 150)}`,
-                parameter: `exit ${exitCode}`,
-                result: truncated || undefined,
+                action: "Bash",
+                parameter: cleaned.slice(0, 4_000),
+                result: `exit ${exitCode}${truncated ? `\n\n${truncated}` : ""}`,
             }];
     }
     if (eventType === "item.completed" && item?.type === "file_changes") {
@@ -64,6 +60,22 @@ export function mapCodexEventToActivity(event) {
         return [{ type: "thought", body: "Codex turn complete" }];
     }
     return [];
+}
+/**
+ * Bound command output for Linear and suppress encoded file payloads that add
+ * no readable diagnostic value.
+ * @param command - executed shell command
+ * @param output - captured stdout/stderr
+ * @param maxChars - maximum readable output length
+ * @returns readable bounded output
+ */
+export function formatCodexCommandOutput(command, output, maxChars) {
+    const commandText = typeof command === "string" ? command : JSON.stringify(command);
+    const outputText = typeof output === "string" ? output : String(output ?? "");
+    if (/(?:^|[|;&]\s*)base64(?:\s|$)|\bbase64\s+-w/i.test(commandText)) {
+        return outputText ? `[encoded file payload omitted: ${outputText.length} characters]` : "";
+    }
+    return outputText.length > maxChars ? `${outputText.slice(0, maxChars)}...` : outputText;
 }
 /**
  * Run Codex CLI with JSONL streaming, mapping events to Linear activities in real-time.
@@ -207,13 +219,15 @@ export async function runCodex(api, params, pluginConfig, onUpdate) {
                 const cleanCmd = typeof cmd === "string"
                     ? cmd.replace(/^\/usr\/bin\/\w+ -lc ['"]?/, "").replace(/['"]?$/, "")
                     : String(cmd);
-                const truncOutput = output.length > 500 ? output.slice(0, 500) + "..." : output;
+                const truncOutput = formatCodexCommandOutput(cmd, output, 500);
                 collectedCommands.push(`\`${cleanCmd}\` → exit ${exitCode}${truncOutput ? "\n```\n" + truncOutput + "\n```" : ""}`);
             }
             const activities = mapCodexEventToActivity(event);
             for (const activity of activities) {
                 if (linearApi && agentSessionId) {
-                    linearApi.emitActivity(agentSessionId, activity).catch((err) => {
+                    linearApi.emitActivity(agentSessionId, activity, event?.type === "item.started" && event?.item?.type === "command_execution"
+                        ? { ephemeral: true }
+                        : undefined).catch((err) => {
                         api.logger.warn(`Failed to emit Codex activity: ${err}`);
                     });
                 }

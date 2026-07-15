@@ -2,6 +2,12 @@ import type { AddressInfo } from "node:net";
 import { createServer } from "node:http";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { clearGrill, getGrill, saveGrill } from "./grill-state.js";
+import {
+  bindActiveCodexRun,
+  buildLinearCodexSessionKey,
+  drainCodexControls,
+} from "../agent/codex-steering.js";
 
 // ── Hoisted mock values ──────────────────────────────────────────────
 const {
@@ -33,6 +39,7 @@ const {
   getActiveDispatchMock,
   registerDispatchMock,
   updateDispatchStatusMock,
+  updateDispatchProgressMock,
   completeDispatchMock,
   removeActiveDispatchMock,
   assessTierMock,
@@ -72,6 +79,8 @@ const {
   }),
   mockLinearApiInstance: {
     emitActivity: vi.fn().mockResolvedValue(undefined),
+    completeSession: vi.fn().mockResolvedValue(undefined),
+    resumeSession: vi.fn(),
     createComment: vi.fn().mockResolvedValue("comment-id"),
     getIssueDetails: vi.fn().mockResolvedValue(null),
     updateSession: vi.fn().mockResolvedValue(undefined),
@@ -115,6 +124,7 @@ const {
   getActiveDispatchMock: vi.fn().mockReturnValue(null),
   registerDispatchMock: vi.fn().mockResolvedValue(undefined),
   updateDispatchStatusMock: vi.fn().mockResolvedValue(undefined),
+  updateDispatchProgressMock: vi.fn().mockResolvedValue(null),
   completeDispatchMock: vi.fn().mockResolvedValue(undefined),
   removeActiveDispatchMock: vi.fn().mockResolvedValue(undefined),
   assessTierMock: vi.fn().mockResolvedValue({ tier: "medium", model: "anthropic/claude-sonnet-4-6", reasoning: "moderate complexity" }),
@@ -185,6 +195,7 @@ vi.mock("./guidance.js", () => ({
 vi.mock("./active-session.js", () => ({
   setActiveSession: setActiveSessionMock,
   clearActiveSession: clearActiveSessionMock,
+  getActiveSession: vi.fn().mockReturnValue(null),
   getIssueAffinity: getIssueAffinityMock,
   _configureAffinityTtl: configureAffinityTtlMock,
   _resetAffinityForTesting: resetAffinityForTestingMock,
@@ -195,6 +206,7 @@ vi.mock("./dispatch-state.js", () => ({
   getActiveDispatch: getActiveDispatchMock,
   registerDispatch: registerDispatchMock,
   updateDispatchStatus: updateDispatchStatusMock,
+  updateDispatchProgress: updateDispatchProgressMock,
   completeDispatch: completeDispatchMock,
   removeActiveDispatch: removeActiveDispatchMock,
 }));
@@ -293,6 +305,7 @@ vi.mock("../infra/notify.js", () => ({
 
 vi.mock("../agent/agent.js", () => ({
   runAgent: runAgentMock,
+  abortRunsFor: vi.fn().mockReturnValue(0),
 }));
 
 import {
@@ -303,10 +316,20 @@ import {
   _configureDedupTtls,
   _getDedupTtlMs,
   _addActiveRunForTesting,
+  _removeActiveRunForTesting,
   _markAsProcessedForTesting,
 } from "./webhook.js";
 
 function createApi(pluginConfig: Record<string, unknown> = {}): OpenClawPluginApi {
+  const buildContext = vi.fn((input: any) => ({
+    ...input,
+    SessionKey: input.route.routeSessionKey,
+    CommandBody: input.message.commandBody,
+  }));
+  const dispatchReplyWithBufferedBlockDispatcher = vi.fn(async ({ dispatcherOptions }: any) => {
+    await dispatcherOptions.deliver({ text: "steered current session." });
+    return { queuedFinal: false, counts: {} };
+  });
   return {
     logger: {
       info: vi.fn(),
@@ -314,7 +337,13 @@ function createApi(pluginConfig: Record<string, unknown> = {}): OpenClawPluginAp
       error: vi.fn(),
       debug: vi.fn(),
     },
-    runtime: {},
+    runtime: {
+      config: { current: vi.fn().mockReturnValue({}) },
+      channel: {
+        inbound: { buildContext },
+        reply: { dispatchReplyWithBufferedBlockDispatcher },
+      },
+    },
     pluginConfig,
   } as unknown as OpenClawPluginApi;
 }
@@ -380,6 +409,29 @@ async function postWebhook(
   return { api, status, body };
 }
 
+async function postDelegationSession(
+  issue: { id: string; identifier: string; title?: string },
+  pluginConfig: Record<string, unknown> = {},
+  sessionId = `session-${issue.id}`,
+  appUserId?: string,
+) {
+  return postWebhook({
+    type: "AgentSessionEvent",
+    action: "created",
+    ...(appUserId ? { appUserId } : {}),
+    agentSession: {
+      id: sessionId,
+      issue,
+      comment: {
+        id: `thread-${sessionId}`,
+        body: "This thread is for an agent session with vasile.",
+      },
+    },
+    previousComments: [],
+    promptContext: `<issue identifier="${issue.identifier}"><title>${issue.title ?? issue.identifier}</title></issue>`,
+  }, "/linear/webhook", pluginConfig);
+}
+
 beforeEach(() => {
   _resetForTesting();
 });
@@ -391,6 +443,8 @@ afterEach(() => {
   spawnWorkerMock.mockReset().mockResolvedValue(undefined);
   runStatePlanMock.mockReset().mockResolvedValue(undefined);
   mockLinearApiInstance.emitActivity.mockReset().mockResolvedValue(undefined);
+  mockLinearApiInstance.completeSession.mockReset().mockResolvedValue(undefined);
+  mockLinearApiInstance.resumeSession.mockReset();
   mockLinearApiInstance.createComment.mockReset().mockResolvedValue("comment-id");
   mockLinearApiInstance.getIssueDetails.mockReset().mockResolvedValue(null);
   mockLinearApiInstance.getRecentComments.mockReset().mockResolvedValue([]);
@@ -436,6 +490,7 @@ afterEach(() => {
   getActiveDispatchMock.mockReset().mockReturnValue(null);
   registerDispatchMock.mockReset().mockResolvedValue(undefined);
   updateDispatchStatusMock.mockReset().mockResolvedValue(undefined);
+  updateDispatchProgressMock.mockReset().mockResolvedValue(null);
   removeActiveDispatchMock.mockReset().mockResolvedValue(undefined);
   assessTierMock.mockReset().mockResolvedValue({ tier: "medium", model: "anthropic/claude-sonnet-4-6", reasoning: "moderate complexity" });
   createWorktreeMock.mockReset().mockReturnValue({ path: "/tmp/worktree", branch: "codex/ENG-123", resumed: false });
@@ -769,7 +824,7 @@ describe("dedup test helpers", () => {
     expect(result.status).toBe(200);
     // Should log that it is reusing the session for the in-flight dispatch
     const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
-    expect(infoCalls.some((msg: string) => msg.includes("reusing session"))).toBe(true);
+    expect(infoCalls.some((msg: string) => msg.includes("dispatch active") && msg.includes("reusing this session"))).toBe(true);
   });
 
   it("_markAsProcessedForTesting causes dedup to trigger on session", async () => {
@@ -816,6 +871,38 @@ describe("AppUserNotification handling", () => {
 // ---------------------------------------------------------------------------
 
 describe("AgentSessionEvent.created full flow", () => {
+  it("keeps a comment-backed mention conversational even when the issue is delegated", async () => {
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: "issue-mentioned-while-delegated",
+      identifier: "ENG-MWD",
+      title: "Mention while delegated",
+      description: "Existing implementation issue",
+      state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
+      assignee: { name: "Human" },
+      team: { id: "team-1", key: "ENG" },
+    });
+
+    const result = await postWebhook({
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: {
+        id: "session-mentioned-while-delegated",
+        issue: { id: "issue-mentioned-while-delegated", identifier: "ENG-MWD" },
+        comment: { id: "comment-mention", body: "@vasile what is the status?" },
+      },
+      previousComments: [
+        { body: "@vasile what is the status?", user: { name: "Human" } },
+      ],
+    });
+
+    expect(result.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(runAgentMock).toHaveBeenCalled();
+    expect(assessTierMock).not.toHaveBeenCalled();
+    expect(mockLinearApiInstance.createComment).not.toHaveBeenCalled();
+  });
+
   it("resolves agent, fetches issue details, and runs agent for valid session", async () => {
     mockLinearApiInstance.getIssueDetails.mockResolvedValue({
       id: "issue-ase",
@@ -944,7 +1031,7 @@ describe("AgentSessionEvent.created full flow", () => {
     expect(clearActiveSessionMock).toHaveBeenCalledWith("issue-err");
   });
 
-  it("falls back to comment when emitActivity fails for response", async () => {
+  it("does not create an issue comment when session response emission fails", async () => {
     // emitActivity fails for 'response' type but succeeds for 'thought'
     mockLinearApiInstance.emitActivity
       .mockImplementation((_sessionId: string, content: any) => {
@@ -964,8 +1051,7 @@ describe("AgentSessionEvent.created full flow", () => {
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 100));
-    // Should have fallen back to createComment
-    expect(mockLinearApiInstance.createComment).toHaveBeenCalled();
+    expect(mockLinearApiInstance.createComment).not.toHaveBeenCalled();
   });
 
   it("posts failure message when agent returns success=false", async () => {
@@ -997,6 +1083,147 @@ describe("AgentSessionEvent.created full flow", () => {
 // ---------------------------------------------------------------------------
 
 describe("AgentSessionEvent.prompted full flow", () => {
+  it("marks STOPped work paused without deleting its dispatch", async () => {
+    const result = await postWebhook({
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "sess-pause",
+        issue: { id: "issue-pause", identifier: "ENG-PAUSE" },
+      },
+      agentActivity: { signal: "stop" },
+    });
+
+    expect(result.status).toBe(200);
+    expect(updateDispatchProgressMock).toHaveBeenCalledWith(
+      "ENG-PAUSE",
+      expect.objectContaining({ status: "paused" }),
+      undefined,
+    );
+    expect(removeActiveDispatchMock).not.toHaveBeenCalled();
+    expect(mockLinearApiInstance.completeSession).toHaveBeenCalledWith(
+      "sess-pause",
+      expect.stringContaining("Reply in this session"),
+    );
+  });
+
+  it("resumes a paused dispatch in the same Linear and OpenClaw implementation session", async () => {
+    const pausedDispatch = {
+      issueId: "issue-resume",
+      issueIdentifier: "ENG-RESUME",
+      issueTitle: "Resume me",
+      worktreePath: "/tmp/ENG-RESUME",
+      branch: "core-eng-resume",
+      tier: "medium",
+      model: "test-model",
+      status: "paused",
+      dispatchedAt: new Date().toISOString(),
+      agentSessionId: "sess-resume",
+      attempt: 0,
+      containerName: "openclaw-linear-ENG-RESUME",
+      containerRepos: ["api"],
+      phaseIndex: 0,
+    };
+    getActiveDispatchMock.mockReturnValue(pausedDispatch);
+    updateDispatchProgressMock.mockResolvedValue({ ...pausedDispatch, status: "working" });
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: "issue-resume",
+      identifier: "ENG-RESUME",
+      title: "Resume me",
+      description: "Implement the feature",
+      state: { name: "In Progress", type: "started" },
+      team: { id: "team-resume" },
+    });
+
+    const result = await postWebhook({
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "sess-resume",
+        issue: { id: "issue-resume", identifier: "ENG-RESUME" },
+      },
+      agentActivity: { content: { body: "Continue, but leave Elasticsearch to the infrastructure repo." } },
+      webhookId: "wh-resume-1",
+    });
+
+    expect(result.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(mockLinearApiInstance.resumeSession).toHaveBeenCalledWith("sess-resume");
+    expect(runStatePlanMock).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        issueIdentifier: "ENG-RESUME",
+        agentSessionId: "sess-resume",
+        containerName: "openclaw-linear-ENG-RESUME",
+      }),
+      expect.objectContaining({ phases: [{ type: "plan-implement" }] }),
+      expect.objectContaining({
+        resume: true,
+        resumeGuidance: "Continue, but leave Elasticsearch to the infrastructure repo.",
+      }),
+    );
+    expect(runAgentMock).not.toHaveBeenCalled();
+    expect(startOrReuseContainerMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        issueIdentifier: "ENG-RESUME",
+        targetRepos: ["api"],
+        branch: "core-eng-resume",
+      }),
+      expect.any(Object),
+      expect.anything(),
+    );
+    expect(setActiveSessionMock).toHaveBeenCalledWith(
+      expect.objectContaining({ agentSessionId: "sess-resume", issueIdentifier: "ENG-RESUME" }),
+    );
+  });
+
+  it("discards a queued continuation when a newer STOP arrives", async () => {
+    const pausedDispatch = {
+      issueId: "issue-stop-race",
+      issueIdentifier: "ENG-STOP-RACE",
+      issueTitle: "Stop race",
+      worktreePath: "/tmp/ENG-STOP-RACE",
+      branch: "core-eng-stop-race",
+      tier: "medium",
+      model: "test-model",
+      status: "paused",
+      dispatchedAt: new Date().toISOString(),
+      agentSessionId: "sess-stop-race",
+      attempt: 0,
+      containerName: "openclaw-linear-ENG-STOP-RACE",
+      containerRepos: ["api"],
+      phaseIndex: 0,
+    };
+    getActiveDispatchMock.mockReturnValue(pausedDispatch);
+    _addActiveRunForTesting("issue-stop-race");
+
+    await postWebhook({
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "sess-stop-race",
+        issue: { id: "issue-stop-race", identifier: "ENG-STOP-RACE" },
+      },
+      agentActivity: { content: { type: "prompt", body: "push and review" } },
+      webhookId: "wh-stop-race-prompt",
+    });
+
+    await postWebhook({
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "sess-stop-race",
+        issue: { id: "issue-stop-race", identifier: "ENG-STOP-RACE" },
+      },
+      agentActivity: { signal: "stop", content: { type: "prompt", body: "stop" } },
+      webhookId: "wh-stop-race-stop",
+    });
+    _removeActiveRunForTesting("issue-stop-race");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(runStatePlanMock).not.toHaveBeenCalled();
+  });
+
   it("responds 200 and ignores when session/issue data is missing", async () => {
     const result = await postWebhook({
       type: "AgentSessionEvent",
@@ -1026,6 +1253,74 @@ describe("AgentSessionEvent.prompted full flow", () => {
     expect(result.status).toBe(200);
     const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
     expect(infoCalls.some((msg: string) => msg.includes("agent active, no tmux, ignoring (feedback)"))).toBe(true);
+  });
+
+  it("steers a follow-up into the same active Codex harness session", async () => {
+    _addActiveRunForTesting("issue-steer");
+    const binding = bindActiveCodexRun({
+      issueId: "issue-steer",
+      linearSessionId: "sess-steer",
+      agentId: "apex",
+      openClawSessionId: "linear-impl-ENG-STEER",
+      sessionKey: buildLinearCodexSessionKey("apex", "sess-steer"),
+      runId: "run-steer",
+    });
+
+    const result = await postWebhook({
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "sess-steer",
+        issue: { id: "issue-steer", identifier: "ENG-STEER" },
+      },
+      agentActivity: { content: { type: "prompt", body: "also cover the retry path" } },
+    }, "/linear/webhook", { enableCodexHarnessSteering: true });
+    await drainCodexControls(binding);
+
+    expect(result.status).toBe(200);
+    expect((result.api.runtime.channel.inbound.buildContext as any)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        route: expect.objectContaining({
+          routeSessionKey: "agent:apex:linear:direct:sess-steer",
+        }),
+        message: expect.objectContaining({
+          commandBody: "/steer also cover the retry path",
+        }),
+      }),
+    );
+    expect(runAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("routes a stop signal to /codex stop before completing the Linear session", async () => {
+    _addActiveRunForTesting("issue-codex-stop");
+    bindActiveCodexRun({
+      issueId: "issue-codex-stop",
+      linearSessionId: "sess-codex-stop",
+      agentId: "apex",
+      openClawSessionId: "linear-impl-ENG-STOP",
+      sessionKey: buildLinearCodexSessionKey("apex", "sess-codex-stop"),
+      runId: "run-stop",
+    });
+
+    const result = await postWebhook({
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "sess-codex-stop",
+        issue: { id: "issue-codex-stop", identifier: "ENG-STOP" },
+      },
+      agentActivity: { signal: "stop", content: { type: "prompt", body: "do not steer this" } },
+    }, "/linear/webhook", { enableCodexHarnessSteering: true });
+
+    const buildContext = result.api.runtime.channel.inbound.buildContext as any;
+    expect(buildContext).toHaveBeenCalledWith(expect.objectContaining({
+      message: expect.objectContaining({ commandBody: "/codex stop" }),
+    }));
+    expect(buildContext.mock.calls[0][0].message.commandBody).not.toContain("steer");
+    expect(mockLinearApiInstance.completeSession).toHaveBeenCalledWith(
+      "sess-codex-stop",
+      expect.stringContaining("Reply in this session"),
+    );
   });
 
   it("deduplicates by webhookId", async () => {
@@ -1232,6 +1527,7 @@ describe("Comment.create intent routing", () => {
       title: "Mention Test",
       description: "desc",
       state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
       assignee: { name: "User" },
       team: { id: "team-mf" },
       comments: { nodes: [{ user: { name: "Someone" }, body: "Prior comment" }] },
@@ -1836,7 +2132,7 @@ describe("Issue.update dispatch flow", () => {
     expect(infoCalls.some((msg: string) => msg.includes("not us"))).toBe(true);
   });
 
-  it("dispatches when assigned to our viewer", async () => {
+  it("waits for Linear to create a session when assigned to our viewer", async () => {
     mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
     mockLinearApiInstance.getIssueDetails.mockResolvedValue({
       id: "issue-assigned",
@@ -1861,16 +2157,14 @@ describe("Issue.update dispatch flow", () => {
     });
 
     expect(result.status).toBe(200);
-    // Wait for fire-and-forget handleDispatch
-    await new Promise((r) => setTimeout(r, 300));
     const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
     expect(infoCalls.some((msg: string) => msg.includes("assigned to our app user"))).toBe(true);
-    // handleDispatch should have run tier assessment and started the container
-    expect(assessTierMock).toHaveBeenCalled();
-    expect(startOrReuseContainerMock).toHaveBeenCalled();
+    expect(infoCalls.some((msg: string) => msg.includes("awaiting Linear's new AgentSession.created"))).toBe(true);
+    expect(assessTierMock).not.toHaveBeenCalled();
+    expect(startOrReuseContainerMock).not.toHaveBeenCalled();
   });
 
-  it("dispatches when delegated to our viewer", async () => {
+  it("waits for Linear to create a session when delegated to our viewer", async () => {
     mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
     mockLinearApiInstance.getIssueDetails.mockResolvedValue({
       id: "issue-delegated",
@@ -1896,11 +2190,109 @@ describe("Issue.update dispatch flow", () => {
     });
 
     expect(result.status).toBe(200);
-    // Wait for fire-and-forget handleDispatch
-    await new Promise((r) => setTimeout(r, 300));
     const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
     expect(infoCalls.some((msg: string) => msg.includes("delegated to our app user"))).toBe(true);
-    expect(assessTierMock).toHaveBeenCalled();
+    expect(infoCalls.some((msg: string) => msg.includes("awaiting Linear's new AgentSession.created"))).toBe(true);
+    expect(assessTierMock).not.toHaveBeenCalled();
+  });
+
+  it("creates one fallback session when Linear omits the delegation session", async () => {
+    mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
+    mockLinearApiInstance.listAgentSessions.mockResolvedValue([]);
+    mockLinearApiInstance.createSessionOnIssue.mockResolvedValue({ sessionId: "sess-fallback" });
+
+    const payload = {
+      type: "Issue",
+      action: "update",
+      data: {
+        id: "issue-fallback-session",
+        identifier: "ENG-FALLBACK",
+        assigneeId: null,
+        delegateId: "viewer-1",
+      },
+      updatedFrom: { delegateId: null },
+    };
+
+    await postWebhook(payload, "/linear/webhook", { delegationSessionGraceMs: 10 });
+    await postWebhook(payload, "/linear/webhook", { delegationSessionGraceMs: 10 });
+
+    await vi.waitFor(() => {
+      expect(mockLinearApiInstance.createSessionOnIssue).toHaveBeenCalledOnce();
+    });
+    expect(mockLinearApiInstance.createSessionOnIssue).toHaveBeenCalledWith("issue-fallback-session");
+    expect(assessTierMock).not.toHaveBeenCalled();
+  });
+
+  it("cancels fallback creation when the native delegation session arrives", async () => {
+    mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: "issue-native-session",
+      identifier: "ENG-NATIVE",
+      title: "Native session",
+      description: "Use Linear's session",
+      state: { name: "In Progress", type: "started" },
+      team: { id: "team-1", key: "ENG" },
+      delegate: { id: "viewer-1", name: "Agent" },
+      labels: { nodes: [] },
+      comments: { nodes: [] },
+    });
+
+    await postWebhook({
+      type: "Issue",
+      action: "update",
+      data: {
+        id: "issue-native-session",
+        identifier: "ENG-NATIVE",
+        assigneeId: null,
+        delegateId: "viewer-1",
+      },
+      updatedFrom: { delegateId: null },
+    }, "/linear/webhook", { delegationSessionGraceMs: 50 });
+
+    const created = await postDelegationSession(
+      { id: "issue-native-session", identifier: "ENG-NATIVE", title: "Native session" },
+      { delegationSessionGraceMs: 50 },
+      "sess-native",
+      "viewer-1",
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const infoCalls = (created.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    expect(infoCalls.some((msg: string) => msg.includes("cancelled fallback creation"))).toBe(true);
+    expect(mockLinearApiInstance.createSessionOnIssue).not.toHaveBeenCalled();
+  });
+
+  it("does not create a fallback when a recent native session already exists", async () => {
+    mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
+    mockLinearApiInstance.listAgentSessions.mockResolvedValue([{
+      id: "sess-native-in-flight",
+      createdAt: new Date().toISOString(),
+      status: "pending",
+      summary: null,
+      plan: null,
+      url: null,
+      pullRequests: [],
+      activities: [],
+    }]);
+
+    await postWebhook({
+      type: "Issue",
+      action: "update",
+      data: {
+        id: "issue-native-in-flight",
+        identifier: "ENG-INFLIGHT",
+        assigneeId: null,
+        delegateId: "viewer-1",
+      },
+      updatedFrom: { delegateId: null },
+    }, "/linear/webhook", { delegationSessionGraceMs: 10 });
+
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(mockLinearApiInstance.listAgentSessions).toHaveBeenCalledWith(
+      "issue-native-in-flight",
+      { activityLimit: 1 },
+    );
+    expect(mockLinearApiInstance.createSessionOnIssue).not.toHaveBeenCalled();
   });
 
   it("skips when no Linear access token for issue update", async () => {
@@ -1922,7 +2314,7 @@ describe("Issue.update dispatch flow", () => {
     expect(errorCalls.some((msg: string) => msg.includes("No Linear access token"))).toBe(true);
   });
 
-  it("deduplicates duplicate Issue.update webhooks", async () => {
+  it("does not dispatch from duplicate Issue.update webhooks", async () => {
     mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
 
     // First webhook
@@ -1938,7 +2330,7 @@ describe("Issue.update dispatch flow", () => {
     });
     expect(result1.status).toBe(200);
 
-    // Second webhook (duplicate) — should be deduped
+    // A duplicate update may also be delivered, but neither update owns work.
     const result2 = await postWebhook({
       type: "Issue",
       action: "update",
@@ -1951,10 +2343,8 @@ describe("Issue.update dispatch flow", () => {
     });
     expect(result2.status).toBe(200);
     const infoCalls = (result2.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
-    // Duplicate is blocked either by the content dedup ("already processed") or,
-    // when the first dispatch has already claimed the issue, by the early
-    // activeRuns guard ("active run — skipping"). Both prevent a second dispatch.
-    expect(infoCalls.some((msg: string) => msg.includes("already processed") || msg.includes("active run"))).toBe(true);
+    expect(infoCalls.some((msg: string) => msg.includes("awaiting Linear's new AgentSession.created"))).toBe(true);
+    expect(assessTierMock).not.toHaveBeenCalled();
   });
 });
 
@@ -2485,7 +2875,229 @@ describe("handleCloseIssue via close_issue intent", () => {
 // handleDispatch — detailed tests
 // ---------------------------------------------------------------------------
 
-describe("handleDispatch via Issue.update assignment", () => {
+describe("handleDispatch via a newly created delegation session", () => {
+  it("uses webhook appUserId instead of the OAuth viewer to identify delegation", async () => {
+    const issueId = "issue-app-user-delegation";
+    mockLinearApiInstance.getViewerId.mockResolvedValue("oauth-human-viewer");
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: issueId,
+      identifier: "CORE-APP",
+      title: "App user delegation",
+      description: "Implement this issue.",
+      state: { name: "In Progress", type: "started" },
+      delegate: { id: "linear-agent-app-user", name: "Vasile" },
+      team: { id: "team-core", key: "CORE" },
+      labels: { nodes: [] },
+      comments: { nodes: [] },
+      attachments: { nodes: [] },
+      project: null,
+    });
+
+    const result = await postDelegationSession(
+      { id: issueId, identifier: "CORE-APP", title: "App user delegation" },
+      { orchestrationMode: "stateplan", grillMode: "off" },
+      "session-app-user-delegation",
+      "linear-agent-app-user",
+    );
+
+    expect(result.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(assessTierMock).toHaveBeenCalled();
+    expect(runAgentMock).not.toHaveBeenCalled();
+    expect(mockLinearApiInstance.getViewerId).not.toHaveBeenCalled();
+  });
+
+  it("continues automatically without exposing raw prior-session transcripts when synthesis fails", async () => {
+    const issueId = "issue-resume-synthesis-fallback";
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: issueId,
+      identifier: "CORE-SYNTH",
+      title: "Resume synthesis",
+      description: "Continue the prior implementation.",
+      state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
+      team: { id: "team-core", key: "CORE" },
+      labels: { nodes: [] },
+      comments: { nodes: [] },
+      attachments: { nodes: [] },
+      project: null,
+    });
+    mockLinearApiInstance.listAgentSessions.mockResolvedValue([{
+      id: "session-raw-history",
+      createdAt: "2026-07-13T10:00:00.000Z",
+      status: "complete",
+      summary: null,
+      plan: "RAW PLAN THAT MUST NOT BE SHOWN",
+      url: null,
+      pullRequests: [],
+      activities: [{
+        createdAt: "2026-07-13T10:01:00.000Z",
+        signal: null,
+        content: { type: "response", body: "RAW SESSION TAIL THAT MUST NOT BE SHOWN" },
+      }],
+    }]);
+    runAgentMock.mockResolvedValueOnce({ success: false, output: "tool failure without JSON" });
+
+    try {
+      const result = await postDelegationSession(
+        { id: issueId, identifier: "CORE-SYNTH", title: "Resume synthesis" },
+        { orchestrationMode: "stateplan", grillMode: "off" },
+        "session-resume-synthesis",
+      );
+
+      expect(result.status).toBe(200);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const analysisCall = runAgentMock.mock.calls.find(
+        ([args]: any[]) => args.sessionId.startsWith("prior-context-CORE-SYNTH-"),
+      )?.[0];
+      expect(analysisCall).toEqual(expect.objectContaining({
+        readOnly: true,
+        streaming: expect.objectContaining({ agentSessionId: "prior-context-CORE-SYNTH" }),
+        toolsDeny: expect.arrayContaining(["group:fs", "group:web", "linear_issues"]),
+      }));
+      expect(runStatePlanMock).toHaveBeenCalledOnce();
+      const visibleBodies = mockLinearApiInstance.emitActivity.mock.calls
+        .filter(([sessionId]: any[]) => sessionId === "session-resume-synthesis")
+        .map(([, activity]: any[]) => activity?.body ?? "")
+        .join("\n");
+      expect(visibleBodies).not.toMatch(/resume|fresh/i);
+      expect(visibleBodies).not.toContain("RAW PLAN THAT MUST NOT BE SHOWN");
+      expect(visibleBodies).not.toContain("RAW SESSION TAIL THAT MUST NOT BE SHOWN");
+    } finally {
+      clearGrill(issueId);
+    }
+  });
+
+  it("hydrates a new delegation from prior session summaries and skips redundant startup gates", async () => {
+    const issueId = "issue-automatic-handoff";
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: issueId,
+      identifier: "CORE-HANDOFF",
+      title: "Continue existing implementation",
+      description: "Finish the approved ticket plan.",
+      state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
+      team: { id: "team-core", key: "CORE" },
+      labels: { nodes: [] },
+      comments: { nodes: [] },
+      attachments: { nodes: [] },
+      project: null,
+    });
+    mockLinearApiInstance.listAgentSessions.mockResolvedValue([{
+      id: "session-prior",
+      createdAt: "2026-07-13T10:00:00.000Z",
+      status: "complete",
+      summary: "Implemented the API path; the UI and focused tests remain.",
+      plan: "Complete the UI in ld-shopify-admin.",
+      url: null,
+      pullRequests: [],
+      activities: [],
+    }]);
+    runAgentMock.mockResolvedValueOnce({
+      success: true,
+      output: JSON.stringify({
+        repos: ["ld-shopify-admin"],
+        brief: "Continue from the completed API work; implement the remaining UI and focused tests.",
+      }),
+    });
+    const pluginConfig = {
+      orchestrationMode: "stateplan",
+      repoSelectionMode: "always",
+      grillMode: "on",
+      repos: {
+        "transaction-monitor-2": { path: "/root/repos/transaction-monitor-2" },
+        "ld-shopify-admin": { path: "/root/repos/ld-shopify-admin" },
+      },
+    };
+
+    const result = await postDelegationSession(
+      { id: issueId, identifier: "CORE-HANDOFF", title: "Continue existing implementation" },
+      pluginConfig,
+      "session-current",
+    );
+
+    expect(result.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(runStatePlanMock).toHaveBeenCalledOnce();
+    expect(mockLinearApiInstance.listAgentSessions).toHaveBeenCalledWith(
+      issueId,
+      { activityLimit: 12 },
+    );
+    const [, dispatch] = registerDispatchMock.mock.calls[0];
+    expect(dispatch.containerRepos).toEqual(["ld-shopify-admin"]);
+    expect(dispatch.grillGuidance).toContain("implement the remaining UI and focused tests");
+    expect(
+      mockLinearApiInstance.emitActivity.mock.calls.some(([, activity]: any[]) =>
+        activity?.type === "elicitation" && /resume|fresh|which repository/i.test(activity.body),
+      ),
+    ).toBe(false);
+  });
+
+  it("clears stale interactive state and binds work to the new session", async () => {
+    const issueId = "issue-pending-resume";
+    const oldSessionId = "session-pending-resume";
+    const newSessionId = "session-new-delegation";
+    const pluginConfig = {
+      orchestrationMode: "stateplan",
+      grillMode: "off",
+      repos: {
+        "transaction-monitor-2": {
+          path: "/root/repos/transaction-monitor-2",
+          github: "littledata/transaction-monitor-2",
+        },
+      },
+    };
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: issueId,
+      identifier: "CORE-1748",
+      title: "Terminal outcome event stream",
+      description: "Implement the existing plan.",
+      state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
+      team: { id: "team-core", key: "CORE" },
+      labels: { nodes: [] },
+      comments: { nodes: [] },
+      attachments: { nodes: [] },
+      project: null,
+    });
+    saveGrill({
+      issueId,
+      issueIdentifier: "CORE-1748",
+      agentSessionId: oldSessionId,
+      qa: [],
+      pendingQuestion: "An unrelated stale grill question?",
+      repos: ["transaction-monitor-2"],
+      createdAt: new Date().toISOString(),
+    });
+    // An old grill can hold the issue-level claim while awaiting input. A new
+    // delegation must supersede that parked claim and start in its session.
+    _addActiveRunForTesting(issueId);
+
+    try {
+      const result = await postDelegationSession(
+        { id: issueId, identifier: "CORE-1748", title: "Terminal outcome event stream" },
+        pluginConfig,
+        newSessionId,
+      );
+
+      expect(result.status).toBe(200);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      expect(getGrill(issueId)).toBeUndefined();
+      expect(assessTierMock).toHaveBeenCalled();
+      expect(runStatePlanMock).toHaveBeenCalledOnce();
+      expect(
+        mockLinearApiInstance.emitActivity.mock.calls.some(([session]: any[]) => session === newSessionId),
+      ).toBe(true);
+      expect(
+        mockLinearApiInstance.emitActivity.mock.calls.some(([session]: any[]) => session === oldSessionId),
+      ).toBe(false);
+      expect(mockLinearApiInstance.createComment).not.toHaveBeenCalled();
+    } finally {
+      clearGrill(issueId);
+    }
+  });
+
   it("enters review directly and checks out the attached PR without resume, repo selection, or grilling", async () => {
     const pullRequestUrl = "https://github.com/littledata/ld-shopify/pull/1740";
     const pluginConfig = {
@@ -2509,6 +3121,7 @@ describe("handleDispatch via Issue.update assignment", () => {
       title: "Disabled Events Per Market",
       description: "Existing implementation is ready for review.",
       state: { name: "In Code Review", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
       team: { id: "team-review" },
       labels: { nodes: [] },
       comments: { nodes: [] },
@@ -2529,16 +3142,11 @@ describe("handleDispatch via Issue.update assignment", () => {
       body: "## Apex plan\nThe implementation plan is already complete.",
     }]);
 
-    const result = await postWebhook({
-      type: "Issue",
-      action: "update",
-      data: {
-        id: "issue-review",
-        identifier: "CORE-1740",
-        assigneeId: "viewer-1",
-      },
-      updatedFrom: { assigneeId: null },
-    }, "/linear/webhook", pluginConfig);
+    const result = await postDelegationSession(
+      { id: "issue-review", identifier: "CORE-1740", title: "Disabled Events Per Market" },
+      pluginConfig,
+      "session-review-current",
+    );
 
     expect(result.status).toBe(200);
     await new Promise((resolve) => setTimeout(resolve, 500));
@@ -2574,22 +3182,18 @@ describe("handleDispatch via Issue.update assignment", () => {
       title: "Full Dispatch",
       description: "Implement this feature",
       state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
       team: { id: "team-df" },
       labels: { nodes: [{ id: "l1", name: "feature" }] },
       comments: { nodes: [{ user: { name: "Dev" }, body: "Please do this" }] },
       project: null,
     });
 
-    const result = await postWebhook({
-      type: "Issue",
-      action: "update",
-      data: {
-        id: "issue-dispatch-full",
-        identifier: "ENG-DF",
-        assigneeId: "viewer-1",
-      },
-      updatedFrom: { assigneeId: null },
-    });
+    const result = await postDelegationSession(
+      { id: "issue-dispatch-full", identifier: "ENG-DF", title: "Full Dispatch" },
+      {},
+      "session-dispatch-full",
+    );
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 500));
@@ -2608,6 +3212,7 @@ describe("handleDispatch via Issue.update assignment", () => {
       title: "Container Fail",
       description: "desc",
       state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
       team: { id: "team-wf" },
       labels: { nodes: [] },
       comments: { nodes: [] },
@@ -2616,23 +3221,19 @@ describe("handleDispatch via Issue.update assignment", () => {
       throw new Error("docker run failed");
     });
 
-    const result = await postWebhook({
-      type: "Issue",
-      action: "update",
-      data: {
-        id: "issue-wt-fail",
-        identifier: "ENG-WF",
-        assigneeId: "viewer-1",
-      },
-      updatedFrom: { assigneeId: null },
-    });
+    const result = await postDelegationSession(
+      { id: "issue-wt-fail", identifier: "ENG-WF", title: "Container Fail" },
+      {},
+      "session-container-fail",
+    );
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 300));
-    // Should post failure comment
-    expect(mockLinearApiInstance.createComment).toHaveBeenCalled();
-    const commentArgs = mockLinearApiInstance.createComment.mock.calls[0];
-    expect(commentArgs[1]).toContain("Dispatch failed");
+    expect(mockLinearApiInstance.emitActivity).toHaveBeenCalledWith(
+      "session-container-fail",
+      expect.objectContaining({ type: "error", body: expect.stringContaining("Dispatch failed") }),
+    );
+    expect(mockLinearApiInstance.createComment).not.toHaveBeenCalled();
   });
 
   it("reclaims stale dispatch and re-dispatches", async () => {
@@ -2643,6 +3244,7 @@ describe("handleDispatch via Issue.update assignment", () => {
       title: "Stale Dispatch",
       description: "desc",
       state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
       team: { id: "team-stale" },
       labels: { nodes: [] },
       comments: { nodes: [] },
@@ -2656,16 +3258,11 @@ describe("handleDispatch via Issue.update assignment", () => {
       worktreePath: "/tmp/old-worktree",
     });
 
-    const result = await postWebhook({
-      type: "Issue",
-      action: "update",
-      data: {
-        id: "issue-stale",
-        identifier: "ENG-STALE",
-        assigneeId: "viewer-1",
-      },
-      updatedFrom: { assigneeId: null },
-    });
+    const result = await postDelegationSession(
+      { id: "issue-stale", identifier: "ENG-STALE", title: "Stale Dispatch" },
+      {},
+      "session-stale-dispatch",
+    );
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 500));
@@ -3003,7 +3600,7 @@ describe("AgentSession.created .catch callbacks", () => {
     expect(agentCall.message).toContain("Full access");
   });
 
-  it("covers no avatarUrl fallback when emitActivity fails for response", async () => {
+  it("does not mirror a failed session response onto the issue", async () => {
     // Set profiles with no avatarUrl
     loadAgentProfilesMock.mockReturnValue({
       mal: { label: "Mal", mission: "captain", mentionAliases: ["mal"], isDefault: true },
@@ -3026,8 +3623,7 @@ describe("AgentSession.created .catch callbacks", () => {
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 150));
-    // Should fall back to comment without agentOpts (no avatar)
-    expect(mockLinearApiInstance.createComment).toHaveBeenCalled();
+    expect(mockLinearApiInstance.createComment).not.toHaveBeenCalled();
   });
 
   it("covers getIssueDetails failure in created handler", async () => {
@@ -4429,22 +5025,18 @@ describe("handleDispatch multi-repo and .catch/.finally", () => {
       title: "Multi Repo",
       description: "Multi repo dispatch",
       state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
       team: { id: "team-multi" },
       labels: { nodes: [] },
       comments: { nodes: [] },
       project: null,
     });
 
-    const result = await postWebhook({
-      type: "Issue",
-      action: "update",
-      data: {
-        id: "issue-multi",
-        identifier: "ENG-MULTI",
-        assigneeId: "viewer-1",
-      },
-      updatedFrom: { assigneeId: null },
-    });
+    const result = await postDelegationSession(
+      { id: "issue-multi", identifier: "ENG-MULTI", title: "Multi Repo" },
+      {},
+      "session-multi",
+    );
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 500));
@@ -4464,22 +5056,18 @@ describe("handleDispatch multi-repo and .catch/.finally", () => {
       title: "Spawn Fail",
       description: "desc",
       state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
       team: { id: "team-sf" },
       labels: { nodes: [] },
       comments: { nodes: [] },
       project: null,
     });
 
-    const result = await postWebhook({
-      type: "Issue",
-      action: "update",
-      data: {
-        id: "issue-spawn-fail",
-        identifier: "ENG-SF",
-        assigneeId: "viewer-1",
-      },
-      updatedFrom: { assigneeId: null },
-    });
+    const result = await postDelegationSession(
+      { id: "issue-spawn-fail", identifier: "ENG-SF", title: "Spawn Fail" },
+      {},
+      "session-spawn-fail",
+    );
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 500));
@@ -4501,22 +5089,18 @@ describe("handleDispatch multi-repo and .catch/.finally", () => {
       title: "Dispatch Thought",
       description: "desc",
       state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
       team: { id: "team-dt" },
       labels: { nodes: [] },
       comments: { nodes: [] },
       project: null,
     });
 
-    const result = await postWebhook({
-      type: "Issue",
-      action: "update",
-      data: {
-        id: "issue-disp-thought",
-        identifier: "ENG-DT",
-        assigneeId: "viewer-1",
-      },
-      updatedFrom: { assigneeId: null },
-    });
+    const result = await postDelegationSession(
+      { id: "issue-disp-thought", identifier: "ENG-DT", title: "Dispatch Thought" },
+      {},
+      "session-dispatch-thought",
+    );
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 500));
@@ -4531,6 +5115,7 @@ describe("handleDispatch multi-repo and .catch/.finally", () => {
       title: "Tier Label",
       description: "desc",
       state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
       team: { id: "team-tl" },
       labels: { nodes: [{ id: "existing-l1", name: "feature" }] },
       comments: { nodes: [] },
@@ -4540,16 +5125,11 @@ describe("handleDispatch multi-repo and .catch/.finally", () => {
       { id: "tier-label-id", name: "developer:medium" },
     ]);
 
-    const result = await postWebhook({
-      type: "Issue",
-      action: "update",
-      data: {
-        id: "issue-tier-label",
-        identifier: "ENG-TL",
-        assigneeId: "viewer-1",
-      },
-      updatedFrom: { assigneeId: null },
-    });
+    const result = await postDelegationSession(
+      { id: "issue-tier-label", identifier: "ENG-TL", title: "Tier Label" },
+      {},
+      "session-tier-label",
+    );
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 500));
@@ -4568,6 +5148,7 @@ describe("handleDispatch multi-repo and .catch/.finally", () => {
       title: "Tier Fail",
       description: "desc",
       state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
       team: { id: "team-tlfail" },
       labels: { nodes: [] },
       comments: { nodes: [] },
@@ -4575,16 +5156,11 @@ describe("handleDispatch multi-repo and .catch/.finally", () => {
     });
     mockLinearApiInstance.getTeamLabels.mockRejectedValue(new Error("team labels fail"));
 
-    const result = await postWebhook({
-      type: "Issue",
-      action: "update",
-      data: {
-        id: "issue-tier-fail",
-        identifier: "ENG-TLFAIL",
-        assigneeId: "viewer-1",
-      },
-      updatedFrom: { assigneeId: null },
-    });
+    const result = await postDelegationSession(
+      { id: "issue-tier-fail", identifier: "ENG-TLFAIL", title: "Tier Fail" },
+      {},
+      "session-tier-fail",
+    );
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 500));
@@ -4601,28 +5177,28 @@ describe("handleDispatch multi-repo and .catch/.finally", () => {
       title: "Plan Block",
       description: "desc",
       state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
       team: { id: "team-pb" },
       labels: { nodes: [] },
       comments: { nodes: [] },
       project: { id: "proj-plan-block" },
     });
 
-    const result = await postWebhook({
-      type: "Issue",
-      action: "update",
-      data: {
-        id: "issue-plan-block",
-        identifier: "ENG-PB",
-        assigneeId: "viewer-1",
-      },
-      updatedFrom: { assigneeId: null },
-    });
+    const result = await postDelegationSession(
+      { id: "issue-plan-block", identifier: "ENG-PB", title: "Plan Block" },
+      {},
+      "session-plan-block",
+    );
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 300));
     const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
     expect(infoCalls.some((msg: string) => msg.includes("planning-mode project"))).toBe(true);
-    expect(mockLinearApiInstance.createComment).toHaveBeenCalled();
+    expect(mockLinearApiInstance.emitActivity).toHaveBeenCalledWith(
+      "session-plan-block",
+      expect.objectContaining({ type: "response", body: expect.stringContaining("planning mode") }),
+    );
+    expect(mockLinearApiInstance.createComment).not.toHaveBeenCalled();
   });
 
   it("covers handleDispatch planning mode check failure", async () => {
@@ -4634,22 +5210,18 @@ describe("handleDispatch multi-repo and .catch/.finally", () => {
       title: "Plan Check Fail",
       description: "desc",
       state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
       team: { id: "team-pcf" },
       labels: { nodes: [] },
       comments: { nodes: [] },
       project: { id: "proj-plan-check-fail" },
     });
 
-    const result = await postWebhook({
-      type: "Issue",
-      action: "update",
-      data: {
-        id: "issue-plan-check-fail",
-        identifier: "ENG-PCF",
-        assigneeId: "viewer-1",
-      },
-      updatedFrom: { assigneeId: null },
-    });
+    const result = await postDelegationSession(
+      { id: "issue-plan-check-fail", identifier: "ENG-PCF", title: "Plan Check Fail" },
+      {},
+      "session-plan-check-fail",
+    );
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 500));
@@ -4665,22 +5237,18 @@ describe("handleDispatch multi-repo and .catch/.finally", () => {
       title: "Claw Dir Fail",
       description: "desc",
       state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
       team: { id: "team-cdf" },
       labels: { nodes: [] },
       comments: { nodes: [] },
       project: null,
     });
 
-    const result = await postWebhook({
-      type: "Issue",
-      action: "update",
-      data: {
-        id: "issue-claw-fail",
-        identifier: "ENG-CDF",
-        assigneeId: "viewer-1",
-      },
-      updatedFrom: { assigneeId: null },
-    });
+    const result = await postDelegationSession(
+      { id: "issue-claw-fail", identifier: "ENG-CDF", title: "Claw Dir Fail" },
+      {},
+      "session-claw-fail",
+    );
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 500));
@@ -4689,7 +5257,7 @@ describe("handleDispatch multi-repo and .catch/.finally", () => {
     expect(registerDispatchMock).toHaveBeenCalled();
   });
 
-  it("covers handleDispatch session creation failure", async () => {
+  it("uses the delegation session without proactively creating another session", async () => {
     mockLinearApiInstance.createSessionOnIssue.mockRejectedValue(new Error("session create fail"));
     mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
     mockLinearApiInstance.getIssueDetails.mockResolvedValue({
@@ -4698,28 +5266,23 @@ describe("handleDispatch multi-repo and .catch/.finally", () => {
       title: "Sess Fail",
       description: "desc",
       state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
       team: { id: "team-ssf" },
       labels: { nodes: [] },
       comments: { nodes: [] },
       project: null,
     });
 
-    const result = await postWebhook({
-      type: "Issue",
-      action: "update",
-      data: {
-        id: "issue-sess-fail",
-        identifier: "ENG-SSF",
-        assigneeId: "viewer-1",
-      },
-      updatedFrom: { assigneeId: null },
-    });
+    const result = await postDelegationSession(
+      { id: "issue-sess-fail", identifier: "ENG-SSF", title: "Sess Fail" },
+      {},
+      "session-existing-delegation",
+    );
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 500));
-    const warnCalls = (result.api.logger.warn as any).mock.calls.map((c: any[]) => c[0]);
-    expect(warnCalls.some((msg: string) => msg.includes("could not create agent session"))).toBe(true);
     expect(registerDispatchMock).toHaveBeenCalled();
+    expect(mockLinearApiInstance.createSessionOnIssue).not.toHaveBeenCalled();
   });
 
   it("covers handleDispatch reusing a warm container", async () => {
@@ -4731,22 +5294,18 @@ describe("handleDispatch multi-repo and .catch/.finally", () => {
       title: "Warm Reuse",
       description: "desc",
       state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
       team: { id: "team-pe" },
       labels: { nodes: [] },
       comments: { nodes: [] },
       project: null,
     });
 
-    const result = await postWebhook({
-      type: "Issue",
-      action: "update",
-      data: {
-        id: "issue-prep-err",
-        identifier: "ENG-PE",
-        assigneeId: "viewer-1",
-      },
-      updatedFrom: { assigneeId: null },
-    });
+    const result = await postDelegationSession(
+      { id: "issue-prep-err", identifier: "ENG-PE", title: "Warm Reuse" },
+      {},
+      "session-warm-reuse",
+    );
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 500));
@@ -4765,22 +5324,18 @@ describe("handleDispatch multi-repo and .catch/.finally", () => {
       title: "Memory Fail",
       description: "desc",
       state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
       team: { id: "team-mf2" },
       labels: { nodes: [] },
       comments: { nodes: [] },
       project: null,
     });
 
-    const result = await postWebhook({
-      type: "Issue",
-      action: "update",
-      data: {
-        id: "issue-mem-fail",
-        identifier: "ENG-MF2",
-        assigneeId: "viewer-1",
-      },
-      updatedFrom: { assigneeId: null },
-    });
+    const result = await postDelegationSession(
+      { id: "issue-mem-fail", identifier: "ENG-MF2", title: "Memory Fail" },
+      {},
+      "session-memory-fail",
+    );
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 500));
@@ -4875,11 +5430,11 @@ describe("plan_finalize approval error paths", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Coverage push: postAgentComment without opts (no agentOpts branch)
+// Session output must remain attached to the session
 // ---------------------------------------------------------------------------
 
-describe("postAgentComment without agentOpts", () => {
-  it("covers postAgentComment code path when no agentOpts is passed", async () => {
+describe("session response failures", () => {
+  it("does not fall back to an issue comment when no agentOpts are available", async () => {
     loadAgentProfilesMock.mockReturnValue({
       mal: { label: "Mal", mission: "captain", mentionAliases: ["mal"], isDefault: true },
     });
@@ -4900,9 +5455,7 @@ describe("postAgentComment without agentOpts", () => {
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 150));
-    expect(mockLinearApiInstance.createComment).toHaveBeenCalled();
-    const commentCall = mockLinearApiInstance.createComment.mock.calls[0];
-    expect(commentCall[1]).toContain("**[Mal]**");
+    expect(mockLinearApiInstance.createComment).not.toHaveBeenCalled();
   });
 });
 
@@ -4953,7 +5506,7 @@ describe("Comment.create guidance paths", () => {
 // Coverage push: handleDispatch .catch wrapper (L999)
 // ---------------------------------------------------------------------------
 
-describe("handleDispatch error via Issue.update .catch wrapper", () => {
+describe("handleDispatch error via AgentSession.created .catch wrapper", () => {
   it("covers handleDispatch .catch wrapper when whole dispatch throws", async () => {
     mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
     assessTierMock.mockRejectedValue(new Error("tier assessment crash"));
@@ -4963,22 +5516,18 @@ describe("handleDispatch error via Issue.update .catch wrapper", () => {
       title: "Handle Catch",
       description: "desc",
       state: { name: "In Progress", type: "started" },
+      delegate: { id: "viewer-1", name: "Vasile" },
       team: { id: "team-hc" },
       labels: { nodes: [] },
       comments: { nodes: [] },
       project: null,
     });
 
-    const result = await postWebhook({
-      type: "Issue",
-      action: "update",
-      data: {
-        id: "issue-hdl-catch",
-        identifier: "ENG-HC",
-        assigneeId: "viewer-1",
-      },
-      updatedFrom: { assigneeId: null },
-    });
+    const result = await postDelegationSession(
+      { id: "issue-hdl-catch", identifier: "ENG-HC", title: "Handle Catch" },
+      {},
+      "session-handle-catch",
+    );
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 300));

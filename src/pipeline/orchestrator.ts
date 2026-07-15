@@ -11,9 +11,9 @@
  *                    bounded codex fix, then re-review.
  *   product        : a product role (Helm / Lumen) emits a written brief.
  *
- * TRANSITIONS ARE AGENT-DECIDED: the ticket only advances to the plan's
- * onSuccess state when EVERY phase succeeds. Any phase failure leaves the
- * ticket where it is and posts a comment explaining what blocked it.
+ * TRANSITIONS ARE CONFIG-DRIVEN: the ticket advances to onSuccess only when
+ * every phase succeeds, or moves to onFailure after a gated failure. Terminal
+ * runs close the Agent Session and release Issue.delegate by default.
  *
  * This path is opt-in via config `orchestrationMode: "stateplan"`; the default
  * single-worker pipeline (spawnWorker) is untouched.
@@ -28,9 +28,10 @@ import {
   publishPullRequestReviewInContainer,
   repoWorkdir,
   WORK_ROOT,
+  type ContainerGitStatus,
 } from "../infra/container-runner.js";
 import { readManifest, writeManifest, updateManifest, savePlan, saveWorkerOutput, appendLog } from "./artifacts.js";
-import type { ActiveDispatch } from "./dispatch-state.js";
+import { completeDispatch, updateDispatchProgress, type ActiveDispatch } from "./dispatch-state.js";
 import type { HookContext } from "./pipeline.js";
 import type { ActivityContent } from "../api/linear-api.js";
 import {
@@ -50,6 +51,7 @@ import {
 import { resolveTargetState, type StatePlan, type PlanPhase } from "./state-plan.js";
 import { isCancelled, clearCancel } from "./cancellation.js";
 import { getActiveSession } from "./active-session.js";
+import { isCodexHarnessSteeringEnabled } from "../agent/codex-steering.js";
 
 interface OrchIssue {
   id: string;
@@ -72,6 +74,30 @@ interface RoleRunResult {
 interface StructuredReviewResult extends ReviewVerdict {
   output: string;
   infrastructureFailure?: boolean;
+}
+
+interface ReviewRecord {
+  role: RoleDef;
+  verdict: StructuredReviewResult;
+}
+
+interface PhaseResult {
+  success: boolean;
+  reason?: string;
+  /** Detailed gated findings retained for the terminal session/comment handoff. */
+  details?: string;
+  /** Substantive review retained until the complete review bundle is published. */
+  review?: ReviewRecord;
+  /** Tool/sandbox/auth failure; never publish as a code verdict. */
+  infrastructureFailure?: boolean;
+}
+
+/** Optional continuation data when a stopped state plan resumes. */
+export interface StatePlanRunOptions {
+  /** User direction for the first resumed phase. */
+  resumeGuidance?: string;
+  /** Resume at the persisted phase rather than restarting the whole plan. */
+  resume?: boolean;
 }
 
 /** Max bounded rework attempts (config `maxReworkAttempts`, default 2). */
@@ -175,7 +201,16 @@ async function runRole(
   extra: string | undefined,
   issue: OrchIssue,
 ): Promise<RoleRunResult> {
-  const backend = resolveRoleBackend(role, ctx.pluginConfig);
+  // With harness steering enabled, every specialist runs through OpenClaw's
+  // embedded Codex app-server turn and operates on the ticket container via
+  // container_* tools. Otherwise preserve the direct in-container Codex review
+  // path that avoids connector-based serial GitHub reads.
+  const harnessSteering = isCodexHarnessSteeringEnabled(ctx.pluginConfig);
+  const backend = harnessSteering
+    ? "embedded"
+    : phase === "review"
+      ? "codex"
+      : resolveRoleBackend(role, ctx.pluginConfig);
   const system = buildRolePrompt(role, { identifier: dispatch.issueIdentifier, phase, backend, extra });
   const task = buildRoleTask(issue, dispatch, extra);
 
@@ -210,6 +245,12 @@ async function runRole(
       inactivityMs,
       linearApi: ctx.linearApi,
       agentSessionId: dispatch.agentSessionId,
+      // Reviewers need only the already-synced local checkout. The orchestrator
+      // performs authenticated PR refresh/publication outside the model turn,
+      // so no GitHub credential is exposed to review Codex.
+      githubRole: phase === "implement" ? "coding" : undefined,
+      githubRepositories: repos,
+      pluginConfig: ctx.pluginConfig,
       logger: ctx.api.logger,
     });
     return { success: r.success, output: r.output };
@@ -308,13 +349,14 @@ async function runApexPlan(
 
 /**
  * Whether implementers run as a single steerable OpenClaw agent driving the
- * container via tools (the default), vs. the legacy one-shot `codex exec` per
- * specialist. Config `implementMode: "codex"` opts back into the old path.
+ * container via tools, versus direct `codex exec` per specialist. The public
+ * `workerBackend` setting selects the path so stateplan and single-worker
+ * orchestration obey the same configuration.
  * @param cfg - plugin config
  * @returns true when the container-agent path should be used
  */
-function implementerUsesContainer(cfg?: Record<string, unknown>): boolean {
-  return (cfg?.implementMode as string | undefined) !== "codex";
+export function implementerUsesContainerAgent(cfg?: Record<string, unknown>): boolean {
+  return isCodexHarnessSteeringEnabled(cfg) || cfg?.workerBackend !== "codex";
 }
 
 /**
@@ -359,11 +401,28 @@ async function runContainerImplement(
     "- container_clone_repo — pull in another repo for cross-repo work",
     "- container_search_code — AST semantic code search; use it to locate code by concept",
     "  (\"where is X handled?\") when you don't know exact names — better than grep for discovery.",
+    "Start repository discovery with ONE bounded container_exec call that batches git status/log,",
+    "targeted rg searches, and small sed excerpts. Keep its output below 20k characters. Use further",
+    "tool calls only for gaps found by that first pass; do not fetch repository files through GitHub.",
     "",
     "## What to do",
     "Implement the change fully, then VERIFY it by running the project's build/tests inside the",
     `container. Commit your work in each changed repo (git add -A && git commit) on branch`,
-    `\`${dispatch.branch}\`. Do NOT open a pull request — that happens after review.`,
+    `\`${dispatch.branch}\`. Use this structured commit message:`,
+    "",
+    `  ${issue.identifier}: <concise summary>`,
+    "",
+    "  Changelog:",
+    "  - <observable code change>",
+    "",
+    "  Validation:",
+    "  - <command>: pass",
+    "",
+    "On a self-review remediation turn, create a NEW commit with the same structure; never amend,",
+    "squash, or overwrite the coder commit. Do NOT open a pull request — that happens after review.",
+    "Do NOT push or launch another Codex/agent/reviewer. Return control after committing;",
+    "the orchestrator runs Apex and publishes the reviewed branch.",
+    "Never base64-encode repository files or read them one-by-one with git show.",
     dispatch.grillGuidance ? `\n## Clarified requirements\n${dispatch.grillGuidance}` : "",
   ]
     .filter(Boolean)
@@ -405,75 +464,209 @@ async function runImplementPhase(
   ctx: HookContext,
   dispatch: ActiveDispatch,
   issue: OrchIssue,
-): Promise<{ success: boolean; reason?: string }> {
+  resumeGuidance?: string,
+): Promise<PhaseResult> {
   const limit = maxRework(ctx.pluginConfig);
-  let assignments = await runApexPlan(ctx, dispatch, issue);
+  let assignments = resumeGuidance
+    ? [{
+      role: "spine",
+      task: [
+        "Continue the existing implementation in the preserved ticket workspace and OpenClaw session.",
+        "Inspect the current work before changing it; do not restart completed work.",
+        `User continuation: ${resumeGuidance}`,
+      ].join("\n"),
+    }]
+    : await runApexPlan(ctx, dispatch, issue);
   let lastReason = "";
-  const useContainerAgent = implementerUsesContainer(ctx.pluginConfig);
+  let lastReviewFindings = "";
+  const useContainerAgent = implementerUsesContainerAgent(ctx.pluginConfig);
 
   for (let attempt = 0; attempt <= limit; attempt++) {
     if (isCancelled(dispatch.issueId)) return { success: false, reason: "halted" };
+    let beforeStatuses: Array<{ repo: string; status: ContainerGitStatus }>;
+    let beforeCommits: Map<string, string>;
+    try {
+      beforeStatuses = readRepoStatuses(dispatch);
+      beforeCommits = new Map(beforeStatuses.map(({ repo, status }) => [repo, status.lastCommit]));
+    } catch (err) {
+      return { success: false, reason: `could not inspect the ticket workspace before implementation: ${err}` };
+    }
     setStatus(dispatch, attempt === 0 ? "implementing" : `reworking (attempt ${attempt + 1})`);
     const attemptOutputs: string[] = [];
     if (useContainerAgent) {
       // One steerable agent per ticket, editing + running ONLY inside its container.
-      const { success, output } = await runContainerImplement(ctx, dispatch, issue, assignments, reworkNoteFrom(lastReason, attempt));
+      const { success, output } = await runContainerImplement(
+        ctx,
+        dispatch,
+        issue,
+        assignments,
+        reworkNoteFrom(lastReviewFindings || lastReason, attempt),
+      );
       attemptOutputs.push(output);
       lastReason = success ? "" : `implementation agent failed: ${output.slice(-300)}`;
     } else {
-      // Legacy: one-shot codex exec per specialist, sharing the container.
+      // Direct codex exec per specialist, sharing the container.
+      let attemptFailure = "";
       for (const a of assignments) {
         if (isCancelled(dispatch.issueId)) return { success: false, reason: "halted" };
         const role = resolveRole(a.role) ?? ROLES.spine;
-        const { success, output } = await runRole(ctx, dispatch, role, "implement", a.task, issue);
+        const commitContract = [
+          a.task,
+          "",
+          `Commit all changes on ${dispatch.branch} using this structure:`,
+          `${issue.identifier}: <concise summary>`,
+          "",
+          "Changelog:",
+          "- <observable code change>",
+          "",
+          "Validation:",
+          "- <command>: pass",
+          attempt > 0
+            ? "This is self-review remediation: create a NEW commit; do not amend or squash the coder commit."
+            : "",
+        ].filter(Boolean).join("\n");
+        const { success, output } = await runRole(
+          ctx,
+          dispatch,
+          role,
+          "implement",
+          commitContract,
+          issue,
+        );
         attemptOutputs.push(`## ${role.label}\n${output}`);
         if (!success) {
-          lastReason = `${role.label} implementation failed: ${output.slice(-300)}`;
+          attemptFailure = `${role.label} implementation failed: ${summarizeImplementationFailure(output)}`;
           // Keep going to self-review — codex may have partially applied changes.
         }
       }
+      lastReason = attemptFailure;
     }
     // Persist this attempt's implementer output for future-session recall.
     try { saveWorkerOutput(dispatch.worktreePath, attempt, attemptOutputs.join("\n\n")); } catch { /* best effort */ }
     try { appendLog(dispatch.worktreePath, { ts: new Date().toISOString(), phase: "worker", attempt, agent: assignments.map((a) => a.role).join("+"), prompt: "", outputPreview: attemptOutputs.join("\n\n").slice(0, 500), success: !lastReason, durationMs: 0 }); } catch { /* best effort */ }
 
-    // No-diff guard: an implementer failed (lastReason set) AND left zero working
-    // changes — the container is effectively untouched (e.g. codex exited 1 in an
-    // empty container). There's nothing for a self-review to gate on, so it would
-    // just fail to find a verdict line ("no REVIEW verdict line found"). Surface the
-    // REAL reason instead of that cryptic message.
-    if (lastReason && !hasAnyChanges(dispatch)) {
+    // STOP may land while the worker is in-flight. Do not run the no-change
+    // guard (or leak the worker's final tool output into Linear) after that.
+    if (isCancelled(dispatch.issueId)) return { success: false, reason: "halted" };
+
+    let repoStatuses: Array<{ repo: string; status: ContainerGitStatus }>;
+    try {
+      repoStatuses = readRepoStatuses(dispatch);
+    } catch (err) {
+      return { success: false, reason: `could not verify committed implementation output: ${err}` };
+    }
+
+    // The summary/validation turn is preserved, but the review gate only sees
+    // explicit commits. Publication must never manufacture a fallback commit.
+    const dirtyRepos = repoStatuses
+      .filter(({ status }) => status.hasUncommitted)
+      .map(({ repo }) => repo);
+    if (dirtyRepos.length) {
+      lastReason = `implementation left uncommitted changes in ${dirtyRepos.join(", ")}`;
+      emit(ctx, dispatch, {
+        type: "thought",
+        body: `⚠️ ${lastReason} (attempt ${attempt + 1}/${limit + 1})`,
+      });
+      if (attempt < limit) continue;
+      return { success: false, reason: lastReason };
+    }
+
+    // No-change guard: never review an untouched workspace, even when an agent
+    // reports success. Commits already preserved before a resumed turn remain
+    // valid; a self-review remediation attempt must add a distinct new commit.
+    if (!repoStatuses.some(({ status }) => status.hasChanges)) {
+      lastReason = lastReason || "implementation agent completed without producing code changes or commits";
       emit(ctx, dispatch, {
         type: "thought",
         body: `⚠️ No code changes were produced (attempt ${attempt + 1}/${limit + 1}): ${lastReason}`,
       });
       if (attempt < limit) {
+        if (!useContainerAgent) {
+          assignments = assignments.map((a) => ({
+            role: a.role,
+            task: `The previous implementation attempt produced no code changes or commits. Implement the assigned work now and verify it:\n${a.task}`,
+          }));
+        }
         continue; // give rework a shot before giving up
       }
       return { success: false, reason: `no changes produced — ${lastReason}` };
+    }
+    const newlyCommitted = repoStatuses.filter(
+      ({ repo, status }) => beforeCommits.get(repo) !== status.lastCommit,
+    );
+    const unstructuredCommits = newlyCommitted
+      .filter(({ status }) =>
+        !status.lastCommitMessage.startsWith(`${issue.identifier}:`) ||
+        !/(?:^|\n)Changelog:\s*(?:\n|$)/.test(status.lastCommitMessage) ||
+        !/(?:^|\n)Validation:\s*(?:\n|$)/.test(status.lastCommitMessage),
+      )
+      .map(({ repo }) => repo);
+    if (unstructuredCommits.length) {
+      lastReason =
+        `commit message in ${unstructuredCommits.join(", ")} must start with ` +
+        `"${issue.identifier}:" and include Changelog: and Validation: sections`;
+      emit(ctx, dispatch, {
+        type: "thought",
+        body: `⚠️ ${lastReason} (attempt ${attempt + 1}/${limit + 1})`,
+      });
+      if (attempt < limit) continue;
+      return { success: false, reason: lastReason };
+    }
+    const requiresNewCommit =
+      attempt > 0 ||
+      (!resumeGuidance && beforeStatuses.some(({ status }) => status.hasChanges));
+    if (
+      requiresNewCommit &&
+      !repoStatuses.some(({ repo, status }) => beforeCommits.get(repo) !== status.lastCommit)
+    ) {
+      lastReason = "remediation did not create a separate commit";
+      emit(ctx, dispatch, {
+        type: "thought",
+        body: `⚠️ ${lastReason} (attempt ${attempt + 1}/${limit + 1})`,
+      });
+      if (attempt < limit) continue;
+      return { success: false, reason: lastReason };
     }
 
     // Apex self-review — read-only, gates the phase.
     if (isCancelled(dispatch.issueId)) return { success: false, reason: "halted" };
     setStatus(dispatch, "reviewing");
+    const reviewedCommits = repoStatuses
+      .filter(({ status }) => status.hasChanges)
+      .map(({ repo, status }) => `- ${repo}: ${status.lastCommit}`)
+      .join("\n");
     const verdict = await runStructuredReview(
       ctx,
       dispatch,
       issue,
       ROLES.apex,
-      "Self-review the implemented work against the issue's acceptance criteria. " +
-        "Confirm the code is complete and the tests pass. This is the gate before code review.",
+      [
+        "Self-review the coder commits in the existing Docker workspace against the issue's acceptance criteria.",
+        "Inspect the local refs/openclaw/base..HEAD diff in every changed repository; do not use GitHub APIs or connector tools.",
+        "Confirm the code is complete and the reported validation is credible. This is the gate before code review.",
+        "Commits under review:",
+        reviewedCommits,
+      ].join("\n"),
     );
     if (verdict.pass) {
-      await openPr(ctx, dispatch, issue);
-      return { success: true };
+      const publication = await openPr(ctx, dispatch, issue);
+      if (publication.success) return { success: true };
+      return publication;
     }
 
     lastReason = verdict.reason;
+    lastReviewFindings = verdict.output.trim().slice(-12_000) || verdict.reason;
     emit(ctx, dispatch, {
       type: "thought",
       body: `🔁 Apex self-review failed (attempt ${attempt + 1}/${limit + 1}): ${verdict.reason}`,
     });
+    if (verdict.infrastructureFailure) {
+      return {
+        success: false,
+        reason: verdict.reason,
+        details: lastReviewFindings,
+      };
+    }
     if (attempt < limit && !useContainerAgent) {
       // Legacy codex rework: re-task each implementer on the reviewer's findings.
       // (The container agent gets the findings via reworkNoteFrom(lastReason).)
@@ -484,7 +677,31 @@ async function runImplementPhase(
     }
   }
 
-  return { success: false, reason: lastReason || "implementation did not pass self-review" };
+  return {
+    success: false,
+    reason: lastReason || "implementation did not pass self-review",
+    details: lastReviewFindings || undefined,
+  };
+}
+
+/**
+ * Reduce a failed worker transcript to a short, human-readable reason. Codex
+ * transcripts contain command output; the last command can be a multi-megabyte
+ * base64 payload, which must never become a Linear failure message.
+ * @param output - raw worker output
+ * @returns bounded failure summary with encoded/tool payloads removed
+ */
+export function summarizeImplementationFailure(output: string): string {
+  const explicit = output.match(/(?:Codex (?:failed|timed out|killed)[^\n]*|inactivity watchdog[^\n]*|exit \d+)/i)?.[0];
+  if (explicit) return explicit.slice(0, 300);
+
+  const cleaned = output
+    .replace(/```[\s\S]*?```/g, " [tool output omitted] ")
+    .replace(/\b[A-Za-z0-9+/]{160,}={0,2}\b/g, "[encoded tool output omitted]")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return "worker exited without a readable error";
+  return cleaned.slice(-300);
 }
 
 /**
@@ -499,15 +716,29 @@ function reworkNoteFrom(lastReason: string, attempt: number): string | undefined
   return `This is rework attempt ${attempt + 1}. Address these review findings, preserving working code:\n${lastReason}`;
 }
 
+/** Read every prepared repository's local git state from the ticket container. */
+function readRepoStatuses(
+  dispatch: ActiveDispatch,
+): Array<{ repo: string; status: ContainerGitStatus }> {
+  const repos = dispatch.containerRepos ?? [];
+  if (!dispatch.containerName || !repos.length) {
+    throw new Error("no ticket container or repositories are available");
+  }
+  return repos.map((repo) => ({
+    repo,
+    status: containerGitStatus(dispatch.containerName!, repo),
+  }));
+}
+
 /**
- * Whether any target repo in the container has uncommitted working-tree changes.
+ * Whether any target repo has working-tree changes or commits since provisioning.
  * Best-effort: a git-status probe that throws is treated as "no changes" for that
- * repo. Used only as a negative signal (combined with a failed implementer) to
- * avoid running a self-review over an untouched workspace.
+ * repo. Used as a hard gate to avoid running a self-review over an untouched
+ * workspace, even when the implementation agent reported success.
  * @param dispatch - the active dispatch (needs containerName + containerRepos)
  * @returns true if at least one repo shows changes
  */
-function hasAnyChanges(dispatch: ActiveDispatch): boolean {
+export function hasAnyChanges(dispatch: ActiveDispatch): boolean {
   const repos = dispatch.containerRepos ?? [];
   if (!dispatch.containerName || !repos.length) return false;
   for (const repo of repos) {
@@ -524,11 +755,15 @@ function hasAnyChanges(dispatch: ActiveDispatch): boolean {
  * Open a PR per changed repo (cross-repo aware) from inside the container so the
  * Code Review phase has something to review. Repos with no changes are skipped.
  */
-async function openPr(ctx: HookContext, dispatch: ActiveDispatch, issue: OrchIssue): Promise<void> {
+async function openPr(
+  ctx: HookContext,
+  dispatch: ActiveDispatch,
+  issue: OrchIssue,
+): Promise<PhaseResult> {
   const repos = dispatch.containerRepos ?? [];
   if (!dispatch.containerName || !repos.length) {
     ctx.api.logger.warn(`[orchestrator] ${issue.identifier} no container/repos to open a PR`);
-    return;
+    return { success: false, reason: "no ticket container or repositories were available for publication" };
   }
   const opened: string[] = [];
   const failures: string[] = [];
@@ -537,8 +772,7 @@ async function openPr(ctx: HookContext, dispatch: ActiveDispatch, issue: OrchIss
     try {
       const status = containerGitStatus(dispatch.containerName, repo);
       if (!status.hasChanges) {
-        // Still attempt: the agent may have committed (porcelain clean but ahead
-        // of base). openPrInContainer no-ops gh when there's truly no diff.
+        continue;
       }
       const prUrl = await openPrInContainer(
         dispatch.containerName,
@@ -556,12 +790,18 @@ async function openPr(ctx: HookContext, dispatch: ActiveDispatch, issue: OrchIss
   }
   if (opened.length) {
     await comment(ctx, dispatch, `## ✅ Implementation complete\n\nPR(s):\n${opened.map((o) => `- ${o}`).join("\n")}`);
-  } else if (failures.length) {
-    await comment(ctx, dispatch, `## ⚠️ Implementation complete, PR creation failed\n\n${failures.map((f) => `- ${f}`).join("\n")}`);
-  } else {
-    ctx.api.logger.warn(`[orchestrator] ${issue.identifier} no changes across repos — no PR opened`);
-    emit(ctx, dispatch, { type: "thought", body: "No code changes to open a PR (nothing to review)." });
+    if (!failures.length) return { success: true };
   }
+  if (failures.length) {
+    await comment(ctx, dispatch, `## ⚠️ Implementation complete, PR creation failed\n\n${failures.map((f) => `- ${f}`).join("\n")}`);
+    return {
+      success: false,
+      reason: `could not publish every changed repository: ${failures.join("; ")}`,
+    };
+  }
+  ctx.api.logger.warn(`[orchestrator] ${issue.identifier} no pull request URL was produced`);
+  emit(ctx, dispatch, { type: "thought", body: "No pull request URL was produced for the committed changes." });
+  return { success: false, reason: "committed changes were not published to a pull request" };
 }
 
 // ---------------------------------------------------------------------------
@@ -570,9 +810,10 @@ async function openPr(ctx: HookContext, dispatch: ActiveDispatch, issue: OrchIss
 
 function reviewFocus(role: RoleDef): string {
   const prInstruction =
-    "Review the exact linked pull request head freshly fetched and checked out in this ticket's existing Docker container. " +
-    "Use ONLY container_read_file, container_search_code, and read-only container_exec commands for repository work. " +
-    "Never use host bash/exec. Inspect the PR diff and run relevant checks inside Docker. " +
+    "You are already running inside the ticket's Docker container. Review the exact linked pull request head " +
+    "that the orchestrator freshly fetched and checked out before this turn. Use local read-only shell commands " +
+    "such as git diff, rg, sed, and the project's tests. Do not call GitHub APIs, connector tools, container_* tools, " +
+    "or host commands; the local checkout is authoritative. " +
     "Do not edit, commit, push, or open a PR. Write a detailed review; the orchestrator will publish it to GitHub. ";
   switch (role.id) {
     case "warden":
@@ -618,28 +859,45 @@ function reviewInfrastructureFailure(output: string): string | null {
   return patterns.some((pattern) => pattern.test(output)) ? compact : null;
 }
 
-/** Publish a substantive review to every linked PR, falling back to Linear. */
-async function publishReview(
+/** Publish one formal verdict for the complete review bundle to every linked PR. */
+async function publishReviewBundle(
   ctx: HookContext,
   dispatch: ActiveDispatch,
-  role: RoleDef,
-  verdict: StructuredReviewResult,
+  reviews: ReviewRecord[],
+  failures: Array<{ label: string; result: PhaseResult }>,
 ): Promise<void> {
   const pullRequests = dispatch.reviewPullRequests ?? [];
-  if (!pullRequests.length || verdict.infrastructureFailure) return;
+  if (!pullRequests.length || (!reviews.length && !failures.length)) return;
+  if (failures.some(({ result }) => result.infrastructureFailure)) return;
+  const passed = failures.length === 0 && reviews.every(({ verdict }) => verdict.pass);
   const body = [
-    `## ${role.label} review`,
+    "## Automated review bundle",
     "",
-    `**Verdict:** ${verdict.pass ? "pass" : "fail"}${verdict.reason ? ` — ${verdict.reason}` : ""}`,
+    `**Overall verdict:** ${passed ? "pass" : "fail"}`,
     "",
-    verdict.output.trim(),
+    ...reviews.flatMap(({ role, verdict }) => [
+      `### ${role.label}`,
+      "",
+      `**Verdict:** ${verdict.pass ? "pass" : "fail"}${verdict.reason ? ` — ${verdict.reason}` : ""}`,
+      "",
+      verdict.output.trim(),
+      "",
+    ]),
+    ...failures
+      .filter(({ result }) => !result.review)
+      .flatMap(({ label, result }) => [
+        `### ${label}`,
+        "",
+        `**Verdict:** fail — ${result.reason ?? "review failed"}`,
+        "",
+      ]),
     "",
     `_Automated review for Linear issue ${dispatch.issueIdentifier}._`,
   ].join("\n").slice(0, 30_000);
-  const failures: string[] = [];
+  const publicationFailures: string[] = [];
   for (const pullRequest of pullRequests) {
     if (!dispatch.containerName) {
-      failures.push(`${pullRequest.url}: no ticket container`);
+      publicationFailures.push(`${pullRequest.url}: no ticket container`);
       continue;
     }
     const published = await publishPullRequestReviewInContainer(
@@ -647,21 +905,21 @@ async function publishReview(
       pullRequest.repoName,
       pullRequest.url,
       body,
-      verdict.pass,
+      passed,
       ctx.pluginConfig,
     );
     if (published.status !== 0) {
-      failures.push(`${pullRequest.url}: ${published.stderr.trim().slice(0, 300)}`);
+      publicationFailures.push(`${pullRequest.url}: ${published.stderr.trim().slice(0, 300)}`);
     }
   }
-  if (!failures.length) return;
+  if (!publicationFailures.length) return;
 
   ctx.api.logger.warn(
-    `[orchestrator] ${dispatch.issueIdentifier} GitHub review publication failed: ${failures.join("; ")}`,
+    `[orchestrator] ${dispatch.issueIdentifier} GitHub review publication failed: ${publicationFailures.join("; ")}`,
   );
   await ctx.linearApi.createComment(
     dispatch.issueId,
-    `${body}\n\n> GitHub publication failed; preserved in Linear instead.\n> ${failures.join("\n> ")}`,
+    `${body}\n\n> GitHub publication failed; preserved in Linear instead.\n> ${publicationFailures.join("\n> ")}`,
   ).catch((err) => {
     ctx.api.logger.warn(`[orchestrator] Linear review fallback failed for ${dispatch.issueIdentifier}: ${err}`);
   });
@@ -744,10 +1002,9 @@ async function runStructuredReview(
 /**
  * Run a single review role for a code-review / QA state. REVIEW-ONLY: reviewers
  * read the change and emit a pass/fail verdict — they NEVER trigger an
- * implementer. In a code-review state only review agents run; a fail GATES (the
- * ticket stays put and the findings are reported) so a human can bounce it back
- * to implementation, where fixing actually belongs. The verdict streams into the
- * agent session rather than the issue comments.
+ * implementer. In a code-review state only review agents run; the complete
+ * configured bundle is collected into one formal GitHub verdict. A gated fail
+ * returns the ticket to the configured remediation state.
  * @param gate - true when the phase blocks on failure; false = annotate-only
  */
 async function runReviewPhase(
@@ -756,49 +1013,170 @@ async function runReviewPhase(
   issue: OrchIssue,
   role: RoleDef,
   gate: boolean,
-): Promise<{ success: boolean; reason?: string }> {
+  resumeGuidance?: string,
+): Promise<PhaseResult> {
   const syncFailure = await syncReviewSandbox(ctx, dispatch);
   if (syncFailure) {
-    return { success: false, reason: `${role.label} review sandbox sync failed: ${syncFailure}` };
+    return {
+      success: false,
+      reason: `${role.label} review sandbox sync failed: ${syncFailure}`,
+      details: syncFailure,
+      infrastructureFailure: true,
+    };
   }
-  const verdict = await runStructuredReview(ctx, dispatch, issue, role, reviewFocus(role));
+  const focus = [
+    reviewFocus(role),
+    resumeGuidance ? `User continuation after pausing: ${resumeGuidance}` : "",
+  ].filter(Boolean).join("\n\n");
+  const verdict = await runStructuredReview(ctx, dispatch, issue, role, focus);
   emit(ctx, dispatch, {
     type: "thought",
     body: `${verdict.pass ? "✅" : "❌"} ${role.label} review — ${verdict.pass ? "pass" : "fail"}: ${verdict.reason}`,
   });
-  await publishReview(ctx, dispatch, role, verdict);
 
-  if (verdict.pass) return { success: true };
-  if (!gate) return { success: true }; // annotate-only reviewers never block
-  return { success: false, reason: `${role.label}: ${verdict.reason}` };
+  const review = verdict.infrastructureFailure ? undefined : { role, verdict };
+  if (verdict.pass) return { success: true, review };
+  if (!gate) {
+    return { success: true, review, infrastructureFailure: verdict.infrastructureFailure };
+  } // annotate-only reviewers never block
+  return {
+    success: false,
+    reason: `${role.label}: ${verdict.reason}`,
+    details: verdict.output.trim().slice(-12_000) || undefined,
+    review,
+    infrastructureFailure: verdict.infrastructureFailure,
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Agent-decided state transition
+// Deterministic state transition + delegate lifecycle
 // ---------------------------------------------------------------------------
 
-async function transitionOnSuccess(
+interface TransitionResult {
+  success: boolean;
+  stateName?: string;
+  reason?: string;
+}
+
+async function transitionToTarget(
+  ctx: HookContext,
+  dispatch: ActiveDispatch,
+  issue: OrchIssue,
+  targetConfig: StatePlan["onSuccess"],
+  outcome: "success" | "failure",
+): Promise<TransitionResult> {
+  if (!targetConfig) return { success: true };
+  if (!issue.teamId) return { success: false, reason: "the issue has no team id for state resolution" };
+  try {
+    const states = await ctx.linearApi.getTeamStates(issue.teamId);
+    const target = resolveTargetState(targetConfig, states);
+    if (!target) {
+      const reason = `no team state matched ${outcome} target ${JSON.stringify(targetConfig)}`;
+      ctx.api.logger.warn(`[orchestrator] ${issue.identifier} ${reason}`);
+      return { success: false, reason };
+    }
+    await ctx.linearApi.updateIssue(dispatch.issueId, { stateId: target.id });
+    await comment(
+      ctx,
+      dispatch,
+      `## ➡️ Moving to **${target.name}**\n\n${outcome === "success" ? "All phases passed." : "A gated phase requested changes."}`,
+    );
+    ctx.api.logger.info(`[orchestrator] ${issue.identifier} → ${target.name}`);
+    return { success: true, stateName: target.name };
+  } catch (err) {
+    const reason = `state transition failed: ${String(err).slice(0, 300)}`;
+    ctx.api.logger.warn(`[orchestrator] ${reason} for ${issue.identifier}`);
+    return { success: false, reason };
+  }
+}
+
+/** Release the app from Issue.delegate after a terminal workflow outcome. */
+async function releaseDelegate(
+  ctx: HookContext,
+  dispatch: ActiveDispatch,
+  plan: StatePlan,
+): Promise<void> {
+  if (plan.clearDelegate === false) return;
+  if (typeof ctx.linearApi.updateIssue !== "function") {
+    ctx.api.logger.warn(`[orchestrator] Linear API cannot release delegate for ${dispatch.issueIdentifier}`);
+    return;
+  }
+  await ctx.linearApi.updateIssue(dispatch.issueId, { delegateId: null }).catch((err) => {
+    ctx.api.logger.warn(`[orchestrator] delegate release failed for ${dispatch.issueIdentifier}: ${err}`);
+  });
+}
+
+/** Archive a terminal dispatch so a later manual delegation starts a fresh run. */
+async function archiveDispatch(
+  ctx: HookContext,
+  dispatch: ActiveDispatch,
+  status: "done" | "failed",
+): Promise<void> {
+  if (typeof completeDispatch !== "function") return;
+  await completeDispatch(
+    dispatch.issueIdentifier,
+    {
+      tier: dispatch.tier,
+      status,
+      completedAt: new Date().toISOString(),
+      project: dispatch.project,
+    },
+    ctx.configPath,
+  ).catch((err) => {
+    ctx.api.logger.warn(`[orchestrator] dispatch archival failed for ${dispatch.issueIdentifier}: ${err}`);
+  });
+}
+
+/** Finish a gated workflow failure, preserving findings for the next delegation. */
+async function finishFailedPlan(
   ctx: HookContext,
   dispatch: ActiveDispatch,
   plan: StatePlan,
   issue: OrchIssue,
+  label: string,
+  result: PhaseResult,
 ): Promise<void> {
-  if (!plan.onSuccess || !issue.teamId) return;
-  try {
-    const states = await ctx.linearApi.getTeamStates(issue.teamId);
-    const target = resolveTargetState(plan.onSuccess, states);
-    if (!target) {
-      ctx.api.logger.warn(
-        `[orchestrator] ${issue.identifier} no team state matched onSuccess ${JSON.stringify(plan.onSuccess)}`,
-      );
-      return;
-    }
-    await ctx.linearApi.updateIssue(dispatch.issueId, { stateId: target.id });
-    await comment(ctx, dispatch, `## ➡️ Moving to **${target.name}**\n\nAll phases passed.`);
-    ctx.api.logger.info(`[orchestrator] ${issue.identifier} → ${target.name}`);
-  } catch (err) {
-    ctx.api.logger.warn(`[orchestrator] transition failed for ${issue.identifier}: ${err}`);
+  let reason = result.reason ?? "phase failed";
+  const transition = await transitionToTarget(
+    ctx,
+    dispatch,
+    issue,
+    plan.onFailure ?? null,
+    "failure",
+  );
+  if (!transition.success && transition.reason) {
+    reason = `${reason}\n\nWorkflow transition warning: ${transition.reason}`;
   }
+  const findings = result.details
+    ? `\n\n## Review findings\n\n${result.details.slice(-8_000)}`
+    : "";
+  await comment(
+    ctx,
+    dispatch,
+    `## ⛔ Blocked at ${label}\n\n${reason}${findings}\n\n` +
+      (transition.stateName
+        ? `The ticket was returned to **${transition.stateName}** for remediation.`
+        : "The ticket requires remediation before this workflow can continue."),
+  );
+  await ctx.notify("stuck", {
+    identifier: dispatch.issueIdentifier,
+    title: issue.title,
+    status: "stuck",
+    attempt: dispatch.attempt,
+    reason,
+  }).catch(() => {});
+  setStatus(dispatch, `blocked: ${label}`);
+  await endSession(
+    ctx,
+    dispatch,
+    "response",
+    `⛔ Blocked at ${label}: ${reason}${findings}\n\n` +
+      (transition.stateName
+        ? `Moved to ${transition.stateName}. Delegate the coding agent again when you want remediation to start.`
+        : "Delegate the agent again when you want to retry."),
+  );
+  await releaseDelegate(ctx, dispatch, plan);
+  await archiveDispatch(ctx, dispatch, "failed");
 }
 
 // ---------------------------------------------------------------------------
@@ -807,8 +1185,9 @@ async function transitionOnSuccess(
 
 /**
  * Run a resolved state plan for a dispatch. Executes phases in order; on the
- * first phase failure it stops and posts a blocking comment WITHOUT moving the
- * ticket. On full success it advances the ticket to the plan's onSuccess state.
+ * first gated failure it moves to the configured onFailure state; on full
+ * success it advances to onSuccess. Both terminal paths complete the Linear
+ * session, release the delegate (unless disabled), and archive the dispatch.
  * @param ctx - hook context (api, linearApi, notify, config, configPath)
  * @param dispatch - the active dispatch (worktree, session, attempt)
  * @param plan - the resolved state plan
@@ -817,6 +1196,7 @@ export async function runStatePlan(
   ctx: HookContext,
   dispatch: ActiveDispatch,
   plan: StatePlan,
+  options: StatePlanRunOptions = {},
 ): Promise<void> {
   const details = await ctx.linearApi.getIssueDetails(dispatch.issueId).catch(() => null);
   const issue: OrchIssue = {
@@ -827,55 +1207,147 @@ export async function runStatePlan(
     teamId: details?.team?.id,
   };
 
-  // Fresh run — drop any stale halt flag from a prior (stopped) dispatch.
+  // A resumed turn deliberately clears the STOP flag while retaining the same
+  // Linear session, OpenClaw session ids, repos, and container.
   clearCancel(dispatch.issueId);
+  const startPhaseIndex = options.resume && typeof dispatch.phaseIndex === "number"
+    ? Math.min(Math.max(dispatch.phaseIndex, 0), Math.max(plan.phases.length - 1, 0))
+    : 0;
+  await updateDispatchProgress(
+    dispatch.issueIdentifier,
+    { status: "working", phaseIndex: startPhaseIndex, pausedAt: null },
+    ctx.configPath,
+  ).catch((err) => {
+    ctx.api.logger.warn(`[orchestrator] could not persist resume state for ${issue.identifier}: ${err}`);
+  });
   ensureManifest(dispatch);
-  setStatus(dispatch, "orchestrating");
+  setStatus(dispatch, options.resume ? "resuming" : "orchestrating");
   emit(ctx, dispatch, {
     type: "thought",
-    body: `Orchestrating "${plan.stateLabel}" — ${plan.phases.length} phase(s)`,
+    body: options.resume
+      ? `Resuming "${plan.stateLabel}" at phase ${startPhaseIndex + 1}/${plan.phases.length}`
+      : `Orchestrating "${plan.stateLabel}" — ${plan.phases.length} phase(s)`,
   });
   ctx.api.logger.info(
     `[orchestrator] ${issue.identifier} plan=${plan.stateLabel} phases=${plan.phases.map((p) => p.role ?? p.type).join(",")}`,
   );
 
   try {
-    for (const phase of plan.phases) {
+    const reviewFailures: Array<{ label: string; result: PhaseResult }> = [];
+    const reviewRecords: ReviewRecord[] = [];
+    for (let phaseIndex = startPhaseIndex; phaseIndex < plan.phases.length; phaseIndex++) {
+      const phase = plan.phases[phaseIndex];
+      dispatch.phaseIndex = phaseIndex;
+      await updateDispatchProgress(
+        dispatch.issueIdentifier,
+        { status: "working", phaseIndex, pausedAt: null },
+        ctx.configPath,
+      ).catch((err) => {
+        ctx.api.logger.warn(`[orchestrator] could not persist phase ${phaseIndex} for ${issue.identifier}: ${err}`);
+      });
       // Honor a STOP requested between phases — bail cleanly, don't advance.
       if (isCancelled(dispatch.issueId)) {
         setStatus(dispatch, "cancelled");
-        endSession(ctx, dispatch, "response", "🛑 Halted — stopped before completing the pipeline. Re-assign or comment to start again.");
+        await updateDispatchProgress(
+          dispatch.issueIdentifier,
+          { status: "paused", phaseIndex, pausedAt: new Date().toISOString() },
+          ctx.configPath,
+        ).catch(() => {});
         return;
       }
-      const result = await runPhase(ctx, dispatch, issue, phase);
+      const result = await runPhase(
+        ctx,
+        dispatch,
+        issue,
+        phase,
+        phaseIndex === startPhaseIndex ? options.resumeGuidance : undefined,
+      );
       if (result.reason === "halted") {
         setStatus(dispatch, "cancelled");
-        endSession(ctx, dispatch, "response", "🛑 Halted mid-phase — stopped the running work. Re-assign or comment to start again.");
+        await updateDispatchProgress(
+          dispatch.issueIdentifier,
+          { status: "paused", phaseIndex, pausedAt: new Date().toISOString() },
+          ctx.configPath,
+        ).catch(() => {});
         return;
       }
+      if (result.review) reviewRecords.push(result.review);
       if (!result.success) {
         const label = phase.role ? `${phase.type}:${phase.role}` : phase.type;
-        const reason = result.reason ?? "phase failed";
-        await comment(
+        const nextPhase = plan.phases[phaseIndex + 1];
+        if (phase.type === "review") {
+          reviewFailures.push({ label, result });
+          // Run the complete configured review bundle (e.g. Warden + Apex) so
+          // one delegation produces all actionable findings in one pass.
+          if (nextPhase?.type === "review") continue;
+          await publishReviewBundle(ctx, dispatch, reviewRecords, reviewFailures);
+          const combined: PhaseResult = {
+            success: false,
+            reason: reviewFailures
+              .map((failure) => `${failure.label}: ${failure.result.reason ?? "review failed"}`)
+              .join("; "),
+            details: reviewFailures
+              .map((failure) => `### ${failure.label}\n\n${failure.result.details ?? failure.result.reason ?? "review failed"}`)
+              .join("\n\n"),
+          };
+          await finishFailedPlan(
+            ctx,
+            dispatch,
+            plan,
+            issue,
+            reviewFailures.map((failure) => failure.label).join(" + "),
+            combined,
+          );
+          return;
+        }
+        await finishFailedPlan(ctx, dispatch, plan, issue, label, result);
+        return;
+      }
+      const nextPhase = plan.phases[phaseIndex + 1];
+      if (phase.type === "review" && nextPhase?.type !== "review") {
+        await publishReviewBundle(ctx, dispatch, reviewRecords, reviewFailures);
+      }
+      if (phase.type === "review" && reviewFailures.length && nextPhase?.type !== "review") {
+        const combined: PhaseResult = {
+          success: false,
+          reason: reviewFailures
+            .map((failure) => `${failure.label}: ${failure.result.reason ?? "review failed"}`)
+            .join("; "),
+          details: reviewFailures
+            .map((failure) => `### ${failure.label}\n\n${failure.result.details ?? failure.result.reason ?? "review failed"}`)
+            .join("\n\n"),
+        };
+        await finishFailedPlan(
           ctx,
           dispatch,
-          `## ⛔ Blocked at ${label}\n\n${reason}\n\nThe ticket stays in its current state until this is resolved.`,
+          plan,
+          issue,
+          reviewFailures.map((failure) => failure.label).join(" + "),
+          combined,
         );
-        await ctx.notify("stuck", {
-          identifier: dispatch.issueIdentifier,
-          title: issue.title,
-          status: "stuck",
-          attempt: dispatch.attempt,
-          reason: result.reason,
-        }).catch(() => {});
-        setStatus(dispatch, `blocked: ${label}`);
-        // Terminal activity — ends the Linear agent turn (otherwise it hangs "active").
-        endSession(ctx, dispatch, "response", `⛔ Blocked at ${label}: ${reason}\n\nThe ticket was left in its current state. Reply with guidance to retry.`);
         return;
+      }
+      if (phase.type === "review" && nextPhase?.type !== "review") {
+        reviewRecords.length = 0;
+        reviewFailures.length = 0;
       }
     }
 
-    await transitionOnSuccess(ctx, dispatch, plan, issue);
+    const transition = await transitionToTarget(
+      ctx,
+      dispatch,
+      issue,
+      plan.onSuccess,
+      "success",
+    );
+    if (!transition.success) {
+      const reason = transition.reason ?? "workflow state transition failed";
+      setStatus(dispatch, "error");
+      await endSession(ctx, dispatch, "error", `Implementation/review passed, but ${reason}.`);
+      await releaseDelegate(ctx, dispatch, plan);
+      await archiveDispatch(ctx, dispatch, "failed");
+      return;
+    }
     setStatus(dispatch, "done");
     await ctx.notify("audit_pass", {
       identifier: dispatch.issueIdentifier,
@@ -883,11 +1355,21 @@ export async function runStatePlan(
       status: "done",
       attempt: dispatch.attempt,
     }).catch(() => {});
-    endSession(ctx, dispatch, "response", `✅ Completed "${plan.stateLabel}" — all phases passed.`);
+    await endSession(
+      ctx,
+      dispatch,
+      "response",
+      `✅ Completed "${plan.stateLabel}" — all phases passed.` +
+        (transition.stateName ? ` Moved to ${transition.stateName}.` : ""),
+    );
+    await releaseDelegate(ctx, dispatch, plan);
+    await archiveDispatch(ctx, dispatch, "done");
   } catch (err) {
     ctx.api.logger.error(`[orchestrator] ${issue.identifier} unexpected error: ${err}`);
     setStatus(dispatch, "error");
-    endSession(ctx, dispatch, "error", `The pipeline hit an unexpected error: ${String(err).slice(0, 400)}`);
+    await endSession(ctx, dispatch, "error", `The pipeline hit an unexpected error: ${String(err).slice(0, 400)}`);
+    await releaseDelegate(ctx, dispatch, plan);
+    await archiveDispatch(ctx, dispatch, "failed");
   }
 }
 
@@ -900,14 +1382,14 @@ export async function runStatePlan(
  * @param type - "response" for a normal end, "error" for a failure
  * @param body - the closing message shown in the session
  */
-function endSession(
+async function endSession(
   ctx: HookContext,
   dispatch: ActiveDispatch,
   type: "response" | "error",
   body: string,
-): void {
+): Promise<void> {
   if (!dispatch.agentSessionId) return;
-  ctx.linearApi.emitActivity(dispatch.agentSessionId, { type, body }).catch((err) => {
+  await ctx.linearApi.emitActivity(dispatch.agentSessionId, { type, body }).catch((err) => {
     ctx.api.logger.warn(`[orchestrator] terminal ${type} emit failed for ${dispatch.issueIdentifier}: ${err}`);
   });
 }
@@ -918,14 +1400,15 @@ async function runPhase(
   dispatch: ActiveDispatch,
   issue: OrchIssue,
   phase: PlanPhase,
-): Promise<{ success: boolean; reason?: string }> {
+  resumeGuidance?: string,
+): Promise<PhaseResult> {
   if (phase.type === "plan-implement") {
-    return runImplementPhase(ctx, dispatch, issue);
+    return runImplementPhase(ctx, dispatch, issue, resumeGuidance);
   }
   if (phase.type === "review") {
     const role = phase.role ? resolveRole(phase.role) : undefined;
     if (!role) return { success: false, reason: `unknown review role "${phase.role}"` };
-    return runReviewPhase(ctx, dispatch, issue, role, phase.gate !== false);
+    return runReviewPhase(ctx, dispatch, issue, role, phase.gate !== false, resumeGuidance);
   }
   if (phase.type === "product") {
     const role = phase.role ? resolveRole(phase.role) : undefined;
@@ -934,7 +1417,10 @@ async function runPhase(
       role.id === "helm"
         ? "Turn this feature idea into a crisp product brief with goals, scope, and acceptance criteria."
         : "Define the metrics, funnels, and measurement plan for this feature.";
-    const { success, output } = await runRole(ctx, dispatch, role, "product", focus, issue);
+    const productFocus = [focus, resumeGuidance ? `User continuation after pausing: ${resumeGuidance}` : ""]
+      .filter(Boolean)
+      .join("\n\n");
+    const { success, output } = await runRole(ctx, dispatch, role, "product", productFocus, issue);
     if (success) await comment(ctx, dispatch, `## 📄 ${role.label}\n\n${output.slice(0, 4000)}`);
     return { success };
   }

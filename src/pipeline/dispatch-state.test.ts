@@ -8,6 +8,7 @@ import {
   transitionDispatch,
   completeDispatch,
   updateDispatchStatus,
+  updateDispatchProgress,
   getActiveDispatch,
   listActiveDispatches,
   listStaleDispatches,
@@ -293,6 +294,26 @@ describe("listStaleDispatches", () => {
     const stale = listStaleDispatches(state, 2 * 60 * 60_000);
     expect(stale).toHaveLength(0);
   });
+
+  it("excludes paused and already-stuck dispatches regardless of age", async () => {
+    const p = tmpStatePath();
+    const oldDate = new Date(Date.now() - 3 * 60 * 60_000).toISOString();
+    await registerDispatch("PAUSED-OLD", makeDispatch({
+      issueIdentifier: "PAUSED-OLD",
+      status: "paused",
+      dispatchedAt: oldDate,
+      pausedAt: new Date().toISOString(),
+    }), p);
+    await registerDispatch("STUCK-OLD", makeDispatch({
+      issueIdentifier: "STUCK-OLD",
+      status: "stuck",
+      dispatchedAt: oldDate,
+      stuckReason: "manual",
+    }), p);
+
+    const state = await readDispatchState(p);
+    expect(listStaleDispatches(state, 2 * 60 * 60_000)).toEqual([]);
+  });
 });
 
 describe("listRecoverableDispatches", () => {
@@ -409,6 +430,42 @@ describe("migration", () => {
     expect(state.version).toBe(2);
     expect(getActiveDispatch(state, "X-3")).not.toBeNull();
     expect(state.processedEvents).toEqual(["evt-old"]);
+  });
+});
+
+describe("updateDispatchProgress", () => {
+  it("preserves dispatch identity while pausing and resuming a phase", async () => {
+    const p = tmpStatePath();
+    await registerDispatch("PAUSE-1", makeDispatch({
+      issueIdentifier: "PAUSE-1",
+      agentSessionId: "linear-session-1",
+      containerName: "openclaw-linear-PAUSE-1",
+      containerRepos: ["api", "frontend"],
+    }), p);
+
+    const paused = await updateDispatchProgress("PAUSE-1", {
+      status: "paused",
+      phaseIndex: 1,
+      pausedAt: "2026-07-14T20:00:00.000Z",
+      stuckReason: "stale_2h",
+    }, p);
+    expect(paused).toMatchObject({
+      status: "paused",
+      phaseIndex: 1,
+      agentSessionId: "linear-session-1",
+      containerName: "openclaw-linear-PAUSE-1",
+      containerRepos: ["api", "frontend"],
+    });
+
+    const resumed = await updateDispatchProgress("PAUSE-1", {
+      status: "working",
+      pausedAt: null,
+      stuckReason: null,
+    }, p);
+    expect(resumed?.status).toBe("working");
+    expect(resumed?.pausedAt).toBeUndefined();
+    expect(resumed?.stuckReason).toBeUndefined();
+    expect(resumed?.phaseIndex).toBe(1);
   });
 });
 

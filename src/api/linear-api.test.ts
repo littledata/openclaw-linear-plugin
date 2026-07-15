@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, type Mock } from "vitest";
 import { resolveLinearToken, LinearAgentApi, AUTH_PROFILES_PATH, refreshTokenProactively, formatAgentPlan } from "./linear-api.js";
+import { _resetAgentSessionLifecycleForTesting } from "./agent-session-lifecycle.js";
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -70,6 +71,7 @@ let fetchMock: Mock;
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  _resetAgentSessionLifecycleForTesting();
   fetchMock = vi.fn();
   vi.stubGlobal("fetch", fetchMock);
 
@@ -416,6 +418,54 @@ describe("LinearAgentApi", () => {
         content: { type: "action", action: "container_exec", parameter: "git diff" },
       });
     });
+
+    it("makes the completion response terminal until the same session resumes", async () => {
+      fetchMock
+        .mockResolvedValueOnce(okResponse({ agentActivityCreate: { success: true } }))
+        .mockResolvedValueOnce(okResponse({ agentActivityCreate: { success: true } }));
+
+      const api = new LinearAgentApi(TOKEN);
+      await api.completeSession("session-stop", "Stopped. Reply to continue.");
+      await api.emitActivity("session-stop", { type: "thought", body: "late worker output" });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const completion = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(completion.variables.input.content).toEqual({
+        type: "response",
+        body: "Stopped. Reply to continue.",
+      });
+
+      api.resumeSession("session-stop");
+      await api.emitActivity("session-stop", { type: "thought", body: "continuing" });
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const continuation = JSON.parse(fetchMock.mock.calls[1][1].body);
+      expect(continuation.variables.input.content).toEqual({
+        type: "thought",
+        body: "continuing",
+      });
+    });
+
+    it("drops activities queued before completion so the response remains last", async () => {
+      fetchMock.mockResolvedValueOnce(
+        okResponse({ agentActivityCreate: { success: true } }),
+      );
+
+      const api = new LinearAgentApi(TOKEN);
+      const staleActivity = api.emitActivity("session-race", {
+        type: "action",
+        action: "old tool call",
+      });
+      const completion = api.completeSession("session-race", "Stopped.");
+      await Promise.all([staleActivity, completion]);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.variables.input.content).toEqual({
+        type: "response",
+        body: "Stopped.",
+      });
+    });
   });
 
   describe("createComment", () => {
@@ -454,6 +504,7 @@ describe("LinearAgentApi", () => {
         estimate: 3,
         state: { name: "In Progress" },
         assignee: { name: "Alice" },
+        delegate: { id: "app-1", name: "Vasile" },
         labels: { nodes: [{ id: "l1", name: "bug" }] },
         team: { id: "t1", name: "Engineering", issueEstimationType: "fibonacci" },
         comments: {
@@ -485,6 +536,7 @@ describe("LinearAgentApi", () => {
       expect(result.estimate).toBe(3);
       expect(result.state.name).toBe("In Progress");
       expect(result.assignee?.name).toBe("Alice");
+      expect(result.delegate?.id).toBe("app-1");
       expect(result.labels.nodes).toHaveLength(1);
       expect(result.team.issueEstimationType).toBe("fibonacci");
       expect(result.comments.nodes).toHaveLength(1);
@@ -497,6 +549,7 @@ describe("LinearAgentApi", () => {
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
       expect(body.variables).toEqual({ id: "iss-1" });
       expect(body.query).toContain("attachments(first: 50)");
+      expect(body.query).toContain("delegate { id name }");
     });
   });
 
@@ -523,7 +576,17 @@ describe("LinearAgentApi", () => {
                   },
                 }],
               },
+              // Linear returns these newest-first; the API wrapper should make
+              // the result chronological for deterministic handoff selection.
               activities: { nodes: [{
+                createdAt: "2026-07-13T10:02:00Z",
+                signal: null,
+                content: {
+                  __typename: "AgentActivityResponseContent",
+                  type: "response",
+                  body: "Implementation complete",
+                },
+              }, {
                 createdAt: "2026-07-13T10:01:00Z",
                 signal: null,
                 content: {
@@ -553,7 +616,12 @@ describe("LinearAgentApi", () => {
         parameter: "git diff",
         result: "clean",
       });
+      expect(sessions[0].activities[1].content).toEqual({
+        type: "response",
+        body: "Implementation complete",
+      });
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.query).toContain("agentSessions(first: 20)");
       expect(body.query).toContain("pullRequest { url title sourceBranch targetBranch status }");
       expect(body.query).toContain("... on AgentActivityActionContent { type action parameter result }");
       expect(body.query).toContain("... on AgentActivityPromptContent { type body }");
@@ -586,6 +654,21 @@ describe("LinearAgentApi", () => {
           stateId: "s1",
           priority: 2,
         },
+      });
+    });
+
+    it("can clear the Linear agent delegate", async () => {
+      fetchMock.mockResolvedValueOnce(
+        okResponse({ issueUpdate: { success: true } }),
+      );
+
+      const api = new LinearAgentApi(TOKEN);
+      await api.updateIssue("iss-42", { delegateId: null });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.variables).toEqual({
+        id: "iss-42",
+        input: { delegateId: null },
       });
     });
   });

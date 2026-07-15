@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { mkdirSync } from "node:fs";
 import { InactivityWatchdog, resolveWatchdogConfig } from "./watchdog.js";
 import { bindAgentRunToIssue, unbindAgentRunFromIssue } from "../pipeline/active-session.js";
+import { bindActiveCodexRun, buildLinearCodexSessionKey, drainCodexControls, isCodexHarnessSteeringEnabled, unbindActiveCodexRun, } from "./codex-steering.js";
 function resolveAgentDirs(agentId, config) {
     const home = homedir();
     const agentList = config?.agents?.list;
@@ -49,6 +50,94 @@ export function formatToolActivityValue(value, maxChars) {
     if (text.length <= maxChars)
         return text;
     return `${text.slice(0, maxChars)}\n…(${text.length - maxChars} more characters)`;
+}
+function parseToolActivityObject(value) {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+        const record = value;
+        if (record.details && typeof record.details === "object" && !Array.isArray(record.details)) {
+            return record.details;
+        }
+        const content = Array.isArray(record.content) ? record.content : [];
+        const text = content.find((item) => item && typeof item === "object" && item.type === "text");
+        if (text) {
+            const textValue = text.text;
+            if (typeof textValue === "string") {
+                try {
+                    const parsed = JSON.parse(textValue);
+                    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                        return parsed;
+                    }
+                }
+                catch {
+                    // Fall through to the original result object.
+                }
+            }
+        }
+        return record;
+    }
+    if (typeof value === "string") {
+        try {
+            const parsed = JSON.parse(value);
+            return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+                ? parsed
+                : null;
+        }
+        catch {
+            return null;
+        }
+    }
+    return null;
+}
+/** Convert an internal tool identifier into its Linear activity title. */
+export function formatToolActivityTitle(toolName) {
+    if (toolName === "container_exec")
+        return "Shell";
+    if (toolName === "container_search_code")
+        return "Search Code";
+    return toolName
+        .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+        .replace(/[_-]+/g, " ")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+        .join(" ") || "Tool";
+}
+/** Format tool arguments for the expandable Linear action parameter area. */
+export function formatToolActivityParameter(toolName, rawArgs, meta = "") {
+    const args = parseToolActivityObject(rawArgs);
+    if (toolName === "container_exec") {
+        const command = args?.command;
+        if (typeof command === "string")
+            return formatToolActivityValue(command, 4_000) || undefined;
+    }
+    if (toolName === "container_search_code") {
+        const query = args?.query;
+        if (typeof query === "string")
+            return formatToolActivityValue(query, 4_000) || undefined;
+    }
+    return formatToolActivityValue(rawArgs ?? meta, 4_000) || undefined;
+}
+/** Format a completed tool result for the Linear action output area. */
+export function formatToolActivityResult(toolName, rawResult, isError) {
+    if (toolName === "container_exec") {
+        const result = parseToolActivityObject(rawResult);
+        if (result) {
+            const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
+            const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
+            const error = typeof result.error === "string" ? result.error.trim() : "";
+            const shellOutput = stdout || stderr || error;
+            if (shellOutput) {
+                const formatted = formatToolActivityValue(shellOutput, 12_000);
+                return isError ? `Failed\n\n${formatted}` : formatted;
+            }
+            if (typeof result.exitCode === "number") {
+                return isError ? `Failed\n\nExit code ${result.exitCode}` : `Exit code ${result.exitCode}`;
+            }
+        }
+    }
+    const formatted = formatToolActivityValue(rawResult, 12_000) || (isError ? "failed" : "completed");
+    return isError ? `Failed\n\n${formatted}` : formatted;
 }
 /**
  * Run an agent with automatic retry on watchdog kill.
@@ -149,9 +238,17 @@ async function runAgentOnce(params) {
         catch (err) {
             // Read-only mode MUST NOT fall back to subprocess — subprocess runs a
             // full agent with no way to enforce the tool deny policy.
-            if (readOnly) {
-                api.logger.error(`Embedded runner failed in read-only mode, refusing subprocess fallback: ${err}`);
-                return { success: false, output: "Read-only agent run failed (embedded runner unavailable)." };
+            // The opt-in Codex harness also fails closed: a subprocess fallback would
+            // silently lose the stable session binding and all steering guarantees.
+            if (readOnly || isCodexHarnessSteeringEnabled(pluginConfig)) {
+                const mode = readOnly ? "read-only" : "Codex harness";
+                api.logger.error(`Embedded runner failed in ${mode} mode, refusing subprocess fallback: ${err}`);
+                return {
+                    success: false,
+                    output: readOnly
+                        ? "Read-only agent run failed (embedded runner unavailable)."
+                        : `Codex harness agent run failed: ${String(err)}`,
+                };
             }
             api.logger.warn(`Embedded runner failed, falling back to subprocess: ${err}`);
         }
@@ -240,8 +337,23 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
         `${api.runtime.agent.defaults.provider}/${api.runtime.agent.defaults.model}`;
     // Parse "provider/model-id" format (e.g. "openrouter/moonshotai/kimi-k2.5")
     const slashIdx = modelRef.indexOf("/");
-    const provider = slashIdx > 0 ? modelRef.slice(0, slashIdx) : api.runtime.agent.defaults.provider;
-    const model = slashIdx > 0 ? modelRef.slice(slashIdx + 1) : modelRef;
+    let provider = slashIdx > 0 ? modelRef.slice(0, slashIdx) : api.runtime.agent.defaults.provider;
+    let model = slashIdx > 0 ? modelRef.slice(slashIdx + 1) : modelRef;
+    // The Codex app-server harness is deliberately opt-in. It is separate from
+    // workerBackend="codex" (the existing codex exec/container backend) because
+    // enabling it changes which runtime owns embedded agent turns.
+    const pluginConfig = api.pluginConfig;
+    const codexHarnessEnabled = isCodexHarnessSteeringEnabled(pluginConfig);
+    const configuredCodexModel = pluginConfig?.codexHarnessModel;
+    if (codexHarnessEnabled && typeof configuredCodexModel === "string" && configuredCodexModel.trim()) {
+        const normalized = configuredCodexModel.trim();
+        const separator = normalized.indexOf("/");
+        if (separator <= 0 || separator === normalized.length - 1) {
+            throw new Error("codexHarnessModel must use provider/model format (for example openai/<codex-compatible-model>)");
+        }
+        provider = normalized.slice(0, separator);
+        model = normalized.slice(separator + 1);
+    }
     api.logger.info(`Embedded agent run: agent=${agentId} session=${sessionId} runId=${runId} provider=${provider} model=${model} workspaceDir=${workspaceDir} agentDir=${agentDir}`);
     // Serialize writes so an ephemeral start cannot race its completed card.
     let activityQueue = Promise.resolve();
@@ -286,97 +398,202 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
         "provided for this ticket's Docker sandbox.",
         "Your only output is your text response.",
     ].join(" ");
-    const composedSystemPrompt = [extraSystemPrompt, readOnly ? readOnlyNotice : undefined]
+    const progressThoughtsEnabled = pluginConfig?.linearProgressThoughts !== false;
+    const progressNotice = progressThoughtsEnabled
+        ? [
+            "LINEAR PROGRESS VISIBILITY: Before the first tool batch and whenever your investigation",
+            "changes direction, write one brief commentary update explaining what you are checking,",
+            "the relevant finding so far, and what comes next. Keep it to one or two sentences.",
+            "Do not reveal private chain-of-thought and do not narrate every individual tool call.",
+        ].join(" ")
+        : undefined;
+    const composedSystemPrompt = [extraSystemPrompt, readOnly ? readOnlyNotice : undefined, progressNotice]
         .filter(Boolean)
         .join("\n\n");
-    const result = await api.runtime.agent.runEmbeddedPiAgent({
-        sessionId,
-        sessionFile,
-        workspaceDir,
-        agentDir,
-        prompt: message,
-        agentId,
-        runId,
-        timeoutMs,
-        config,
-        provider,
-        model,
-        abortSignal: controller.signal,
-        // Project the structured lifecycle below. OpenClaw's aggregate summaries
-        // would otherwise create extra, uncorrelated Linear rows.
-        shouldEmitToolResult: () => false,
-        shouldEmitToolOutput: () => false,
-        ...(composedSystemPrompt ? { extraSystemPrompt: composedSystemPrompt } : {}),
-        // Stream reasoning/thinking to Linear
-        onReasoningStream: (payload) => {
-            watchdog.tick();
-            const text = payload.text?.trim();
-            if (text && text.length > 10) {
-                emit({ type: "thought", body: text.slice(0, 500) });
-            }
-        },
-        // OpenClaw supplies the actual result immediately before the matching
-        // `phase=result` event. The latter carries the toolCallId needed to pair it.
-        onAgentToolResult: ({ toolName, result, isError }) => {
-            watchdog.tick();
-            const queued = completedResults.get(toolName) ?? [];
-            queued.push({ result, isError });
-            completedResults.set(toolName, queued);
-        },
-        // Raw agent events — capture tool starts/ends/updates
-        onAgentEvent: (evt) => {
-            watchdog.tick();
-            const { stream, data } = evt;
-            if (stream !== "tool")
-                return;
-            const phase = String(data.phase ?? "");
-            const toolName = String(data.name ?? "tool");
-            const toolCallId = String(data.toolCallId ?? "");
-            const meta = typeof data.meta === "string" ? data.meta : "";
-            const rawArgs = data.args ?? data.input;
-            // Transient live card. The persistent completion carries args + result.
-            if (phase === "start") {
-                const parameter = formatToolActivityValue(rawArgs ?? meta, 4_000) || undefined;
-                if (toolCallId)
-                    pendingTools.set(toolCallId, { name: toolName, parameter });
-                emit({ type: "action", action: toolName, parameter }, { ephemeral: true });
-            }
-            if (phase === "result") {
-                const pending = toolCallId ? pendingTools.get(toolCallId) : undefined;
+    let pendingAssistantCommentary = "";
+    let lastEmittedCommentary = "";
+    const flushAssistantCommentary = () => {
+        const text = pendingAssistantCommentary.trim();
+        pendingAssistantCommentary = "";
+        if (!progressThoughtsEnabled || text.length <= 10 || text === lastEmittedCommentary)
+            return;
+        lastEmittedCommentary = text;
+        emit({ type: "thought", body: formatToolActivityValue(text, 1_200) });
+    };
+    let codexBinding;
+    const linearSessionId = streaming.agentSessionId;
+    const codexSessionKey = buildLinearCodexSessionKey(agentId, linearSessionId);
+    if (codexHarnessEnabled && abortKey) {
+        const sessionEntry = {
+            sessionId,
+            updatedAt: Date.now(),
+            sessionFile,
+            chatType: "direct",
+            agentRuntimeOverride: "codex",
+            providerOverride: provider,
+            modelOverride: model,
+        };
+        const sessionRuntime = api.runtime.agent.session;
+        const existingEntry = sessionRuntime?.getSessionEntry?.({
+            agentId,
+            sessionKey: codexSessionKey,
+        });
+        if (existingEntry && sessionRuntime?.patchSessionEntry) {
+            await sessionRuntime.patchSessionEntry({
+                agentId,
+                sessionKey: codexSessionKey,
+                fallbackEntry: sessionEntry,
+                preserveActivity: true,
+                update: () => sessionEntry,
+            });
+        }
+        else {
+            await sessionRuntime?.upsertSessionEntry?.({
+                agentId,
+                sessionKey: codexSessionKey,
+                entry: sessionEntry,
+            });
+        }
+        codexBinding = bindActiveCodexRun({
+            issueId: abortKey,
+            linearSessionId,
+            agentId,
+            openClawSessionId: sessionId,
+            sessionKey: codexSessionKey,
+            runId,
+        });
+    }
+    let result;
+    try {
+        result = await api.runtime.agent.runEmbeddedPiAgent({
+            sessionId,
+            ...(codexHarnessEnabled ? {
+                sessionKey: codexSessionKey,
+                agentHarnessRuntimeOverride: "codex",
+                messageChannel: "linear",
+                messageProvider: "linear",
+                chatType: "direct",
+            } : {}),
+            sessionFile,
+            workspaceDir,
+            agentDir,
+            prompt: message,
+            agentId,
+            runId,
+            timeoutMs,
+            config,
+            provider,
+            model,
+            abortSignal: controller.signal,
+            // Project the structured lifecycle below. OpenClaw's aggregate summaries
+            // would otherwise create extra, uncorrelated Linear rows.
+            shouldEmitToolResult: () => false,
+            shouldEmitToolOutput: () => false,
+            ...(composedSystemPrompt ? { extraSystemPrompt: composedSystemPrompt } : {}),
+            // Stream the model's REASONING SUMMARY to Linear as chain-of-thought.
+            // These are the provider's reasoning-summary blocks (not raw hidden CoT),
+            // surfaced so developers can follow and intervene. Requires the codex config
+            // to emit them (model_reasoning_summary != "none").
+            onReasoningStream: (payload) => {
+                watchdog.tick();
+                const text = payload.text?.trim();
+                if (text && text.length > 10) {
+                    emit({ type: "thought", body: formatToolActivityValue(text, 4_000) });
+                }
+            },
+            // OpenClaw supplies the actual result immediately before the matching
+            // `phase=result` event. The latter carries the toolCallId needed to pair it.
+            onAgentToolResult: ({ toolName, result, isError }) => {
+                watchdog.tick();
                 const queued = completedResults.get(toolName) ?? [];
-                const completed = queued.shift();
-                if (queued.length)
-                    completedResults.set(toolName, queued);
+                queued.push({ result, isError });
+                completedResults.set(toolName, queued);
+            },
+            // Raw agent events — capture tool starts/ends/updates
+            onAgentEvent: (evt) => {
+                watchdog.tick();
+                const { stream, data } = evt;
+                if (stream !== "tool")
+                    return;
+                const phase = String(data.phase ?? "");
+                const toolName = String(data.name ?? "tool");
+                const toolCallId = String(data.toolCallId ?? "");
+                const meta = typeof data.meta === "string" ? data.meta : "";
+                const rawArgs = data.args ?? data.input;
+                // Transient live card. The persistent completion carries args + result.
+                if (phase === "start") {
+                    // Visible assistant commentary followed by a tool call is a progress
+                    // update, not the terminal answer. Emit it before the tool card.
+                    flushAssistantCommentary();
+                    const action = formatToolActivityTitle(toolName);
+                    const parameter = formatToolActivityParameter(toolName, rawArgs, meta);
+                    if (toolCallId)
+                        pendingTools.set(toolCallId, { name: action, parameter });
+                    emit({ type: "action", action, parameter }, { ephemeral: true });
+                }
+                if (phase === "result") {
+                    const pending = toolCallId ? pendingTools.get(toolCallId) : undefined;
+                    const queued = completedResults.get(toolName) ?? [];
+                    const completed = queued.shift();
+                    if (queued.length)
+                        completedResults.set(toolName, queued);
+                    else
+                        completedResults.delete(toolName);
+                    if (toolCallId)
+                        pendingTools.delete(toolCallId);
+                    const isError = completed?.isError ?? Boolean(data.isError);
+                    const rawResult = completed?.result ?? data.result ?? meta ?? (isError ? "failed" : "completed");
+                    emit({
+                        type: "action",
+                        action: pending?.name ?? formatToolActivityTitle(toolName),
+                        parameter: pending?.parameter,
+                        result: formatToolActivityResult(toolName, rawResult, isError),
+                    });
+                }
+            },
+            // Partial assistant text (for long responses)
+            onPartialReply: (payload) => {
+                watchdog.tick();
+                // Buffer visible assistant commentary. It becomes a Linear thought only
+                // if another tool starts afterward; terminal answer text is therefore
+                // left to the caller's response activity and is never duplicated here.
+                const text = payload.text?.trim() ?? "";
+                if (!text)
+                    return;
+                if (payload.replace)
+                    pendingAssistantCommentary = text;
+                else if (typeof payload.delta === "string")
+                    pendingAssistantCommentary += payload.delta;
                 else
-                    completedResults.delete(toolName);
-                if (toolCallId)
-                    pendingTools.delete(toolCallId);
-                const isError = completed?.isError ?? Boolean(data.isError);
-                const rawResult = completed?.result ?? data.result ?? meta ?? (isError ? "failed" : "completed");
-                const formattedResult = formatToolActivityValue(rawResult, 12_000) || (isError ? "failed" : "completed");
-                emit({
-                    type: "action",
-                    action: pending?.name ?? toolName,
-                    parameter: pending?.parameter,
-                    result: isError ? `Failed\n\n${formattedResult}` : formattedResult,
-                });
+                    pendingAssistantCommentary = text;
+            },
+            // Native Codex request_user_input is projected as an elicitation. The
+            // next /steer message is consumed by OpenClaw's pending-input bridge as
+            // the answer instead of being sent to turn/steer.
+            onBlockReply: (payload) => {
+                watchdog.tick();
+                const text = payload.text?.trim();
+                if (text && /^(?:agent|codex) needs input:/i.test(text)) {
+                    watchdog.pause();
+                    emit({ type: "elicitation", body: text });
+                }
+            },
+        });
+    }
+    finally {
+        await activityQueue;
+        if (codexBinding)
+            await drainCodexControls(codexBinding);
+        watchdog.stop();
+        if (codexBinding)
+            unbindActiveCodexRun(codexBinding.issueId, runId);
+        if (abortKey) {
+            const set = runsByAbortKey.get(abortKey);
+            if (set) {
+                set.delete(controller);
+                if (set.size === 0)
+                    runsByAbortKey.delete(abortKey);
             }
-        },
-        // Partial assistant text (for long responses)
-        onPartialReply: (payload) => {
-            watchdog.tick();
-            // We don't emit every partial chunk to avoid flooding Linear
-            // The final response will be posted as a comment
-        },
-    });
-    await activityQueue;
-    watchdog.stop();
-    if (abortKey) {
-        const set = runsByAbortKey.get(abortKey);
-        if (set) {
-            set.delete(controller);
-            if (set.size === 0)
-                runsByAbortKey.delete(abortKey);
         }
     }
     // Extract output text from payloads

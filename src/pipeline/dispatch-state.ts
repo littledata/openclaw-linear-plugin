@@ -26,15 +26,17 @@ export type DispatchStatus =
   | "dispatched"
   | "working"
   | "auditing"
+  | "paused"
   | "done"
   | "failed"
   | "stuck";
 
 /** Valid CAS transitions: from → allowed next states */
 const VALID_TRANSITIONS: Record<DispatchStatus, DispatchStatus[]> = {
-  dispatched: ["working", "failed", "stuck"],
-  working: ["auditing", "failed", "stuck"],
-  auditing: ["done", "working", "stuck"],  // working = rework (attempt++)
+  dispatched: ["working", "paused", "failed", "stuck"],
+  working: ["auditing", "paused", "failed", "stuck"],
+  auditing: ["done", "working", "paused", "stuck"],  // working = rework (attempt++)
+  paused: ["working", "failed", "stuck"],
   done: [],                                 // terminal
   failed: [],                               // terminal
   stuck: [],                                // terminal
@@ -60,6 +62,8 @@ export interface ActiveDispatch {
   issueTitle?: string;          // for artifact summaries and memory headings
   worktrees?: Array<{ repoName: string; path: string; branch: string }>;
   grillGuidance?: string;       // implementation brief from the /grill-me interview
+  phaseIndex?: number;          // current state-plan phase; retained across STOP/resume
+  pausedAt?: string;            // set while STOP has paused this dispatch
 
   // Container execution (replaces worktrees). worktreePath is now the HOST
   // artifact root (`<root>/.claw` holds plan/worker/manifest); code lives in the
@@ -421,6 +425,46 @@ export async function updateDispatchStatus(
 }
 
 /**
+ * Persist resumable orchestration progress without replacing the dispatch.
+ * STOP/resume uses this to retain the current phase, Linear session, repository
+ * selection, and container while only changing runtime state.
+ * @param issueIdentifier - Linear issue identifier
+ * @param updates - resumable fields to patch on the active dispatch
+ * @param configPath - optional dispatch-state file path
+ * @returns the updated dispatch, or null when no active dispatch exists
+ */
+export async function updateDispatchProgress(
+  issueIdentifier: string,
+  updates: {
+    status?: DispatchStatus;
+    phaseIndex?: number;
+    pausedAt?: string | null;
+    stuckReason?: string | null;
+    agentSessionId?: string;
+  },
+  configPath?: string,
+): Promise<ActiveDispatch | null> {
+  const filePath = resolveStatePath(configPath);
+  await acquireLock(filePath);
+  try {
+    const data = await readDispatchState(configPath);
+    const dispatch = data.dispatches.active[issueIdentifier];
+    if (!dispatch) return null;
+    if (updates.status !== undefined) dispatch.status = updates.status;
+    if (updates.phaseIndex !== undefined) dispatch.phaseIndex = updates.phaseIndex;
+    if (updates.pausedAt === null) delete dispatch.pausedAt;
+    else if (updates.pausedAt !== undefined) dispatch.pausedAt = updates.pausedAt;
+    if (updates.stuckReason === null) delete dispatch.stuckReason;
+    else if (updates.stuckReason !== undefined) dispatch.stuckReason = updates.stuckReason;
+    if (updates.agentSessionId !== undefined) dispatch.agentSessionId = updates.agentSessionId;
+    await writeDispatchState(filePath, data);
+    return dispatch;
+  } finally {
+    await releaseLock(filePath);
+  }
+}
+
+/**
  * Persist a new task-flow revision back to the active dispatch record so
  * subsequent bridge calls see the up-to-date `expectedRevision`. Best-effort:
  * silently no-ops when the dispatch is no longer active or has no flow id.
@@ -461,6 +505,12 @@ export function listStaleDispatches(
 ): ActiveDispatch[] {
   const now = Date.now();
   return Object.values(state.dispatches.active).filter((d) => {
+    // STOPped work is intentionally idle and must remain resumable indefinitely.
+    // Stuck/terminal records are already classified and should not be counted
+    // again by stale-run monitoring.
+    if (!(["dispatched", "working", "auditing"] as DispatchStatus[]).includes(d.status)) {
+      return false;
+    }
     const age = now - new Date(d.dispatchedAt).getTime();
     return age > maxAgeMs;
   });

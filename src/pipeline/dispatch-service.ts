@@ -23,7 +23,9 @@ import {
   pruneCompleted,
 } from "./dispatch-state.js";
 import { getWorktreeStatus } from "../infra/codex-worktree.js";
+import { containerGitStatus } from "../infra/container-runner.js";
 import { emitDiagnostic } from "../infra/observability.js";
+import type { ActiveDispatch } from "./dispatch-state.js";
 
 const INTERVAL_MS = 5 * 60_000; // 5 minutes
 const STALE_THRESHOLD_MS = 2 * 60 * 60_000; // 2 hours
@@ -105,13 +107,11 @@ export function createDispatchService(api: OpenClawPluginApi) {
           continue;
         }
 
-        // Check if worktree still exists and has progress
-        if (existsSync(dispatch.worktreePath)) {
-          const status = getWorktreeStatus(dispatch.worktreePath);
-          if (status.hasUncommitted || status.lastCommit) {
-            // Worktree has activity — not truly stale, just slow
-            continue;
-          }
+        // Check the actual code workspace. Container dispatches store artifacts
+        // at worktreePath, which is deliberately not a Git repository.
+        if (hasDispatchWorkspaceActivity(dispatch)) {
+          // Workspace has activity — not truly stale, just slow.
+          continue;
         }
 
         ctx.logger.warn(
@@ -205,4 +205,26 @@ export function createDispatchService(api: OpenClawPluginApi) {
       ctx.logger.error(`linear-dispatch: tick failed: ${err}`);
     }
   }
+}
+
+/**
+ * Check whether a dispatch's real code workspace contains activity.
+ * Container probe failures are treated conservatively as activity so a
+ * transient Docker error cannot incorrectly mark live work as stuck.
+ * @param dispatch - active dispatch to inspect
+ * @returns true when code activity exists or a container cannot be inspected
+ */
+export function hasDispatchWorkspaceActivity(dispatch: ActiveDispatch): boolean {
+  if (dispatch.containerName && dispatch.containerRepos?.length) {
+    try {
+      return dispatch.containerRepos.some(
+        (repo) => containerGitStatus(dispatch.containerName!, repo).hasChanges,
+      );
+    } catch {
+      return true;
+    }
+  }
+  if (!existsSync(dispatch.worktreePath)) return false;
+  const status = getWorktreeStatus(dispatch.worktreePath);
+  return status.hasUncommitted || Boolean(status.lastCommit);
 }

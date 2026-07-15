@@ -5,7 +5,7 @@
  * Linear UI. The chosen option's `value` comes back as a normal `prompt`
  * activity, so it flows through the same reply handlers a typed answer does —
  * which is why each builder's `value` is chosen to round-trip cleanly through
- * the existing parsers (parseRepoSelection / parseResumeDecision).
+ * the existing reply parser.
  *
  * See https://linear.app/developers/agent-signals
  */
@@ -30,16 +30,6 @@ export function repoSelectSignal(candidates, recommended = []) {
         options.push(ALL_OPTION);
     return { signal: "select", signalMetadata: { options } };
 }
-/** Options for the resume-or-fresh gate. Values match parseResumeDecision. */
-export const RESUME_SELECT = {
-    signal: "select",
-    signalMetadata: {
-        options: [
-            { label: "Resume — continue prior work", value: "resume" },
-            { label: "Start fresh — re-plan from scratch", value: "fresh" },
-        ],
-    },
-};
 /**
  * Build a select signal from a grill question's discrete answer choices.
  * @param values - the allowed answer strings (blank entries are dropped)

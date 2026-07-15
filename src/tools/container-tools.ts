@@ -22,9 +22,11 @@ import {
   getIssueIdentifierForAgentRun,
 } from "../pipeline/active-session.js";
 import { getContainerRecord, touchContainer } from "../infra/container-registry.js";
+import { hydrateGitHubRepositoryCatalog } from "../infra/github-repository-catalog.js";
 import {
   ensureContainerAlive,
   execInContainer,
+  execAuthenticatedInContainer,
   writeFileToContainer,
   readFileFromContainer,
   codeSearchInContainer,
@@ -46,11 +48,18 @@ function clip(s: string): string {
  * Resolve the container for the active issue, spawning/reviving it as needed.
  * Returns the live container name + the issue identifier, or an error string.
  */
-function resolveContainer(
+async function resolveContainer(
   api: OpenClawPluginApi,
   ctx: OpenClawPluginToolContext,
-): { containerName: string; identifier: string } | { error: string } {
-  const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
+): Promise<{
+  containerName: string;
+  identifier: string;
+  repos: string[];
+  pluginConfig?: Record<string, unknown>;
+} | { error: string }> {
+  const pluginConfig = await hydrateGitHubRepositoryCatalog(
+    (api as any).pluginConfig as Record<string, unknown> | undefined,
+  );
   const boundIdentifier = getIssueIdentifierForAgentRun(ctx.sessionId, ctx.sessionKey, ctx.agentId);
   const session =
     (boundIdentifier ? null : ctx.agentId ? getActiveSessionByAgentId(ctx.agentId) : null) ??
@@ -64,12 +73,18 @@ function resolveContainer(
   if (!rec) {
     return { error: `No container is registered for ${identifier}. It should have been created at dispatch.` };
   }
-  const name = ensureContainerAlive(identifier, rec.repos, rec.branch, pluginConfig, api.logger);
+  const name = await ensureContainerAlive(identifier, rec.repos, rec.branch, pluginConfig, api.logger);
   if (!name) {
     return { error: `Could not start the container for ${identifier}.` };
   }
   touchContainer(identifier);
-  return { containerName: name, identifier };
+  return { containerName: name, identifier, repos: rec.repos, pluginConfig };
+}
+
+function githubRoleForAgent(agentId: string | undefined): "coding" | "reviewer" {
+  return agentId && ["apex", "warden", "proof", "helm", "lumen"].includes(agentId)
+    ? "reviewer"
+    : "coding";
 }
 
 /**
@@ -99,13 +114,23 @@ export function createContainerTools(api: OpenClawPluginApi, rawCtx: Record<stri
       required: ["command"],
     },
     execute: async (_id: string, params: { command?: string; workdir?: string; timeoutSec?: number }) => {
-      const c = resolveContainer(api, ctx);
+      const c = await resolveContainer(api, ctx);
       if ("error" in c) return jsonResult({ success: false, error: c.error });
       const command = params.command ?? "";
       const cwd = params.workdir || WORK_ROOT;
       const timeoutMs = Math.min(Math.max((params.timeoutSec ?? 600) * 1000, 1000), 3_600_000);
       api.logger.info(`container_exec [${c.identifier}] ${cwd}$ ${command.slice(0, 200)}`);
-      const r = execInContainer(c.containerName, command, cwd, timeoutMs);
+      const r = c.pluginConfig?.repositorySource === "github-app"
+        ? await execAuthenticatedInContainer(
+            githubRoleForAgent(ctx.agentId),
+            c.containerName,
+            c.repos,
+            command,
+            cwd,
+            timeoutMs,
+            c.pluginConfig,
+          )
+        : execInContainer(c.containerName, command, cwd, timeoutMs);
       return jsonResult({
         success: r.exitCode === 0,
         exitCode: r.exitCode,
@@ -131,7 +156,7 @@ export function createContainerTools(api: OpenClawPluginApi, rawCtx: Record<stri
       required: ["path", "content"],
     },
     execute: async (_id: string, params: { path?: string; content?: string }) => {
-      const c = resolveContainer(api, ctx);
+      const c = await resolveContainer(api, ctx);
       if ("error" in c) return jsonResult({ success: false, error: c.error });
       if (!params.path) return jsonResult({ success: false, error: "path is required" });
       const r = writeFileToContainer(c.containerName, params.path, params.content ?? "");
@@ -152,7 +177,7 @@ export function createContainerTools(api: OpenClawPluginApi, rawCtx: Record<stri
       required: ["path"],
     },
     execute: async (_id: string, params: { path?: string }) => {
-      const c = resolveContainer(api, ctx);
+      const c = await resolveContainer(api, ctx);
       if ("error" in c) return jsonResult({ success: false, error: c.error });
       if (!params.path) return jsonResult({ success: false, error: "path is required" });
       const r = readFileFromContainer(c.containerName, params.path);
@@ -175,7 +200,7 @@ export function createContainerTools(api: OpenClawPluginApi, rawCtx: Record<stri
       required: ["repo", "patch"],
     },
     execute: async (_id: string, params: { repo?: string; patch?: string }) => {
-      const c = resolveContainer(api, ctx);
+      const c = await resolveContainer(api, ctx);
       if ("error" in c) return jsonResult({ success: false, error: c.error });
       if (!params.repo || !params.patch) return jsonResult({ success: false, error: "repo and patch are required" });
       const tmp = `/tmp/${_id.replace(/[^a-zA-Z0-9]/g, "")}.patch`;
@@ -193,14 +218,14 @@ export function createContainerTools(api: OpenClawPluginApi, rawCtx: Record<stri
     promptSnippet: "container_status — git status of the container's repos",
     parameters: { type: "object", properties: {}, required: [] },
     execute: async () => {
-      const c = resolveContainer(api, ctx);
+      const c = await resolveContainer(api, ctx);
       if ("error" in c) return jsonResult({ success: false, error: c.error });
       const rec = getContainerRecord(c.identifier);
       const repos = rec?.repos ?? [];
       const status = repos.map((repo) => {
         try {
           const s = containerGitStatus(c.containerName, repo);
-          return { repo, hasChanges: s.hasChanges, lastCommit: s.lastCommit };
+          return { repo, hasChanges: s.hasChanges, commitsAhead: s.commitsAhead, lastCommit: s.lastCommit };
         } catch (err) {
           return { repo, error: String(err).slice(0, 200) };
         }
@@ -214,22 +239,22 @@ export function createContainerTools(api: OpenClawPluginApi, rawCtx: Record<stri
     label: "Container: clone another repo",
     description:
       "Clone an ADDITIONAL littledata repo into this ticket's container for cross-repo work. " +
-      "The repo must exist in the read-only repos mirror. It lands at /work/<repo>.",
+      "The repo must be installed for the coding GitHub App. It lands at /work/<repo>.",
     promptSnippet: "container_clone_repo — add another repo to the container for cross-repo work",
     parameters: {
       type: "object",
       properties: {
-        repo: { type: "string", description: "Repo name (directory name in the repos mirror)." },
+        repo: { type: "string", description: "Installed GitHub repository name." },
       },
       required: ["repo"],
     },
     execute: async (_id: string, params: { repo?: string }) => {
-      const c = resolveContainer(api, ctx);
+      const c = await resolveContainer(api, ctx);
       if ("error" in c) return jsonResult({ success: false, error: c.error });
       if (!params.repo) return jsonResult({ success: false, error: "repo is required" });
       const rec = getContainerRecord(c.identifier);
       const branch = rec?.branch ?? "main";
-      const r = cloneRepo(c.containerName, params.repo, branch);
+      const r = await cloneRepo(c.containerName, params.repo, branch, c.pluginConfig);
       return jsonResult({ success: r.status === 0, exitCode: r.status ?? -1, stderr: clip(r.stderr), path: repoWorkdir(params.repo) });
     },
   } as unknown as AnyAgentTool;
@@ -253,7 +278,7 @@ export function createContainerTools(api: OpenClawPluginApi, rawCtx: Record<stri
       required: ["query"],
     },
     execute: async (_id: string, params: { query?: string; repo?: string; limit?: number }) => {
-      const c = resolveContainer(api, ctx);
+      const c = await resolveContainer(api, ctx);
       if ("error" in c) return jsonResult({ success: false, error: c.error });
       if (!params.query) return jsonResult({ success: false, error: "query is required" });
       const rec = getContainerRecord(c.identifier);

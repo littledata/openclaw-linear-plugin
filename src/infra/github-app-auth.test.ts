@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   clearGitHubAppTokenCache,
   getGitHubAppToken,
+  getGitHubAppTokenForRepositories,
   githubAppPermissions,
   githubAuthenticationEnvironment,
   parseGitHubRepositoryRemote,
@@ -97,6 +98,27 @@ describe("GitHub App authentication", () => {
       permissions: githubAppPermissions("coding"),
     });
     expect(request[1].headers.Authorization).toMatch(/^Bearer [^.]+\.[^.]+\.[^.]+$/);
+  });
+
+  it("can scope one installation token to several selected repositories", async () => {
+    const keyPath = privateKeyFile();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: async () => ({ token: "ghs_multi", expires_at: new Date(Date.now() + 60 * 60_000).toISOString() }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getGitHubAppTokenForRepositories(
+      "coding",
+      ["littledata/web", "littledata/api"],
+      config(keyPath),
+    )).resolves.toBe("ghs_multi");
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      repositories: ["api", "web"],
+      permissions: githubAppPermissions("coding"),
+    });
   });
 
   it("refuses private keys readable by group or other users", async () => {

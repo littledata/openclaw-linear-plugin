@@ -16,6 +16,8 @@ vi.mock("./watchdog.js", () => ({
     silenceMs = 0;
     start() {}
     tick() {}
+    pause() {}
+    resume() {}
     stop() {}
   },
   resolveWatchdogConfig: (...args: any[]) => mockResolveWatchdogConfig(...args),
@@ -34,7 +36,13 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 
-import { formatToolActivityValue, runAgent } from "./agent.js";
+import {
+  formatToolActivityParameter,
+  formatToolActivityResult,
+  formatToolActivityTitle,
+  formatToolActivityValue,
+  runAgent,
+} from "./agent.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 
 function createApi(): OpenClawPluginApi {
@@ -371,6 +379,9 @@ describe("embedded tool activity projection", () => {
     const runEmbeddedPiAgent = vi.fn().mockImplementation(async (opts: any) => {
       expect(opts.shouldEmitToolResult()).toBe(false);
       expect(opts.shouldEmitToolOutput()).toBe(false);
+      opts.onPartialReply({
+        text: "I’m checking the local diff first so the review is based on the authoritative workspace.",
+      });
       opts.onAgentEvent({
         stream: "tool",
         data: {
@@ -407,35 +418,132 @@ describe("embedded tool activity projection", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(emitActivity).toHaveBeenCalledTimes(2);
+    expect(emitActivity).toHaveBeenCalledTimes(3);
     expect(emitActivity).toHaveBeenNthCalledWith(
       1,
       "linear-session",
       {
-        type: "action",
-        action: "container_exec",
-        parameter: '{\n  "command": "git diff",\n  "workdir": "/work/repo"\n}',
+        type: "thought",
+        body: "I’m checking the local diff first so the review is based on the authoritative workspace.",
       },
-      { ephemeral: true },
+      undefined,
     );
     expect(emitActivity).toHaveBeenNthCalledWith(
       2,
       "linear-session",
+      {
+        type: "action",
+        action: "Shell",
+        parameter: "git diff",
+      },
+      { ephemeral: true },
+    );
+    expect(emitActivity).toHaveBeenNthCalledWith(
+      3,
+      "linear-session",
       expect.objectContaining({
         type: "action",
-        action: "container_exec",
-        result: '{\n  "success": true,\n  "stdout": "diff output"\n}',
+        action: "Shell",
+        parameter: "git diff",
+        result: "diff output",
       }),
       undefined,
     );
     expect(runEmbeddedPiAgent.mock.calls[0][0].extraSystemPrompt).toContain(
       "Repository shell commands are allowed only through the container_* tools",
     );
+    expect(runEmbeddedPiAgent.mock.calls[0][0].extraSystemPrompt).toContain(
+      "LINEAR PROGRESS VISIBILITY",
+    );
     expect(runEmbeddedPiAgent.mock.calls[0][0].extraSystemPrompt).not.toContain("Do not run shell commands");
+    expect(runEmbeddedPiAgent.mock.calls[0][0]).not.toHaveProperty("agentHarnessRuntimeOverride");
   });
 
   it("pretty-prints JSON and caps oversized values", () => {
     expect(formatToolActivityValue('{"a":1}', 100)).toBe('{\n  "a": 1\n}');
     expect(formatToolActivityValue("abcdefgh", 4)).toContain("abcd\n…(4 more characters)");
+  });
+
+  it("formats search and generic tool activities for Linear", () => {
+    expect(formatToolActivityTitle("container_search_code")).toBe("Search Code");
+    expect(formatToolActivityParameter("container_search_code", {
+      query: "where are webhook events routed?",
+      repo: "openclaw-linear-plugin",
+      limit: 5,
+    })).toBe("where are webhook events routed?");
+
+    expect(formatToolActivityTitle("container_read_file")).toBe("Container Read File");
+    expect(formatToolActivityTitle("fetch_pr-details-v2")).toBe("Fetch Pr Details V2");
+    expect(formatToolActivityParameter("container_read_file", {
+      path: "src/agent/agent.ts",
+      repo: "openclaw-linear-plugin",
+    })).toBe('{\n  "path": "src/agent/agent.ts",\n  "repo": "openclaw-linear-plugin"\n}');
+  });
+
+  it("extracts shell output from OpenClaw's structured tool result", () => {
+    expect(formatToolActivityResult("container_exec", {
+      content: [{
+        type: "text",
+        text: JSON.stringify({ success: true, exitCode: 0, stdout: "line one\nline two", stderr: "" }),
+      }],
+      details: { success: true, exitCode: 0, stdout: "line one\nline two", stderr: "" },
+    }, false)).toBe("line one\nline two");
+    expect(formatToolActivityResult("container_exec", {
+      success: false,
+      exitCode: 1,
+      stdout: "",
+      stderr: "command failed",
+    }, true)).toBe("Failed\n\ncommand failed");
+  });
+
+  it("opts into the Codex harness, binds the stable session, and emits native input as elicitation", async () => {
+    const api = createApi() as any;
+    api.pluginConfig = {
+      enableCodexHarnessSteering: true,
+      codexHarnessModel: "openai/gpt-5.3-codex",
+    };
+    const emitActivity = vi.fn().mockResolvedValue(undefined);
+    const upsertSessionEntry = vi.fn().mockResolvedValue(undefined);
+    const runEmbeddedPiAgent = vi.fn().mockImplementation(async (opts: any) => {
+      await opts.onBlockReply({ text: "Codex needs input:\n1. Use migration A\n2. Use migration B" });
+      return { payloads: [{ text: "done" }], meta: { durationMs: 10 } };
+    });
+    api.runtime.agent = {
+      defaults: { provider: "openrouter", model: "test-model" },
+      session: { upsertSessionEntry },
+      runEmbeddedPiAgent,
+    };
+
+    const result = await runAgent({
+      api,
+      agentId: "apex",
+      sessionId: "linear-apex-CORE-1-0",
+      message: "review",
+      abortKey: "issue-1",
+      streaming: { linearApi: { emitActivity } as any, agentSessionId: "linear-session-1" },
+    });
+
+    expect(result.success).toBe(true);
+    expect(runEmbeddedPiAgent).toHaveBeenCalledWith(expect.objectContaining({
+      sessionKey: "agent:apex:linear:direct:linear-session-1",
+      agentHarnessRuntimeOverride: "codex",
+      provider: "openai",
+      model: "gpt-5.3-codex",
+    }));
+    expect(upsertSessionEntry).toHaveBeenCalledWith(expect.objectContaining({
+      sessionKey: "agent:apex:linear:direct:linear-session-1",
+      entry: expect.objectContaining({
+        sessionId: "linear-apex-CORE-1-0",
+        agentRuntimeOverride: "codex",
+      }),
+    }));
+    expect(emitActivity).toHaveBeenCalledWith(
+      "linear-session-1",
+      {
+        type: "elicitation",
+        body: "Codex needs input:\n1. Use migration A\n2. Use migration B",
+      },
+      undefined,
+    );
   });
 });

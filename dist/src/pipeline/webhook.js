@@ -2,23 +2,24 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { LinearAgentApi, resolveLinearToken } from "../api/linear-api.js";
 import { buildProjectContext } from "./pipeline.js";
-import { setActiveSession, clearActiveSession, getIssueAffinity, _resetAffinityForTesting } from "./active-session.js";
-import { readDispatchState, getActiveDispatch, registerDispatch, updateDispatchStatus, removeActiveDispatch } from "./dispatch-state.js";
+import { setActiveSession, clearActiveSession, getActiveSession, getIssueAffinity, _resetAffinityForTesting } from "./active-session.js";
+import { readDispatchState, getActiveDispatch, registerDispatch, updateDispatchStatus, updateDispatchProgress, removeActiveDispatch } from "./dispatch-state.js";
 import { createManagedFlowForDispatch } from "./taskflow-bridge.js";
 import { createNotifierFromConfig } from "../infra/notify.js";
 import { assessTier } from "./tier-assess.js";
 import { recommendRepos } from "./recommend-repos.js";
-import { startOrReuseContainer, buildContainerSpec, destroyContainer, stopContainerRun, containerNameForIssue, checkoutPullRequestInContainer } from "../infra/container-runner.js";
-import { setContainerRecord, getContainerRecord, removeContainerRecord } from "../infra/container-registry.js";
+import { startOrReuseContainer, buildContainerSpec, stopContainerRun, containerNameForIssue, checkoutPullRequestInContainer } from "../infra/container-runner.js";
+import { setContainerRecord, getContainerRecord } from "../infra/container-registry.js";
 import { resolveRepos, getRepoEntries, resolveReposByNames, buildCandidateRepositories, detectMentionedRepos } from "../infra/multi-repo.js";
-import { repoSelectSignal, optionsSignal, RESUME_SELECT } from "./select-signal.js";
+import { hydrateGitHubRepositoryCatalog } from "../infra/github-repository-catalog.js";
+import { repoSelectSignal, optionsSignal } from "./select-signal.js";
 import { savePendingRepoSelection, getPendingRepoSelection, clearPendingRepoSelection, parseRepoSelection, } from "./repo-selection-state.js";
 import { getGrill, saveGrill, clearGrill } from "./grill-state.js";
 import { runStatePlan } from "./orchestrator.js";
 import { resolveStatePlan, orchestrationMode, isReviewOnlyPlan } from "./state-plan.js";
-import { gatherPriorWork, analyzeResume } from "./prior-work.js";
+import { gatherPriorWork, synthesizePriorContext } from "./prior-work.js";
 import { collectReviewPullRequests, resolveReviewTargets } from "./review-context.js";
-import { getResume, saveResume, clearResume, parseResumeDecision, markResumeHandled, wasResumeHandledRecently, clearResumeHandled } from "./resume-state.js";
+import { clearLegacyResumeState } from "./legacy-resume-state.js";
 import { runGrillStep } from "./grill.js";
 import { ensureClawDir, writeManifest, writeDispatchMemory, resolveOrchestratorWorkspace } from "./artifacts.js";
 import { readPlanningState, isInPlanningMode, getPlanningSession, endPlanningSession } from "./planning-state.js";
@@ -31,6 +32,8 @@ import { loadAgentProfiles, buildMentionPattern, resolveAgentFromAlias, validate
 import { getActiveTmuxSession } from "../infra/tmux-runner.js";
 import { capturePane } from "../infra/tmux.js";
 import { loadCodingConfig, resolveToolName } from "../tools/code-tool.js";
+import { clearCancel } from "./cancellation.js";
+import { _resetCodexSteeringForTesting, isCodexHarnessSteeringEnabled, steerActiveCodexRun, stopActiveCodexRun, } from "../agent/codex-steering.js";
 // ── Prompt input sanitization ─────────────────────────────────────
 /**
  * Sanitize user-controlled text before embedding in agent prompts.
@@ -64,13 +67,99 @@ function shouldBlockWorkRequest(intent, stateType, stateName, issueRef) {
 }
 // Track issues with active agent runs to prevent concurrent duplicate runs.
 const activeRuns = new Set();
+// A STOP follow-up can arrive while the aborted pipeline is still unwinding.
+// Claim resumes separately so duplicate prompted webhooks cannot start two turns.
+const resumingRuns = new Set();
+// Fast-path marker set synchronously by STOP. Persistent dispatch state remains
+// authoritative across restarts, but this avoids an async lookup before the
+// active-run/dedup gates on ordinary prompted webhooks.
+const pausedIssues = new Set();
+// Incremented for every STOP received for an issue. A continuation can be
+// queued while the previous turn is still unwinding; if another STOP arrives
+// before that continuation claims the dispatch, the generation mismatch keeps
+// the older continuation from clearing the newer cancellation request.
+const pauseGenerations = new Map();
 /**
- * issue id → the Linear AgentSession id that Linear auto-created when the agent
- * was delegated the issue. The dispatch reuses it (instead of creating its own)
- * so the whole pipeline runs in ONE Linear session. Populated by the
- * AgentSessionEvent.created handler when it defers to an in-flight dispatch.
+ * issue id → a Linear AgentSession created by one of our own non-delegation
+ * handlers. This only bridges the race between createSessionOnIssue() and its
+ * created webhook; delegation sessions are passed directly to handleDispatch.
  */
 const linearSessionByIssue = new Map();
+// Linear normally creates an AgentSession after delegation, but Developer
+// Preview delivery is not reliable enough to make that an unconditional
+// assumption. Keep one delayed reconciliation per issue so duplicate
+// Issue.update webhooks cannot create duplicate sessions.
+const pendingDelegationSessionChecks = new Map();
+const DEFAULT_DELEGATION_SESSION_GRACE_MS = 3_000;
+function clearPendingDelegationSessionCheck(issueId) {
+    const pending = pendingDelegationSessionChecks.get(issueId);
+    if (!pending)
+        return false;
+    clearTimeout(pending.timer);
+    pendingDelegationSessionChecks.delete(issueId);
+    return true;
+}
+function scheduleDelegationSessionReconciliation(api, linearApi, issue, delegatedAtMs, pluginConfig) {
+    if (pendingDelegationSessionChecks.has(issue.id)) {
+        api.logger.info(`Issue ${issue.identifier ?? issue.id}: delegation session reconciliation already scheduled`);
+        return;
+    }
+    const configuredGraceMs = pluginConfig?.delegationSessionGraceMs;
+    const graceMs = typeof configuredGraceMs === "number" && configuredGraceMs >= 0
+        ? configuredGraceMs
+        : DEFAULT_DELEGATION_SESSION_GRACE_MS;
+    const token = Symbol(issue.id);
+    const timer = setTimeout(() => {
+        void (async () => {
+            try {
+                const pending = pendingDelegationSessionChecks.get(issue.id);
+                if (!pending || pending.token !== token)
+                    return;
+                // The created webhook normally cancels this timer. Re-read Linear as a
+                // second race fence in case the session exists but its webhook is still
+                // in flight. A newly-created, non-complete session can precede the
+                // Issue.update webhook by a small amount, hence the two-second window.
+                const sessions = await linearApi.listAgentSessions(issue.id, { activityLimit: 1 });
+                const nativeSession = sessions.find((session) => {
+                    const createdAtMs = Date.parse(session.createdAt);
+                    if (!Number.isFinite(createdAtMs))
+                        return false;
+                    return createdAtMs >= delegatedAtMs ||
+                        (createdAtMs >= delegatedAtMs - 2_000 && session.status !== "complete");
+                });
+                if (nativeSession) {
+                    api.logger.info(`Issue ${issue.identifier ?? issue.id}: Linear session ${nativeSession.id} exists — fallback creation not needed`);
+                    return;
+                }
+                // A native created event may have arrived while listAgentSessions was
+                // running. Check the token again immediately before mutating Linear.
+                const current = pendingDelegationSessionChecks.get(issue.id);
+                if (!current || current.token !== token)
+                    return;
+                api.logger.warn(`Issue ${issue.identifier ?? issue.id}: Linear did not create an AgentSession after delegation — creating fallback session`);
+                const result = await linearApi.createSessionOnIssue(issue.id);
+                if (!result.sessionId) {
+                    api.logger.error(`Issue ${issue.identifier ?? issue.id}: fallback AgentSession creation failed: ${result.error ?? "no session ID returned"}`);
+                    return;
+                }
+                // Do not dispatch here. The resulting AgentSession.created webhook is
+                // still the sole work entry point and will bind the exact new session.
+                linearSessionByIssue.set(issue.id, result.sessionId);
+                api.logger.info(`Issue ${issue.identifier ?? issue.id}: created fallback AgentSession ${result.sessionId}; awaiting created webhook`);
+            }
+            catch (err) {
+                api.logger.error(`Issue ${issue.identifier ?? issue.id}: delegation session reconciliation failed: ${err}`);
+            }
+            finally {
+                const pending = pendingDelegationSessionChecks.get(issue.id);
+                if (pending?.token === token)
+                    pendingDelegationSessionChecks.delete(issue.id);
+            }
+        })();
+    }, graceMs);
+    timer.unref?.();
+    pendingDelegationSessionChecks.set(issue.id, { token, timer });
+}
 // Dedup: track recently processed keys to avoid double-handling.
 // Periodic sweep instead of O(n) scan on every call.
 // TTLs are configurable via pluginConfig (dedupTtlMs, dedupSweepIntervalMs).
@@ -103,7 +192,14 @@ function wasRecentlyProcessed(key) {
 }
 /** @internal — test-only; clears all in-memory dedup state. */
 export function _resetForTesting() {
+    for (const pending of pendingDelegationSessionChecks.values()) {
+        clearTimeout(pending.timer);
+    }
+    pendingDelegationSessionChecks.clear();
     activeRuns.clear();
+    resumingRuns.clear();
+    pausedIssues.clear();
+    pauseGenerations.clear();
     recentlyProcessed.clear();
     recentlyEmittedActivities.clear();
     _resetProfilesCacheForTesting();
@@ -113,6 +209,7 @@ export function _resetForTesting() {
     _sweepIntervalMs = 10_000;
     _resetGuidanceCacheForTesting();
     _resetAffinityForTesting();
+    _resetCodexSteeringForTesting();
 }
 // ── Feedback loop prevention for steering ─────────────────────────────
 // Track recently emitted activity body hashes to prevent our own emissions
@@ -144,6 +241,10 @@ function wasRecentlyEmitted(body) {
 /** @internal — test-only; add an issue ID to the activeRuns set. */
 export function _addActiveRunForTesting(issueId) {
     activeRuns.add(issueId);
+}
+/** @internal — test-only; releases an active-run claim. */
+export function _removeActiveRunForTesting(issueId) {
+    activeRuns.delete(issueId);
 }
 /** @internal — test-only; pre-registers a key as recently processed. */
 export function _markAsProcessedForTesting(key) {
@@ -308,10 +409,10 @@ export async function handleLinearWebhook(api, req, res) {
         res.end("ok");
         return true;
     }
-    // ── AgentSessionEvent.created — direct agent run ─────────────────
-    // User chatted with @ctclaw in Linear's agent session. Run the agent
-    // DIRECTLY with the user's message. The plan→implement→audit pipeline
-    // is only triggered from Issue.update delegation, not from chat.
+    // ── AgentSessionEvent.created — sole session entry point ────────────
+    // Linear creates a new session for both delegation and conversation. A
+    // delegation starts the plan→implement→audit pipeline in that exact new
+    // session; a mention/chat starts the conversational agent in its session.
     if ((payload.type === "AgentSessionEvent" && payload.action === "created") ||
         (payload.type === "AgentSession" && payload.action === "create")) {
         // Respond within 5 seconds (Linear requirement)
@@ -323,20 +424,11 @@ export async function handleLinearWebhook(api, req, res) {
             api.logger.error("AgentSession.created missing session or issue data");
             return true;
         }
-        // Guard: check activeRuns FIRST (O(1), no side effects).
-        // This catches sessions created by our own handlers (Comment dispatch,
-        // Issue triage, handleDispatch) which all set activeRuns BEFORE calling
-        // createSessionOnIssue(). Checking this first prevents the race condition
-        // where the webhook arrives before wasRecentlyProcessed is registered.
-        if (activeRuns.has(issue.id)) {
-            // A dispatch is already handling this issue. Capture the session Linear
-            // just created so the dispatch emits into it (one unified session) rather
-            // than creating its own, and skip the parallel conversational run.
-            linearSessionByIssue.set(issue.id, session.id);
-            api.logger.info(`Agent already running for ${issue?.identifier ?? issue?.id} — reusing session ${session.id} for the dispatch`);
-            return true;
+        if (clearPendingDelegationSessionCheck(issue.id)) {
+            api.logger.info(`AgentSession ${session.id}: native session arrived for ${issue.identifier ?? issue.id} — cancelled fallback creation`);
         }
-        // Secondary dedup: skip if we already handled this exact session ID
+        // Deduplicate only the exact session. Never deduplicate a fresh delegation
+        // by issue id: each delegation owns a newly-created Linear session.
         if (wasRecentlyProcessed(`session:${session.id}`)) {
             api.logger.info(`AgentSession ${session.id} already handled — skipping`);
             return true;
@@ -354,13 +446,15 @@ export async function handleLinearWebhook(api, req, res) {
                 type: "error",
                 body: profilesError,
             }).catch(() => { });
-            // Also try posting as a comment in case emitActivity doesn't render markdown
-            try {
-                await createCommentWithDedup(linearApi, issue.id, profilesError);
-            }
-            catch { }
             return true;
         }
+        // Linear owns the session lifecycle for mentions and delegations. Acknowledge
+        // this exact session immediately; all subsequent work for this invocation
+        // must stay attached to session.id.
+        await linearApi.emitActivity(session.id, {
+            type: "thought",
+            body: `Starting a new session for ${issue.identifier ?? issue.id}...`,
+        }, { ephemeral: true }).catch(() => { });
         const previousComments = payload.previousComments ?? [];
         const guidanceCtx = extractGuidance(payload);
         // Extract the user's latest message from previousComments (NOT from guidance)
@@ -436,6 +530,50 @@ export async function handleLinearWebhook(api, req, res) {
         }
         catch (err) {
             api.logger.warn(`Could not fetch issue details: ${err}`);
+        }
+        // Delegating an issue automatically creates this session. Start the full
+        // work pipeline from AgentSessionEvent.created, never from the parallel
+        // Issue.update webhook. A comment-backed session is an @mention/conversation,
+        // even when the issue happens to remain delegated to this app.
+        // Agent webhooks identify the installed app user explicitly. GraphQL
+        // viewer.id can be the OAuth actor and is not guaranteed to equal the
+        // issue's delegate id, so use appUserId whenever Linear provides it.
+        const webhookAppUserId = typeof payload.appUserId === "string"
+            ? payload.appUserId
+            : await linearApi.getViewerId();
+        const sessionCommentBody = typeof session?.comment?.body === "string"
+            ? session.comment.body.trim()
+            : "";
+        const hasUserAuthoredSessionComment = Boolean(session?.comment &&
+            !/^This thread is for an agent session with\b/i.test(sessionCommentBody));
+        const isDelegationSession = !hasUserAuthoredSessionComment &&
+            typeof webhookAppUserId === "string" &&
+            enrichedIssue?.delegate?.id === webhookAppUserId;
+        if (isDelegationSession) {
+            // A fresh delegation owns a fresh Linear session. Clear any interaction
+            // parked by an older session, but do not cancel a real implementation.
+            const supersedesParkedInteraction = Boolean(getGrill(issue.id));
+            clearPendingRepoSelection(issue.id);
+            clearGrill(issue.id);
+            clearLegacyResumeState(issue.id);
+            if (supersedesParkedInteraction)
+                activeRuns.delete(issue.id);
+            linearSessionByIssue.delete(issue.id);
+            api.logger.info(`AgentSession ${session.id}: new delegation for ${issue.identifier ?? issue.id} — starting pipeline in this session`);
+            void handleDispatch(api, linearApi, enrichedIssue, {
+                existingSessionId: session.id,
+            }).catch((err) => {
+                api.logger.error(`Dispatch pipeline error for ${issue.identifier ?? issue.id}: ${err}`);
+            });
+            return true;
+        }
+        // A non-delegation handler may have proactively created this session while
+        // its run is already active. Capture that exact session without launching a
+        // duplicate conversational agent. Delegations have already returned above.
+        if (activeRuns.has(issue.id)) {
+            linearSessionByIssue.set(issue.id, session.id);
+            api.logger.info(`AgentSession ${session.id}: dispatch active for ${issue.identifier ?? issue.id} — reusing this session, skipping conversational run`);
+            return true;
         }
         // Team-based agent routing: if no mention or affinity override, try team mapping
         const teamKey = enrichedIssue?.team?.key;
@@ -539,14 +677,6 @@ export async function handleLinearWebhook(api, req, res) {
             ``,
             `Respond within the scope defined above. Be concise and action-oriented.`,
         ].filter(Boolean).join("\n");
-        // Re-check: the Issue.update dispatch may have claimed this issue during the
-        // (multi-second) intent classification above. If so, reuse THIS session for
-        // the dispatch and skip the conversational run — avoids a duplicate session.
-        if (activeRuns.has(issue.id)) {
-            linearSessionByIssue.set(issue.id, session.id);
-            api.logger.info(`AgentSession ${session.id}: dispatch active for ${issue.identifier ?? issue.id} — reusing this session, skipping conversational run`);
-            return true;
-        }
         // Run agent directly (non-blocking)
         activeRuns.add(issue.id);
         void (async () => {
@@ -576,6 +706,7 @@ export async function handleLinearWebhook(api, req, res) {
                     sessionId,
                     message,
                     timeoutMs: 5 * 60_000,
+                    abortKey: issue.id,
                     streaming: {
                         linearApi,
                         agentSessionId: session.id,
@@ -584,20 +715,15 @@ export async function handleLinearWebhook(api, req, res) {
                 const responseBody = result.success
                     ? result.output
                     : `Something went wrong while processing this. The system will retry automatically if possible. If this keeps happening, run \`openclaw openclaw-linear doctor\` to check for issues.`;
-                // Emit response via session (preferred — avoids duplicate comment).
-                // Fall back to a regular comment only if emitActivity fails.
+                // Agent-session invocations communicate only through their session.
+                // Linear renders these activities in the session thread itself.
                 const labeledResponse = `**[${label}]** ${responseBody}`;
-                const emitted = await linearApi.emitActivity(session.id, {
+                await linearApi.emitActivity(session.id, {
                     type: "response",
                     body: labeledResponse,
-                }).then(() => true).catch(() => false);
-                if (!emitted) {
-                    const avatarUrl = profiles[agentId]?.avatarUrl;
-                    const agentOpts = avatarUrl
-                        ? { createAsUser: label, displayIconUrl: avatarUrl }
-                        : undefined;
-                    await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts);
-                }
+                }).catch((err) => {
+                    api.logger.warn(`Could not emit response in AgentSession ${session.id}: ${err}`);
+                });
                 api.logger.info(`Posted agent response to ${enrichedIssue?.identifier ?? issue.id} (session ${session.id})`);
             }
             catch (err) {
@@ -637,6 +763,15 @@ export async function handleLinearWebhook(api, req, res) {
         if (stopSignal === "stop") {
             const stopIdentifier = issue.identifier ?? issue.id;
             api.logger.info(`AgentSession prompted: STOP signal for ${stopIdentifier}`);
+            const stopApi = createLinearApi(api);
+            const codexStopped = stopApi
+                ? await stopActiveCodexRun({
+                    api,
+                    linearApi: stopApi,
+                    issueId: issue.id,
+                    linearSessionId: session.id,
+                })
+                : false;
             // Abort in-flight EMBEDDED runs (reviewers) AND the codex process inside
             // the container. The container is LEFT RUNNING (warm) so the next message
             // can continue in the same workspace.
@@ -646,25 +781,26 @@ export async function handleLinearWebhook(api, req, res) {
             // killing the current sub-run alone lets its loop spawn the next one.
             const { requestCancel } = await import("./cancellation.js");
             requestCancel(issue.id);
+            pausedIssues.add(issue.id);
+            pauseGenerations.set(issue.id, (pauseGenerations.get(issue.id) ?? 0) + 1);
             const codexKilled = stopContainerRun(containerNameForIssue(stopIdentifier));
-            const halted = abortedRuns > 0 || codexKilled;
-            activeRuns.delete(issue.id);
-            try {
-                await removeActiveDispatch(stopIdentifier, pluginConfig?.dispatchStatePath);
-            }
-            catch { /* best effort */ }
+            const halted = codexStopped || abortedRuns > 0 || codexKilled;
+            // Keep the dispatch record: it owns the selected repos, current phase,
+            // Linear session, stable OpenClaw session ids, and warm container needed
+            // by the next prompted turn.
+            await updateDispatchProgress(stopIdentifier, { status: "paused", pausedAt: new Date().toISOString() }, pluginConfig?.dispatchStatePath).catch((err) => api.logger.warn(`Could not persist paused dispatch for ${stopIdentifier}: ${err}`));
             clearPendingRepoSelection(issue.id);
             clearGrill(issue.id);
-            clearResume(issue.id);
-            clearResumeHandled(issue.id); // next engagement should re-ask resume/fresh
-            const stopApi = createLinearApi(api);
+            clearLegacyResumeState(issue.id);
             if (stopApi) {
-                await stopApi.emitActivity(session.id, {
-                    type: "response",
-                    body: halted
-                        ? `🛑 Stopped — halted the running work and cleared the dispatch for ${stopIdentifier}. Re-assign or comment to start again.`
-                        : `🛑 Stop received for ${stopIdentifier} — no active work was running; cleared any pending dispatch state.`,
-                }).catch(() => { });
+                const stopBody = halted
+                    ? `🛑 Paused — halted the running turn for ${stopIdentifier}. Reply in this session to continue with the same context and workspace.`
+                    : `🛑 Pause received for ${stopIdentifier}. Reply in this session to continue with the same context and workspace.`;
+                trackEmittedActivity(stopBody);
+                // A response is Linear's terminal activity: it marks the visible
+                // Agent Session complete. The API lifecycle fence makes this the last
+                // activity even if the interrupted worker still has queued tool rows.
+                await stopApi.completeSession(session.id, stopBody).catch(() => { });
             }
             return true;
         }
@@ -682,97 +818,75 @@ export async function handleLinearWebhook(api, req, res) {
             api.logger.info(`AgentSession prompted: ${session.id} — feedback from own activity (${activityType ?? "hash-match"}), ignoring`);
             return true;
         }
+        // STOP marks this synchronously, so a fast follow-up can queue a resume even
+        // while the aborted pipeline is still unwinding and activeRuns remains set.
+        if (pausedIssues.has(issue.id)) {
+            if (await routePausedPrompt(api, session, issue, activityBody, pluginConfig))
+                return true;
+            pausedIssues.delete(issue.id);
+        }
         // ── /grill-me: the user answered an interview question ──
         // Runs BEFORE the activeRuns "ignore feedback" gate because the interview
-        // intentionally holds activeRuns. Record the answer and resume the dispatch.
+        // intentionally holds activeRuns. Record the answer and continue the dispatch.
         const grillPending = getGrill(issue.id);
+        if (grillPending?.agentSessionId &&
+            grillPending.agentSessionId !== session.id) {
+            api.logger.info(`AgentSession prompted: ${session.id} is stale; grill belongs to ${grillPending.agentSessionId} — ignoring`);
+            return true;
+        }
         if (grillPending?.pendingQuestion) {
             const answer = typeof activityBody === "string" ? activityBody.trim() : "";
             if (answer) {
                 grillPending.qa.push({ question: grillPending.pendingQuestion, answer });
                 grillPending.pendingQuestion = undefined;
                 saveGrill(grillPending);
-                activeRuns.delete(issue.id); // release the interview claim so the resume re-claims
+                activeRuns.delete(issue.id); // release the interview claim so continuation can re-claim
                 const grillApi = createLinearApi(api);
                 if (grillApi) {
                     api.logger.info(`AgentSession prompted: ${issue.identifier ?? issue.id} — grill answer #${grillPending.qa.length} recorded, resuming`);
                     void handleDispatch(api, grillApi, issue, {
                         existingSessionId: grillPending.agentSessionId ?? session.id,
-                        resumeResolved: true,
+                        contextHydrated: true,
                         // Carry the settled repo(s) so the repo-selection gate isn't re-asked
                         // between interview questions.
                         repoOverride: grillPending.repos?.length ? grillPending.repos : undefined,
-                    }).catch((err) => api.logger.error(`grill resume failed: ${err}`));
+                    }).catch((err) => api.logger.error(`grill continuation failed: ${err}`));
                 }
                 return true;
             }
         }
-        // ── Resume-or-fresh: the user answered the resume gate ──
-        // Runs BEFORE the activeRuns "ignore feedback" gate — the gate holds
-        // activeRuns while parked, same as /grill-me.
-        const resumePending = getResume(issue.id);
-        if (resumePending) {
-            const reply = typeof activityBody === "string" ? activityBody.trim() : "";
-            if (reply) {
-                const decision = parseResumeDecision(reply);
-                const rApi = createLinearApi(api);
-                if (!decision) {
-                    if (rApi)
-                        await rApi.emitActivity(session.id, { type: "elicitation", body: 'Reply **resume** to continue the prior work, or **fresh** to start over.' }, RESUME_SELECT).catch(() => { });
-                    return true;
-                }
-                clearResume(issue.id);
-                markResumeHandled(issue.id); // suppress the gate for re-triggers this engagement
-                activeRuns.delete(issue.id); // release the gate claim so the resume re-claims
-                if (!rApi)
-                    return true;
-                if (decision === "fresh") {
-                    api.logger.info(`AgentSession prompted: ${issue.identifier ?? issue.id} resume-gate → FRESH`);
-                    await rApi.emitActivity(session.id, { type: "thought", body: "Starting fresh — discarding the prior container and re-planning." }).catch(() => { });
-                    try {
-                        // Fresh = throw away the warm container; the re-dispatch recreates it.
-                        destroyContainer(containerNameForIssue(issue.identifier ?? issue.id));
-                        removeContainerRecord(issue.identifier ?? issue.id);
-                    }
-                    catch (err) {
-                        api.logger.warn(`resume-fresh container destroy failed: ${err}`);
-                    }
-                    void handleDispatch(api, rApi, issue, {
-                        existingSessionId: resumePending.agentSessionId ?? session.id,
-                        resumeResolved: true,
-                    }).catch((err) => api.logger.error(`resume-fresh dispatch failed: ${err}`));
-                    return true;
-                }
-                // decision === "resume": re-derive the correct repo(s) + a continuation
-                // brief from the prior context, then dispatch straight into the pipeline.
-                api.logger.info(`AgentSession prompted: ${issue.identifier ?? issue.id} resume-gate → RESUME`);
-                await rApi.emitActivity(session.id, { type: "thought", body: "Resuming — reviewing prior work to confirm the right repo and continue the plan." }).catch(() => { });
-                const repoNames = Object.keys(getRepoEntries(pluginConfig));
-                // The semantic analysis normally runs BEFORE the elicitation so the user
-                // sees the model's actual understanding and the chosen repos are already
-                // settled. Re-analyse only for parked state written by an older version.
-                const analysis = resumePending.analyzedBrief || resumePending.analyzedRepos?.length
-                    ? {
-                        repos: resumePending.analyzedRepos ?? [],
-                        brief: resumePending.analyzedBrief ?? "",
-                    }
-                    : await analyzeResume(api, { identifier: issue.identifier ?? issue.id, title: issue.title ?? issue.identifier ?? issue.id, description: issue.description }, repoNames, resumePending.fullContext, resolveAgentId(api));
-                if (analysis.repos.length) {
-                    await rApi.emitActivity(session.id, { type: "thought", body: `Resuming in: ${analysis.repos.join(", ")}` }).catch(() => { });
-                }
-                void handleDispatch(api, rApi, issue, {
-                    existingSessionId: resumePending.agentSessionId ?? session.id,
-                    resumeResolved: true,
-                    grillDone: true, // skip grill — we have the repo + continuation brief
-                    repoOverride: analysis.repos.length ? analysis.repos : undefined,
-                    grillGuidance: analysis.brief || undefined,
-                }).catch((err) => api.logger.error(`resume dispatch failed: ${err}`));
+        // An opt-in Codex harness run owns this exact Linear session. Route the
+        // message through OpenClaw's generic /steer command: active Codex turns
+        // receive turn/steer, pending request_user_input consumes it as an answer,
+        // and review/compaction rejection is deferred as a normal prompt.
+        if (activeRuns.has(issue.id) &&
+            isCodexHarnessSteeringEnabled(pluginConfig)) {
+            const userText = typeof activityBody === "string" ? activityBody.trim() : "";
+            const steeringApi = createLinearApi(api);
+            if (userText && steeringApi && steerActiveCodexRun({
+                api,
+                linearApi: steeringApi,
+                issueId: issue.id,
+                linearSessionId: session.id,
+                message: sanitizePromptInput(userText),
+            })) {
+                await steeringApi.emitActivity(session.id, {
+                    type: "thought",
+                    body: "Steering the active Codex run with your follow-up...",
+                }, { ephemeral: true }).catch(() => { });
+                api.logger.info(`AgentSession prompted: ${session.id} issue=${issue.identifier ?? issue.id} — queued on active Codex harness run`);
                 return true;
             }
         }
         // 2. If active dispatch with tmux session → route to steering orchestrator
         const tmuxSession = getActiveTmuxSession(issue.id);
         if (tmuxSession) {
+            const activeSession = getActiveSession(issue.id);
+            if (activeSession?.agentSessionId &&
+                activeSession.agentSessionId !== session.id) {
+                api.logger.info(`AgentSession prompted: ${session.id} is stale; active work belongs to ${activeSession.agentSessionId} — ignoring`);
+                return true;
+            }
             const userText = activityBody;
             if (!userText || typeof userText !== "string" || !userText.trim()) {
                 api.logger.info(`AgentSession prompted: ${session.id} — tmux active but empty user message, ignoring`);
@@ -799,6 +913,10 @@ export async function handleLinearWebhook(api, req, res) {
             api.logger.info(`AgentSession prompted: webhook ${webhookId} already processed — skipping`);
             return true;
         }
+        // Persistent fallback after a gateway restart, when the in-memory paused
+        // marker is gone but the dispatch record still owns the resumable session.
+        if (await routePausedPrompt(api, session, issue, activityBody, pluginConfig))
+            return true;
         // Extract user message from the activity (not from promptContext which contains issue data + guidance)
         const guidanceCtxPrompted = extractGuidance(payload);
         const userMessage = activity?.content?.body ??
@@ -813,7 +931,7 @@ export async function handleLinearWebhook(api, req, res) {
             api.logger.error("No Linear access token configured");
             return true;
         }
-        // ── Interactive repo selection: resume a parked dispatch on the user's reply ──
+        // ── Interactive repo selection: continue a parked dispatch on the user's reply ──
         const pendingRepoSel = getPendingRepoSelection(issue.id);
         if (pendingRepoSel) {
             // Numbers map to the displayed shortlist; names may be ANY configured repo
@@ -835,8 +953,10 @@ export async function handleLinearWebhook(api, req, res) {
             void handleDispatch(api, linearApi, issue, {
                 repoOverride: selected,
                 existingSessionId: pendingRepoSel.agentSessionId ?? session.id,
-                resumeResolved: true, // resume stage already passed earlier in this chain
-            }).catch((err) => api.logger.error(`repo-selection resume failed: ${err}`));
+                contextHydrated: true,
+                grillDone: pendingRepoSel.skipGrill,
+                grillGuidance: pendingRepoSel.guidance,
+            }).catch((err) => api.logger.error(`repo-selection continuation failed: ${err}`));
             return true;
         }
         // Validate agent profiles before doing any work
@@ -998,6 +1118,7 @@ export async function handleLinearWebhook(api, req, res) {
                     sessionId,
                     message,
                     timeoutMs: 5 * 60_000,
+                    abortKey: issue.id,
                     streaming: {
                         linearApi,
                         agentSessionId: session.id,
@@ -1317,27 +1438,22 @@ export async function handleLinearWebhook(api, req, res) {
             api.logger.error("No Linear access token — cannot process issue update");
             return true;
         }
-        const viewerId = await linearApi.getViewerId();
-        const isAssignedToUs = assigneeChanged && assigneeId === viewerId;
-        const isDelegatedToUs = delegateChanged && delegateId === viewerId;
+        const appUserId = typeof payload.appUserId === "string"
+            ? payload.appUserId
+            : await linearApi.getViewerId();
+        const isAssignedToUs = assigneeChanged && assigneeId === appUserId;
+        const isDelegatedToUs = delegateChanged && delegateId === appUserId;
         if (!isAssignedToUs && !isDelegatedToUs) {
-            api.logger.info(`Issue.update: assignee=${assigneeId} delegate=${delegateId}, not us (${viewerId}), ignoring`);
+            api.logger.info(`Issue.update: assignee=${assigneeId} delegate=${delegateId}, not us (${appUserId}), ignoring`);
             return true;
         }
         const trigger = isDelegatedToUs ? "delegated" : "assigned";
-        api.logger.info(`Issue ${trigger} to our app user (${viewerId}), executing pipeline`);
-        // Secondary dedup: catch duplicate webhooks that both passed the activeRuns
-        // check before either could register (belt-and-suspenders with the sync guard).
-        const dedupKey = `${trigger}:${issue.id}:${viewerId}`;
-        if (wasRecentlyProcessed(dedupKey)) {
-            api.logger.info(`${trigger} ${issue.id} -> ${viewerId} already processed — skipping`);
-            return true;
-        }
-        // Assignment triggers the full dispatch pipeline:
-        // tier assessment → worktree → plan → implement → audit
-        void handleDispatch(api, linearApi, issue).catch((err) => {
-            api.logger.error(`Dispatch pipeline error for ${issue.identifier ?? issue.id}: ${err}`);
-        });
+        // Linear automatically creates a fresh AgentSession for a delegation. The
+        // corresponding AgentSessionEvent.created webhook is the sole work entry
+        // point, guaranteeing that every run is bound to the new session rather
+        // than racing this webhook and reusing an older awaiting-input session.
+        api.logger.info(`Issue ${trigger} to our app user (${appUserId}) — awaiting Linear's new AgentSession.created event with fallback reconciliation`);
+        scheduleDelegationSessionReconciliation(api, linearApi, issue, Date.now(), pluginConfig);
         return true;
     }
     // ── Issue.create — auto-triage new issues ───────────────────────
@@ -1977,7 +2093,7 @@ function shouldAskRepoSelection(resolution, pluginConfig) {
     return resolution.source === "config_default";
 }
 async function handleDispatch(api, linearApi, issue, opts) {
-    const pluginConfig = api.pluginConfig;
+    const pluginConfig = await hydrateGitHubRepositoryCatalog(api.pluginConfig);
     const statePath = pluginConfig?.dispatchStatePath;
     const worktreeBaseDir = pluginConfig?.worktreeBaseDir;
     const baseRepo = pluginConfig?.codexBaseRepo ?? join(process.env.HOME ?? homedir(), "ai-workspace");
@@ -1992,7 +2108,13 @@ async function handleDispatch(api, linearApi, issue, opts) {
             const planState = await readPlanningState(planStatePath);
             if (isInPlanningMode(planState, planProjectId)) {
                 api.logger.info(`dispatch: ${identifier} is in planning-mode project — skipping`);
-                await createCommentWithDedup(linearApi, issue.id, `**Can't dispatch yet** — this project is in planning mode.\n\n**To continue:** Comment on the planning issue with your requirements, then say **"finalize plan"** when ready.\n\n**To cancel planning:** Comment **"abandon"** on the planning issue.`);
+                const body = `**Can't dispatch yet** — this project is in planning mode.\n\n**To continue:** Comment on the planning issue with your requirements, then say **"finalize plan"** when ready.\n\n**To cancel planning:** Comment **"abandon"** on the planning issue.`;
+                if (opts?.existingSessionId) {
+                    await linearApi.emitActivity(opts.existingSessionId, { type: "response", body }).catch(() => { });
+                }
+                else {
+                    await createCommentWithDedup(linearApi, issue.id, body);
+                }
                 return;
             }
         }
@@ -2011,7 +2133,13 @@ async function handleDispatch(api, linearApi, issue, opts) {
         if (!isStale && inMemory) {
             // Truly still running in this gateway process
             api.logger.info(`dispatch: ${identifier} actively running (status: ${existing.status}, age: ${Math.round(ageMs / 1000)}s) — skipping`);
-            await createCommentWithDedup(linearApi, issue.id, `**Already running** as **${existing.tier}** — status: **${existing.status}**, started ${Math.round(ageMs / 60_000)}m ago.\n\nWorktree: \`${existing.worktreePath}\`\n\n**Options:**\n- Check progress: \`/dispatch status ${identifier}\`\n- Force restart: \`/dispatch retry ${identifier}\` (only works when stuck)\n- Escalate: \`/dispatch escalate ${identifier} "reason"\``);
+            const body = `**Already running** as **${existing.tier}** — status: **${existing.status}**, started ${Math.round(ageMs / 60_000)}m ago.\n\nWorktree: \`${existing.worktreePath}\`\n\n**Options:**\n- Check progress: \`/dispatch status ${identifier}\`\n- Force restart: \`/dispatch retry ${identifier}\` (only works when stuck)\n- Escalate: \`/dispatch escalate ${identifier} "reason"\``;
+            if (opts?.existingSessionId) {
+                await linearApi.emitActivity(opts.existingSessionId, { type: "response", body }).catch(() => { });
+            }
+            else {
+                await createCommentWithDedup(linearApi, issue.id, body);
+            }
             return;
         }
         // Stale or not in memory (gateway restarted) — reclaim
@@ -2023,12 +2151,17 @@ async function handleDispatch(api, linearApi, issue, opts) {
     // 2. Prevent concurrent runs on same issue
     if (activeRuns.has(issue.id)) {
         api.logger.info(`@dispatch: ${identifier} has active agent run — skipping`);
+        if (opts?.existingSessionId) {
+            await linearApi.emitActivity(opts.existingSessionId, {
+                type: "response",
+                body: `A run is already active for **${identifier}**. This new session will not start a concurrent implementation.`,
+            }).catch(() => { });
+        }
         return;
     }
-    // Claim the issue NOW (not at step 6). Linear fires AgentSessionEvent.created
-    // on delegation, racing this dispatch; claiming here blocks that handler from
-    // spawning a second, conversational agent during the multi-second assessment.
-    // Cleaned up on any early-return failure path below.
+    // Claim the issue before assessment so duplicate invocations cannot start a
+    // second pipeline while this session is being prepared. Cleaned up on every
+    // early-return failure path below.
     activeRuns.add(issue.id);
     // 3. Fetch full issue details for tier assessment
     let enrichedIssue;
@@ -2055,6 +2188,7 @@ async function handleDispatch(api, linearApi, issue, opts) {
     // Repo/guidance the grill interview (or an explicit override) may supply.
     let repoOverride = opts?.repoOverride;
     let grillGuidance = opts?.grillGuidance;
+    let grillDone = opts?.grillDone;
     if (reviewOnly) {
         const priorSessions = await linearApi.listAgentSessions(issue.id).catch(() => []);
         const recentComments = await linearApi.getRecentComments(issue.id, 60).catch(() => []);
@@ -2093,60 +2227,38 @@ async function handleDispatch(api, linearApi, issue, opts) {
         repoOverride = [...new Set(reviewTargets.map((target) => target.repoName))];
         api.logger.info(`@dispatch: ${identifier} review-only state — ${reviewTargets.length} linked PR(s), repos=${repoOverride.join(",")}`);
     }
-    // ── Resume-or-fresh gate ──────────────────────────────────────────────
-    // If this issue already has prior agent work (previous sessions/comments),
-    // recap it and ask the user to RESUME (continue the prior plan) or start
-    // FRESH — BEFORE grilling or building a worktree. Runs only in stateplan mode
-    // and only once per dispatch chain (opts.resumeResolved guards re-entry).
-    if (orchestrationMode(pluginConfig) === "stateplan" &&
-        !reviewOnly &&
-        !opts?.resumeResolved &&
-        !opts?.grillDone &&
-        !getResume(issue.id) &&
-        !wasResumeHandledRecently(issue.id)) {
+    // ── Automatic prior-context handoff ─────────────────────────────────────
+    // Every delegation gets a new Linear Agent Session. Older sessions are
+    // context only: synthesize bounded summaries, plans, terminal events, ticket
+    // comments, and local artifacts into guidance for the new run. There is no
+    // resume/fresh gate and no issue-level status comment.
+    if (!reviewOnly && !opts?.contextHydrated) {
+        // Drop state written by releases that still parked on resume/fresh.
+        clearLegacyResumeState(issue.id);
         const excludeSessionId = opts?.existingSessionId ?? linearSessionByIssue.get(issue.id);
         const prior = await gatherPriorWork(linearApi, issue.id, { excludeSessionId });
         if (prior.hasPriorWork) {
-            let rsid = excludeSessionId;
-            if (!rsid) {
-                try {
-                    const sr = await linearApi.createSessionOnIssue(issue.id);
-                    rsid = sr.sessionId ?? undefined;
-                }
-                catch { /* best effort */ }
-            }
             const repoNames = Object.keys(getRepoEntries(pluginConfig));
-            const analysis = await analyzeResume(api, {
+            const analysis = await synthesizePriorContext(api, {
                 identifier,
                 title: enrichedIssue.title ?? identifier,
                 description: enrichedIssue.description,
             }, repoNames, prior.fullContext, resolveAgentId(api));
-            const counts = [
-                prior.sessionCount ? `${prior.sessionCount} prior session(s)` : "",
-                prior.commentCount ? `${prior.commentCount} planning/steering note(s)` : "",
-            ].filter(Boolean).join(", ");
-            const understanding = analysis.brief || prior.summary;
-            const ask = `I found prior work on **${identifier}**${counts ? ` (${counts})` : ""}.\n\n**My understanding of where it stands:**\n\n${understanding}\n\nReply **resume** to continue from that plan, or **fresh** to start over.`;
-            if (rsid)
-                await linearApi.emitActivity(rsid, { type: "elicitation", body: ask }, RESUME_SELECT).catch(() => { });
-            saveResume({
-                issueId: issue.id,
-                issueIdentifier: identifier,
-                agentSessionId: rsid,
-                fullContext: prior.fullContext,
-                analyzedRepos: analysis.repos,
-                analyzedBrief: analysis.brief,
-                createdAt: new Date().toISOString(),
-            });
-            api.logger.info(`@dispatch: ${identifier} resume-gate — ${prior.sessionCount} prior session(s), awaiting resume/fresh reply (activeRuns held)`);
-            return; // activeRuns left set on purpose — released by the prompted resume
+            if (!repoOverride?.length && analysis.repos.length)
+                repoOverride = analysis.repos;
+            if (analysis.brief.trim()) {
+                grillGuidance = [analysis.brief.trim(), grillGuidance?.trim()]
+                    .filter(Boolean)
+                    .join("\n\n");
+            }
+            // Existing planning and steering replace the startup interview. The
+            // implementer receives the handoff directly and continues immediately.
+            grillDone = true;
+            api.logger.info(`@dispatch: ${identifier} hydrated context from ${prior.sessionCount} prior session(s) ` +
+                `and ${prior.commentCount} steering note(s); repos=[${analysis.repos.join(",")}], ` +
+                `brief=${analysis.brief ? "yes" : "no"}`);
         }
     }
-    // Past the resume stage for this engagement — mark it so re-entries (grill /
-    // repo-selection replies, or a stray Issue.update re-delegation) don't re-ask.
-    // Idempotent + sliding: refreshed on each re-entry while work is active.
-    if (orchestrationMode(pluginConfig) === "stateplan" && !reviewOnly)
-        markResumeHandled(issue.id);
     // NOTE: the /grill-me interview gate runs AFTER repo resolution (below), so the
     // repo is settled first and grilling never re-asks which repo.
     // Resolve repos for this dispatch (explicit override → body markers → labels → team mapping → config default)
@@ -2265,6 +2377,8 @@ async function handleDispatch(api, linearApi, issue, opts) {
                 issueIdentifier: identifier,
                 candidates,
                 agentSessionId: selectionSessionId,
+                guidance: grillGuidance,
+                skipGrill: grillDone,
                 createdAt: new Date().toISOString(),
             });
             api.logger.info(`@dispatch: ${identifier} awaiting repo selection (${candidates.length} candidates)`);
@@ -2275,11 +2389,11 @@ async function handleDispatch(api, linearApi, issue, opts) {
     // ── /grill-me interview gate ──────────────────────────────────────────
     // Runs AFTER repo resolution so the repo is already settled — the grill only
     // clarifies requirements and NEVER re-asks which repo. The chosen repo(s) are
-    // persisted in grill state and carried on each resume so the repo-selection gate
+    // persisted in grill state and carried on each continuation so the repo-selection gate
     // above doesn't re-trigger mid-interview. activeRuns stays claimed while parked so
     // the created-handler still skips its conversational run (single session); the
-    // `prompted` handler records each answer and resumes this dispatch.
-    if (!reviewOnly && (pluginConfig?.grillMode ?? "off") === "on" && !opts?.grillDone) {
+    // `prompted` handler records each answer and continues this dispatch.
+    if (!reviewOnly && (pluginConfig?.grillMode ?? "off") === "on" && !grillDone) {
         const chosenRepos = repoResolution.repos.map((r) => r.name);
         const grill = getGrill(issue.id);
         const step = await runGrillStep(api, { identifier, title: enrichedIssue.title ?? identifier, description: enrichedIssue.description }, chosenRepos, grill?.qa ?? [], resolveAgentId(api));
@@ -2292,8 +2406,9 @@ async function handleDispatch(api, linearApi, issue, opts) {
                 }
                 catch { /* best effort */ }
             }
-            if (gsid)
+            if (gsid) {
                 await linearApi.emitActivity(gsid, { type: "elicitation", body: step.question }, optionsSignal(step.options ?? [])).catch(() => { });
+            }
             saveGrill({
                 issueId: issue.id,
                 issueIdentifier: identifier,
@@ -2304,7 +2419,7 @@ async function handleDispatch(api, linearApi, issue, opts) {
                 createdAt: grill?.createdAt ?? new Date().toISOString(),
             });
             api.logger.info(`@dispatch: ${identifier} grill-me — asked question ${(grill?.qa.length ?? 0) + 1}, awaiting reply (activeRuns held)`);
-            return; // NOTE: activeRuns left set on purpose — released by the prompted resume
+            return; // NOTE: activeRuns left set on purpose — released by the prompted continuation
         }
         // Interview complete → carry the implementation brief into the worker.
         clearGrill(issue.id);
@@ -2343,7 +2458,7 @@ async function handleDispatch(api, linearApi, issue, opts) {
     let containerName;
     try {
         const nowMs = Date.now();
-        const start = startOrReuseContainer(buildContainerSpec(identifier, targetRepoNames, dispatchBranch, pluginConfig, nowMs), api.logger);
+        const start = await startOrReuseContainer(buildContainerSpec(identifier, targetRepoNames, dispatchBranch, pluginConfig, nowMs), api.logger, pluginConfig);
         containerName = start.name;
         // Record the container so the agent's container tools + the idle reaper can
         // find it. Reuse preserves the original createdAt; a fresh create stamps now.
@@ -2368,12 +2483,18 @@ async function handleDispatch(api, linearApi, issue, opts) {
     catch (err) {
         api.logger.error(`@dispatch: container start failed: ${err}`);
         activeRuns.delete(issue.id); // release the early claim on failure
-        await createCommentWithDedup(linearApi, issue.id, `**Dispatch failed** — couldn't prepare the ticket container.\n\n> ${String(err).slice(0, 300)}\n\n**What to try:**\n- Re-assign this issue to retry\n- Check the gateway logs`);
+        const body = `**Dispatch failed** — couldn't prepare the ticket container.\n\n> ${String(err).slice(0, 300)}\n\n**What to try:**\n- Re-assign this issue to retry\n- Check the gateway logs`;
+        if (opts?.existingSessionId) {
+            await linearApi.emitActivity(opts.existingSessionId, { type: "error", body }).catch(() => { });
+        }
+        else {
+            await createCommentWithDedup(linearApi, issue.id, body);
+        }
         return;
     }
-    // 6. Reuse the Linear session — an explicit opt, or the one Linear auto-created
-    // on delegation that the created-handler captured — so the whole pipeline runs
-    // in ONE session. Only create a fresh session as a last resort.
+    // 6. Use the explicit delegation session, or a session created by one of the
+    // non-delegation dispatch paths. Only create one as a last resort for callers
+    // that did not originate from AgentSessionEvent.created.
     activeRuns.add(issue.id);
     let agentSessionId = opts?.existingSessionId ?? linearSessionByIssue.get(issue.id);
     if (!agentSessionId) {
@@ -2554,6 +2675,197 @@ async function handleDispatch(api, linearApi, issue, opts) {
         activeRuns.delete(issue.id);
         clearActiveSession(issue.id);
     });
+}
+/**
+ * Detect and route a prompted message when persistent dispatch state says the
+ * issue is paused. Returns false for ordinary follow-ups so normal routing can
+ * continue.
+ * @param api - OpenClaw plugin API
+ * @param session - prompted Linear Agent Session
+ * @param issue - Linear issue reference from the webhook
+ * @param activityBody - prompted activity body
+ * @param pluginConfig - plugin configuration
+ * @returns true when the prompt belongs to a paused dispatch
+ */
+async function routePausedPrompt(api, session, issue, activityBody, pluginConfig) {
+    const identifier = (issue.identifier ?? issue.id);
+    const state = await readDispatchState(pluginConfig?.dispatchStatePath).catch(() => null);
+    const dispatch = state ? getActiveDispatch(state, identifier) : null;
+    if (dispatch?.status !== "paused")
+        return false;
+    const userMessage = typeof activityBody === "string" ? activityBody.trim() : "";
+    if (!userMessage) {
+        api.logger.info(`AgentSession prompted: ${session.id} — paused dispatch but empty continuation, ignoring`);
+        return true;
+    }
+    if (dispatch.agentSessionId && dispatch.agentSessionId !== session.id) {
+        api.logger.info(`AgentSession prompted: ${session.id} is stale; paused work belongs to ${dispatch.agentSessionId} — ignoring`);
+        return true;
+    }
+    const linearApi = createLinearApi(api);
+    if (!linearApi) {
+        api.logger.error("No Linear access token configured");
+        return true;
+    }
+    api.logger.info(`AgentSession prompted: ${session.id} — resuming paused dispatch ${identifier}`);
+    const pauseGeneration = pauseGenerations.get(issue.id) ?? 0;
+    void resumePausedDispatch(api, linearApi, session, issue, userMessage, pauseGeneration, pluginConfig)
+        .catch((err) => api.logger.error(`Paused dispatch resume failed for ${identifier}: ${err}`));
+    return true;
+}
+/**
+ * Wait for an interrupted run to finish unwinding before starting its resumed
+ * turn. STOP aborts the model immediately, but its async pipeline still needs a
+ * moment to observe cancellation and release the issue claim.
+ * @param issueId - Linear issue id used by the active-run registry
+ * @param timeoutMs - maximum time to wait for the old turn
+ * @returns true once the old turn released its claim
+ */
+async function waitForRunToSettle(issueId, timeoutMs = 30_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (activeRuns.has(issueId) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return !activeRuns.has(issueId);
+}
+/**
+ * Resume a STOPped dispatch as another turn in the same Linear Agent Session,
+ * stable OpenClaw role session, and warm ticket container.
+ * @param api - OpenClaw plugin API
+ * @param linearApi - authenticated Linear API
+ * @param session - prompted Linear Agent Session
+ * @param issue - Linear issue reference from the webhook
+ * @param userMessage - continuation instructions from the user
+ * @param expectedPauseGeneration - STOP generation observed by this prompt
+ * @param pluginConfig - plugin configuration
+ */
+async function resumePausedDispatch(api, linearApi, session, issue, userMessage, expectedPauseGeneration, pluginConfig) {
+    const issueId = issue.id;
+    const identifier = (issue.identifier ?? issue.id);
+    if (resumingRuns.has(issueId)) {
+        api.logger.info(`Paused dispatch resume already claimed for ${identifier}`);
+        return;
+    }
+    resumingRuns.add(issueId);
+    let claimedActiveRun = false;
+    try {
+        if (!(await waitForRunToSettle(issueId))) {
+            if ((pauseGenerations.get(issueId) ?? 0) !== expectedPauseGeneration)
+                return;
+            linearApi.resumeSession(session.id);
+            await linearApi.emitActivity(session.id, {
+                type: "error",
+                body: `Could not resume ${identifier}: the stopped turn did not finish shutting down. Please retry.`,
+            }).catch(() => { });
+            return;
+        }
+        if ((pauseGenerations.get(issueId) ?? 0) !== expectedPauseGeneration) {
+            api.logger.info(`Paused dispatch ${identifier} received a newer STOP while its continuation was queued; discarding that continuation`);
+            return;
+        }
+        const statePath = pluginConfig?.dispatchStatePath;
+        const state = await readDispatchState(statePath);
+        const persisted = getActiveDispatch(state, identifier);
+        if (!persisted || persisted.status !== "paused") {
+            api.logger.info(`Paused dispatch ${identifier} disappeared before resume`);
+            return;
+        }
+        if (persisted.agentSessionId && persisted.agentSessionId !== session.id) {
+            api.logger.info(`Paused dispatch ${identifier} belongs to a different Linear session`);
+            return;
+        }
+        // Re-check after the persistent-state reads as well. STOP writes the newer
+        // generation synchronously before its async state update, so this closes the
+        // remaining race immediately before clearCancel/status=working.
+        if ((pauseGenerations.get(issueId) ?? 0) !== expectedPauseGeneration)
+            return;
+        const effectivePluginConfig = await hydrateGitHubRepositoryCatalog(pluginConfig);
+        if (persisted.containerRepos?.length) {
+            try {
+                await startOrReuseContainer(buildContainerSpec(identifier, persisted.containerRepos, persisted.branch, effectivePluginConfig, Date.now()), api.logger, effectivePluginConfig);
+            }
+            catch (err) {
+                if ((pauseGenerations.get(issueId) ?? 0) !== expectedPauseGeneration)
+                    return;
+                linearApi.resumeSession(session.id);
+                await linearApi.emitActivity(session.id, {
+                    type: "error",
+                    body: `Could not resume ${identifier}: the ticket repositories could not be refreshed (${String(err).slice(0, 250)}).`,
+                }).catch(() => { });
+                return;
+            }
+        }
+        const details = await linearApi.getIssueDetails(issueId).catch(() => issue);
+        const workflowState = {
+            name: details?.state?.name ?? "In Progress",
+            type: details?.state?.type ?? "started",
+        };
+        const plan = resolveStatePlan(workflowState, effectivePluginConfig);
+        if (!plan) {
+            if ((pauseGenerations.get(issueId) ?? 0) !== expectedPauseGeneration)
+                return;
+            linearApi.resumeSession(session.id);
+            await linearApi.emitActivity(session.id, {
+                type: "error",
+                body: `Could not resume ${identifier}: no pipeline is configured for "${workflowState.name}".`,
+            }).catch(() => { });
+            return;
+        }
+        // Reopen only after the stopped run has fully unwound. Reopening earlier
+        // could let a delayed activity from that run enter the new generation.
+        if ((pauseGenerations.get(issueId) ?? 0) !== expectedPauseGeneration)
+            return;
+        linearApi.resumeSession(session.id);
+        clearCancel(issueId);
+        const dispatch = await updateDispatchProgress(identifier, { status: "working", pausedAt: null, stuckReason: null, agentSessionId: session.id }, statePath);
+        if ((pauseGenerations.get(issueId) ?? 0) !== expectedPauseGeneration) {
+            await updateDispatchProgress(identifier, { status: "paused", pausedAt: new Date().toISOString() }, statePath).catch(() => { });
+            return;
+        }
+        if (!dispatch)
+            return;
+        pausedIssues.delete(issueId);
+        const agentId = resolveAgentId(api);
+        setActiveSession({
+            agentSessionId: session.id,
+            issueIdentifier: identifier,
+            issueId,
+            agentId,
+            startedAt: Date.now(),
+        });
+        activeRuns.add(issueId);
+        claimedActiveRun = true;
+        await linearApi.emitActivity(session.id, {
+            type: "thought",
+            body: `Continuing ${identifier} in the existing agent session and ticket workspace...`,
+        }).catch(() => { });
+        const notify = createNotifierFromConfig(effectivePluginConfig, api.runtime, api);
+        const hookCtx = {
+            api,
+            linearApi,
+            notify,
+            pluginConfig: effectivePluginConfig,
+            configPath: statePath,
+        };
+        await runStatePlan(hookCtx, dispatch, plan, {
+            resume: true,
+            resumeGuidance: sanitizePromptInput(userMessage),
+        });
+    }
+    catch (err) {
+        api.logger.error(`Could not resume paused dispatch ${identifier}: ${err}`);
+        await linearApi.emitActivity(session.id, {
+            type: "error",
+            body: `Could not resume ${identifier}: ${String(err).slice(0, 400)}`,
+        }).catch(() => { });
+    }
+    finally {
+        if (claimedActiveRun) {
+            activeRuns.delete(issueId);
+            clearActiveSession(issueId);
+        }
+        resumingRuns.delete(issueId);
+    }
 }
 // ── Steering handler ──────────────────────────────────────────────
 //

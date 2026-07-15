@@ -3,6 +3,11 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { refreshLinearToken } from "./auth.js";
 import { withResilience } from "../infra/resilience.js";
+import {
+  enqueueAgentSessionActivity,
+  markAgentSessionComplete,
+  resumeAgentSession,
+} from "./agent-session-lifecycle.js";
 
 export const LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql";
 export const AUTH_PROFILES_PATH = join(
@@ -33,6 +38,8 @@ export interface ActivityEmitOptions {
   signalMetadata?: { options?: Array<{ label?: string; value: string }> };
   /** Transient activity removed by Linear when the next activity arrives. */
   ephemeral?: boolean;
+  /** Internal: allow the terminal response through a completed-session fence. */
+  allowWhenComplete?: boolean;
 }
 
 export interface ExternalUrl {
@@ -279,6 +286,41 @@ export class LinearAgentApi {
     content: ActivityContent,
     opts?: ActivityEmitOptions,
   ): Promise<void> {
+    return enqueueAgentSessionActivity(
+      agentSessionId,
+      opts?.allowWhenComplete === true,
+      () => this.emitActivityNow(agentSessionId, content, opts),
+    );
+  }
+
+  /**
+   * Mark a Linear Agent Session complete with a final response. Linear derives
+   * the visible `complete` state from this terminal activity.
+   * @param agentSessionId - target Linear Agent Session id
+   * @param body - final stopped-state message shown to the user
+   */
+  async completeSession(agentSessionId: string, body: string): Promise<void> {
+    markAgentSessionComplete(agentSessionId);
+    await this.emitActivity(
+      agentSessionId,
+      { type: "response", body },
+      { allowWhenComplete: true },
+    );
+  }
+
+  /**
+   * Reopen a completed Linear Agent Session for a user continuation prompt.
+   * @param agentSessionId - target Linear Agent Session id
+   */
+  resumeSession(agentSessionId: string): void {
+    resumeAgentSession(agentSessionId);
+  }
+
+  private async emitActivityNow(
+    agentSessionId: string,
+    content: ActivityContent,
+    opts?: ActivityEmitOptions,
+  ): Promise<void> {
     const mutation = `mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
         agentActivityCreate(input: $input) {
           success
@@ -394,6 +436,7 @@ export class LinearAgentApi {
     state: { name: string; type: string };
     creator: { name: string; email: string | null } | null;
     assignee: { name: string } | null;
+    delegate: { id: string; name: string } | null;
     labels: { nodes: Array<{ id: string; name: string }> };
     team: { id: string; key: string; name: string; issueEstimationType: string };
     comments: { nodes: Array<{ body: string; user: { name: string } | null; createdAt: string }> };
@@ -413,6 +456,7 @@ export class LinearAgentApi {
           state { name type }
           creator { name email }
           assignee { name }
+          delegate { id name }
           labels { nodes { id name } }
           team { id key name issueEstimationType }
           comments(last: 10) {
@@ -438,6 +482,7 @@ export class LinearAgentApi {
     labelIds?: string[];
     stateId?: string;
     priority?: number;
+    delegateId?: string | null;
   }): Promise<boolean> {
     const data = await this.gql<{
       issueUpdate: { success: boolean };
@@ -614,9 +659,9 @@ export class LinearAgentApi {
 
   /**
    * List prior agent sessions on an issue, newest first, with their per-session
-   * plan/summary, PR links, and full activity feed. Used by the resume gate so a
-   * new session can read everything previous runs did. Best-effort — returns []
-   * if the query fails (schema drift / permissions).
+   * plan/summary, PR links, and bounded activity feed. Used to hydrate a newly
+   * delegated session with a compact handoff from earlier runs. Best-effort —
+   * returns [] if the query fails (schema drift / permissions).
    * @param issueId - the Linear issue id
    * @param opts - optional { activityLimit } cap on activities per session (default 60)
    * @returns prior sessions, newest first
@@ -660,7 +705,7 @@ export class LinearAgentApi {
       }>(
         `query IssueAgentSessions($id: String!, $activityLimit: Int!) {
           issue(id: $id) {
-            agentSessions {
+            agentSessions(first: 20) {
               nodes {
                 id
                 createdAt
@@ -704,10 +749,15 @@ export class LinearAgentApi {
           plan: formatAgentPlan(s.plan),
           url: s.url ?? null,
           pullRequests: (s.pullRequests?.nodes ?? []).map((node) => node.pullRequest).filter(Boolean),
-          activities: (s.activities?.nodes ?? []).map((activity) => {
-            const { __typename: _typename, ...content } = activity.content;
-            return { ...activity, content: content as AgentActivityContent };
-          }),
+          // Linear currently returns activity nodes newest-first. Normalize to
+          // chronological order so callers can reliably use reverse() for the
+          // terminal activity and slice(-N) for the newest bounded handoff.
+          activities: (s.activities?.nodes ?? [])
+            .map((activity) => {
+              const { __typename: _typename, ...content } = activity.content;
+              return { ...activity, content: content as AgentActivityContent };
+            })
+            .sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
         }))
         .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)); // newest first
     } catch (err) {
@@ -716,10 +766,10 @@ export class LinearAgentApi {
   }
 
   /**
-   * Fetch recent comments on an issue with author names. Used by the resume gate:
-   * on this workspace the durable record of prior work (Apex plans, review
-   * verdicts, and the user's steering) lives in comments, not agent-session API
-   * objects. Best-effort — returns [] on failure.
+   * Fetch recent comments on an issue with author names. The durable handoff for
+   * this workspace includes Apex plans, review verdicts, and user steering from
+   * comments in addition to agent-session summaries. Best-effort — returns []
+   * on failure.
    * @param issueId - the Linear issue id
    * @param count - how many of the most recent comments to fetch (default 60)
    * @returns comments oldest→newest with author name (null for system comments)
@@ -782,6 +832,7 @@ export class LinearAgentApi {
     projectId?: string;
     parentId?: string;
     assigneeId?: string;
+    delegateId?: string | null;
     dueDate?: string;
   }): Promise<boolean> {
     const data = await this.gql<{

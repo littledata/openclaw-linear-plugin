@@ -5,6 +5,8 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveLinearToken, LinearAgentApi, AUTH_PROFILES_PATH, LINEAR_GRAPHQL_URL } from "../api/linear-api.js";
 import { validateRepoPath } from "./multi-repo.js";
+import { listGitHubInstallationRepositories } from "./github-repository-catalog.js";
+import { resolveGitHubAppConfig } from "./github-app-auth.js";
 import { LINEAR_OAUTH_AUTH_URL, LINEAR_OAUTH_TOKEN_URL, LINEAR_AGENT_SCOPES } from "../api/auth.js";
 import { listWorktrees } from "./codex-worktree.js";
 import { loadPrompts, clearPromptCache } from "../pipeline/pipeline.js";
@@ -22,6 +24,48 @@ function prompt(question) {
 function openBrowser(url) {
     const cmd = process.platform === "darwin" ? "open" : "xdg-open";
     exec(`${cmd} ${JSON.stringify(url)}`, () => { });
+}
+/** Persist plugin configuration through OpenClaw's active-profile mutation API. */
+export async function saveLinearPluginConfig(api, pluginConfig) {
+    await api.runtime.config.mutateConfigFile({
+        base: "source",
+        afterWrite: { mode: "auto" },
+        mutate: (draft) => {
+            const mutable = draft;
+            const plugins = mutable.plugins ?? {};
+            const entries = plugins.entries ?? {};
+            entries["openclaw-linear"] = {
+                ...entries["openclaw-linear"],
+                config: pluginConfig,
+            };
+            mutable.plugins = { ...plugins, entries };
+        },
+    });
+}
+async function promptGitHubAppRole(role, current) {
+    const label = role === "coding" ? "LilCodingAgent" : "LilReviewerAgent";
+    const appId = await prompt(`  ${label} App ID${current?.appId ? ` [${current.appId}]` : ""}: `);
+    const installationId = await prompt(`  ${label} installation ID${current?.installationId ? ` [${current.installationId}]` : ""}: `);
+    const privateKeyPath = await prompt(`  ${label} PEM path on this gateway${current?.privateKeyPath ? ` [${current.privateKeyPath}]` : ""}: `);
+    const value = {
+        appId: Number(appId || current?.appId),
+        installationId: Number(installationId || current?.installationId),
+        privateKeyPath: privateKeyPath || String(current?.privateKeyPath ?? ""),
+    };
+    if (!Number.isSafeInteger(value.appId) || !Number.isSafeInteger(value.installationId) || !value.privateKeyPath) {
+        console.log(`  ✗ ${label} configuration is incomplete.`);
+        return null;
+    }
+    return value;
+}
+async function verifyGitHubApps(pluginConfig, forceRefresh = false) {
+    resolveGitHubAppConfig("coding", pluginConfig);
+    resolveGitHubAppConfig("reviewer", pluginConfig);
+    const [coding, reviewer] = await Promise.all([
+        listGitHubInstallationRepositories("coding", pluginConfig, forceRefresh),
+        listGitHubInstallationRepositories("reviewer", pluginConfig, forceRefresh),
+    ]);
+    return { coding, reviewer };
 }
 export function registerCli(program, api) {
     const linear = program
@@ -215,7 +259,7 @@ export function registerCli(program, api) {
         .command("setup")
         .description("Guided first-time setup — creates agent profile, checks auth, provisions webhook")
         .action(async () => {
-        const pluginConfig = api.pluginConfig;
+        let pluginConfig = api.pluginConfig ?? {};
         console.log("\nLinear Plugin Setup");
         console.log("═".repeat(50));
         // ---------------------------------------------------------------
@@ -361,9 +405,59 @@ export function registerCli(program, api) {
             }
         }
         // ---------------------------------------------------------------
-        // Step 3: Webhook
+        // Step 3: GitHub Apps
         // ---------------------------------------------------------------
-        console.log("\nStep 3: Webhook");
+        console.log("\nStep 3: GitHub Apps");
+        console.log("─".repeat(50));
+        const configuredApps = pluginConfig.githubApps;
+        if (!configuredApps?.coding || !configuredApps?.reviewer) {
+            const configure = await prompt("  Configure LilCodingAgent and LilReviewerAgent now? [Y/n]: ");
+            if (configure.toLowerCase() !== "n") {
+                const coding = await promptGitHubAppRole("coding", configuredApps?.coding);
+                const reviewer = await promptGitHubAppRole("reviewer", configuredApps?.reviewer);
+                if (coding && reviewer) {
+                    const candidate = {
+                        ...pluginConfig,
+                        repositorySource: "github-app",
+                        githubApps: { coding, reviewer },
+                    };
+                    try {
+                        const verified = await verifyGitHubApps(candidate, true);
+                        const owners = [...new Set(verified.coding.map((repo) => repo.fullName.split("/")[0]))];
+                        pluginConfig = {
+                            ...candidate,
+                            ...(owners.length === 1 ? { githubOwner: owners[0] } : {}),
+                        };
+                        await saveLinearPluginConfig(api, pluginConfig);
+                        console.log(`  ✓ Coding App: ${verified.coding.length} repositories`);
+                        console.log(`  ✓ Reviewer App: ${verified.reviewer.length} repositories`);
+                        console.log("  ✓ Remote-first GitHub repository mode enabled");
+                    }
+                    catch (err) {
+                        console.log(`  ✗ GitHub App verification failed: ${err instanceof Error ? err.message : String(err)}`);
+                    }
+                }
+            }
+        }
+        else {
+            try {
+                const verified = await verifyGitHubApps(pluginConfig);
+                console.log(`  ✓ Coding App: ${verified.coding.length} repositories`);
+                console.log(`  ✓ Reviewer App: ${verified.reviewer.length} repositories`);
+                if (pluginConfig.repositorySource !== "github-app") {
+                    pluginConfig = { ...pluginConfig, repositorySource: "github-app" };
+                    await saveLinearPluginConfig(api, pluginConfig);
+                    console.log("  ✓ Migrated repository source from host mirrors to GitHub Apps");
+                }
+            }
+            catch (err) {
+                console.log(`  ✗ GitHub App verification failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+        }
+        // ---------------------------------------------------------------
+        // Step 4: Webhook
+        // ---------------------------------------------------------------
+        console.log("\nStep 4: Webhook");
         console.log("─".repeat(50));
         const freshToken = resolveLinearToken(pluginConfig);
         if (!freshToken.accessToken) {
@@ -401,9 +495,9 @@ export function registerCli(program, api) {
             }
         }
         // ---------------------------------------------------------------
-        // Step 4: Verify
+        // Step 5: Verify
         // ---------------------------------------------------------------
-        console.log("\nStep 4: Verification");
+        console.log("\nStep 5: Verification");
         console.log("─".repeat(50));
         try {
             const { runDoctor, formatReport } = await import("./doctor.js");
@@ -431,6 +525,61 @@ export function registerCli(program, api) {
         catch (err) {
             console.log(`  ⚠ Doctor failed: ${err instanceof Error ? err.message : String(err)}`);
             console.log("  Run: openclaw openclaw-linear doctor for details.\n");
+        }
+    });
+    // --- openclaw openclaw-linear github-apps ---
+    const githubApps = linear
+        .command("github-apps")
+        .description("Verify and migrate coding/reviewer GitHub App access");
+    githubApps
+        .command("status")
+        .description("Verify both App installations and show repository access")
+        .action(async () => {
+        const pluginConfig = api.pluginConfig ?? {};
+        console.log("\nGitHub App Status");
+        console.log("─".repeat(50));
+        try {
+            const verified = await verifyGitHubApps(pluginConfig, true);
+            console.log(`  Coding:   ${verified.coding.length} repositories`);
+            console.log(`  Reviewer: ${verified.reviewer.length} repositories`);
+            console.log(`  Source:   ${pluginConfig.repositorySource ?? "local"}`);
+        }
+        catch (err) {
+            console.error(`  Failed: ${err instanceof Error ? err.message : String(err)}`);
+            process.exitCode = 1;
+        }
+        console.log();
+    });
+    githubApps
+        .command("migrate")
+        .description("Enable live GitHub catalog + remote-first container clones")
+        .action(async () => {
+        const pluginConfig = api.pluginConfig ?? {};
+        console.log("\nGitHub App Repository Migration");
+        console.log("─".repeat(50));
+        try {
+            const verified = await verifyGitHubApps(pluginConfig, true);
+            const reviewerNames = new Set(verified.reviewer.map((repository) => repository.fullName.toLowerCase()));
+            const missingFromReviewer = verified.coding.filter((repository) => !reviewerNames.has(repository.fullName.toLowerCase()));
+            const owners = [...new Set(verified.coding.map((repository) => repository.fullName.split("/")[0]))];
+            const migrated = {
+                ...pluginConfig,
+                repositorySource: "github-app",
+                ...(owners.length === 1 ? { githubOwner: owners[0] } : {}),
+            };
+            await saveLinearPluginConfig(api, migrated);
+            console.log(`  ✓ Coding catalog: ${verified.coding.length} repositories`);
+            console.log(`  ✓ Reviewer catalog: ${verified.reviewer.length} repositories`);
+            console.log("  ✓ repositorySource set to github-app");
+            console.log("  ✓ host repository mirrors are no longer required for new containers");
+            if (missingFromReviewer.length) {
+                console.log(`  ⚠ ${missingFromReviewer.length} coding repos are not installed for the reviewer App`);
+            }
+            console.log("\nRestart the gateway to apply the migrated configuration.\n");
+        }
+        catch (err) {
+            console.error(`  Migration failed: ${err instanceof Error ? err.message : String(err)}`);
+            process.exitCode = 1;
         }
     });
     // --- openclaw openclaw-linear worktrees ---
@@ -980,8 +1129,12 @@ export function registerCli(program, api) {
 const REPO_LABEL_COLOR = "#5e6ad2"; // Linear indigo
 async function reposAction(api, opts) {
     const pluginConfig = api.pluginConfig;
+    const remoteRepositories = pluginConfig?.repositorySource === "github-app";
+    const catalog = remoteRepositories
+        ? await listGitHubInstallationRepositories("coding", pluginConfig)
+        : [];
     const reposMap = pluginConfig?.repos ?? {};
-    const repoNames = Object.keys(reposMap);
+    const repoNames = remoteRepositories ? catalog.map((repository) => repository.name) : Object.keys(reposMap);
     const mode = opts.dryRun ? "Repos Check" : "Repos Sync";
     console.log(`\n${mode}`);
     console.log("─".repeat(40));
@@ -996,9 +1149,14 @@ async function reposAction(api, opts) {
         return;
     }
     // 2. Validate each repo path
-    console.log("\n  Repos from config:");
+    console.log(remoteRepositories ? "\n  Repos from coding GitHub App:" : "\n  Repos from config:");
     const warnings = [];
     for (const name of repoNames) {
+        if (remoteRepositories) {
+            const repository = catalog.find((candidate) => candidate.name === name);
+            console.log(`  \u2714 ${name.padEnd(24)} ${repository?.fullName} (${repository?.defaultBranch})`);
+            continue;
+        }
         const repoPath = reposMap[name];
         const status = validateRepoPath(repoPath);
         const pad = name.padEnd(16);

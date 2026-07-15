@@ -23,6 +23,7 @@ export class InactivityWatchdog {
     lastActivityAt = Date.now();
     killed = false;
     started = false;
+    paused = false;
     constructor(opts) {
         this.inactivityMs = opts.inactivityMs;
         this.label = opts.label;
@@ -40,7 +41,29 @@ export class InactivityWatchdog {
     }
     /** Record an I/O activity tick. Resets the inactivity countdown. */
     tick() {
+        if (this.paused) {
+            this.resume();
+            return;
+        }
         this.lastActivityAt = Date.now();
+    }
+    /** Pause inactivity enforcement while the agent is waiting for user input. */
+    pause() {
+        if (!this.started || this.paused)
+            return;
+        this.paused = true;
+        if (this.timer) {
+            clearTimeout(this.timer);
+            this.timer = null;
+        }
+    }
+    /** Resume inactivity enforcement after user input or agent progress arrives. */
+    resume() {
+        if (!this.started || !this.paused || this.killed)
+            return;
+        this.paused = false;
+        this.lastActivityAt = Date.now();
+        this.scheduleCheck();
     }
     /** Stop the watchdog (normal completion). */
     stop() {
@@ -49,6 +72,7 @@ export class InactivityWatchdog {
             this.timer = null;
         }
         this.started = false;
+        this.paused = false;
     }
     /** Whether the watchdog triggered a kill. */
     get wasKilled() {
@@ -59,6 +83,8 @@ export class InactivityWatchdog {
         return Date.now() - this.lastActivityAt;
     }
     scheduleCheck() {
+        if (this.paused)
+            return;
         const remaining = Math.max(1000, this.inactivityMs - (Date.now() - this.lastActivityAt));
         this.timer = setTimeout(() => {
             if (this.killed || !this.started)

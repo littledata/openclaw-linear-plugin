@@ -6,7 +6,8 @@
  *
  *   Todo / In Progress  → Apex plans + routes implementers → they build →
  *                         Apex self-reviews → (on success) move to Code Review
- *   Code Review         → Warden + Apex code-review gate → (on success) move to QA
+ *   Code Review         → Warden + Apex code-review gate → (on success) move to QA,
+ *                         or (on failure) return to In Progress
  *   QA                  → Proof QAs → (on success) move to Done
  *
  * Every mapping is overridable via plugin config `statePlans` (keyed by the
@@ -14,9 +15,10 @@
  * built-in matcher picks a plan by state name/type. States with no plan (e.g.
  * Done, Canceled, Backlog) return null — the orchestrator no-ops for those.
  *
- * Transitions are AGENT-DECIDED: a plan only names the CANDIDATE next state(s).
- * The orchestrator moves the ticket only when the agent reports its work is
- * complete; any failure leaves the ticket where it is.
+ * Transitions are CONFIG-DRIVEN: a plan names candidate success/failure states,
+ * and the orchestrator moves the ticket only after the corresponding terminal
+ * verdict. Targets and terminal delegate release are independently configurable
+ * for every Linear state.
  */
 /** True when a state plan contains reviewers only and must skip implementation preflight. */
 export function isReviewOnlyPlan(plan) {
@@ -30,6 +32,8 @@ const IMPLEMENT_PLAN = {
     stateLabel: "implement",
     phases: [{ type: "plan-implement" }],
     onSuccess: { names: ["In Review", "Code Review", "Review"], type: "started" },
+    onFailure: { names: ["In Progress", "Doing"], type: "started" },
+    clearDelegate: true,
 };
 /** Code Review → security + lead review gate → QA. */
 const CODE_REVIEW_PLAN = {
@@ -39,12 +43,16 @@ const CODE_REVIEW_PLAN = {
         { type: "review", role: "apex", gate: true },
     ],
     onSuccess: { names: ["QA", "Testing", "In QA", "Ready for QA"], type: "started" },
+    onFailure: { names: ["In Progress", "Doing"], type: "started" },
+    clearDelegate: true,
 };
 /** QA → Proof QA gate → Done. */
 const QA_PLAN = {
     stateLabel: "qa",
     phases: [{ type: "review", role: "proof", gate: true }],
     onSuccess: { names: ["Done", "Merged", "Complete", "Completed"], type: "completed" },
+    onFailure: { names: ["In Review", "Code Review", "Review"], type: "started" },
+    clearDelegate: true,
 };
 /**
  * Ordered matchers. Review/QA are checked BEFORE implement because custom
@@ -116,21 +124,30 @@ function parseConfigPlan(raw, label) {
         : [];
     if (phases.length === 0)
         return null;
-    let onSuccess = null;
-    const os = o.onSuccess;
-    if (typeof os === "string") {
-        onSuccess = { names: [os] };
-    }
-    else if (Array.isArray(os)) {
-        onSuccess = { names: os.filter((x) => typeof x === "string") };
-    }
-    else if (os && typeof os === "object") {
-        onSuccess = {
-            names: Array.isArray(os.names) ? os.names.filter((x) => typeof x === "string") : [],
-            type: typeof os.type === "string" ? os.type : undefined,
-        };
-    }
-    return { stateLabel: label, phases, onSuccess };
+    const normalizeTarget = (rawTarget) => {
+        if (typeof rawTarget === "string")
+            return { names: [rawTarget] };
+        if (Array.isArray(rawTarget)) {
+            return { names: rawTarget.filter((x) => typeof x === "string") };
+        }
+        if (rawTarget && typeof rawTarget === "object") {
+            const target = rawTarget;
+            return {
+                names: Array.isArray(target.names)
+                    ? target.names.filter((x) => typeof x === "string")
+                    : [],
+                type: typeof target.type === "string" ? target.type : undefined,
+            };
+        }
+        return null;
+    };
+    return {
+        stateLabel: label,
+        phases,
+        onSuccess: normalizeTarget(o.onSuccess),
+        onFailure: normalizeTarget(o.onFailure),
+        clearDelegate: o.clearDelegate !== false,
+    };
 }
 // ---------------------------------------------------------------------------
 // Resolver

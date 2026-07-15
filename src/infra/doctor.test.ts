@@ -355,7 +355,7 @@ describe("checkDispatchHealth", () => {
 // ---------------------------------------------------------------------------
 
 describe("runDoctor", () => {
-  it("returns all 7 sections", async () => {
+  it("returns all 8 sections", async () => {
     vi.stubGlobal("fetch", vi.fn(async (url: string) => {
       if (url.includes("linear.app")) {
         return {
@@ -367,11 +367,12 @@ describe("runDoctor", () => {
     }));
 
     const report = await runDoctor({ fix: false, json: false });
-    expect(report.sections).toHaveLength(7);
+    expect(report.sections).toHaveLength(8);
     expect(report.sections.map((s) => s.name)).toEqual([
       "Authentication & Tokens",
       "Agent Configuration",
       "Coding Tools",
+      "GitHub Apps",
       "Files & Directories",
       "Connectivity",
       "Dispatch Health",

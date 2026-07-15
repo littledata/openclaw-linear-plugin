@@ -8,9 +8,8 @@
  * Unlike webhook-dedup.test.ts (dedup logic) and webhook.test.ts (HTTP basics),
  * these tests verify the full business logic paths end-to-end.
  *
- * Key pattern: handlers prefer emitActivity(response) over createComment
- * when an agent session exists — createComment is only used as a fallback
- * when the session activity emission fails.
+ * Key pattern: agent-session handlers communicate only through session
+ * activities. A failed activity must never be mirrored as an issue comment.
  */
 import type { AddressInfo } from "node:net";
 import { createServer } from "node:http";
@@ -92,6 +91,7 @@ vi.mock("../pipeline/pipeline.js", () => ({
 vi.mock("../pipeline/active-session.js", () => ({
   setActiveSession: mockSetActiveSession,
   clearActiveSession: mockClearActiveSession,
+  getActiveSession: vi.fn().mockReturnValue(null),
   getIssueAffinity: vi.fn().mockReturnValue(null),
   _configureAffinityTtl: vi.fn(),
   _resetAffinityForTesting: vi.fn(),
@@ -368,8 +368,8 @@ describe("webhook scenario tests — full handler flows", () => {
       expect(mockClearActiveSession).toHaveBeenCalledWith("issue-1");
     });
 
-    it("created: falls back to createComment when emitActivity fails", async () => {
-      // Make the response emitActivity fail — comment is the fallback
+    it("created: does not mirror a failed session response onto the issue", async () => {
+      // Make the response emitActivity fail.
       let emitCallCount = 0;
       mockEmitActivity.mockImplementation(async (_sessionId: string, content: any) => {
         emitCallCount++;
@@ -388,10 +388,7 @@ describe("webhook scenario tests — full handler flows", () => {
       // runAgent was called
       expect(mockRunAgent).toHaveBeenCalledOnce();
 
-      // emitActivity(response) failed → fell back to createComment
-      expect(mockCreateComment).toHaveBeenCalledOnce();
-      const commentBody = mockCreateComment.mock.calls[0][1] as string;
-      expect(commentBody).toContain("Agent response text");
+      expect(mockCreateComment).not.toHaveBeenCalled();
     });
 
     it("prompted: processes follow-up, delivers via emitActivity", async () => {
@@ -595,20 +592,35 @@ describe("webhook scenario tests — full handler flows", () => {
   });
 
   describe("Issue.update", () => {
-    it("assignment dispatch: triggers handleDispatch pipeline", async () => {
-      // Set viewerId to match the fixture's assigneeId
-      mockGetViewerId.mockResolvedValue("viewer-1");
+    it("assignment update waits and the new delegation session triggers dispatch", async () => {
+      // The OAuth viewer may be a human; Linear's webhook appUserId is the
+      // authoritative identity for assignment/delegation events.
+      mockGetViewerId.mockResolvedValue("oauth-human-viewer");
       mockGetIssueDetails.mockResolvedValue(makeIssueDetails({
         state: { name: "In Progress", type: "started" },
+        delegate: { id: "viewer-1", name: "Vasile" },
       }));
 
       const api = createApi();
-      const payload = makeIssueUpdateWithAssignment();
+      const payload = {
+        ...makeIssueUpdateWithAssignment(),
+        appUserId: "viewer-1",
+      };
       await postWebhook(api, payload);
 
-      // Container-only: dispatch runs the state-driven orchestrator in a container.
+      expect(mockRunStatePlan).not.toHaveBeenCalled();
+      expect(infoLogs(api).some((line) => line.includes("awaiting Linear's new AgentSession.created"))).toBe(true);
+
+      await postWebhook(api, {
+        ...makeAgentSessionEventCreated(),
+        appUserId: "viewer-1",
+      });
+
+      // The newly-created delegation session owns the container dispatch.
       await waitForMock(mockRunStatePlan, { timeout: 3000 });
       expect(mockRunStatePlan).toHaveBeenCalledOnce();
+      expect(mockCreateSessionOnIssue).not.toHaveBeenCalled();
+      expect(mockGetViewerId).not.toHaveBeenCalled();
     });
   });
 

@@ -25,9 +25,10 @@ export function getRepoEntries(pluginConfig) {
         }
         else if (value && typeof value === "object") {
             result[name] = {
-                path: value.path,
+                path: typeof value.path === "string" ? value.path : undefined,
                 github: value.github,
                 hostname: value.hostname,
+                defaultBranch: value.defaultBranch,
             };
         }
     }
@@ -67,6 +68,10 @@ export function buildCandidateRepositories(pluginConfig) {
         hostname: e.hostname ?? "github.com",
         repositoryFullName: e.github,
     }));
+}
+/** Resolve a configured repository's default branch. */
+export function resolveGitHubDefaultBranch(repoName, pluginConfig) {
+    return getRepoEntries(pluginConfig)[repoName]?.defaultBranch || "main";
 }
 /**
  * Find configured repo names explicitly mentioned in free text (issue body,
@@ -158,7 +163,8 @@ function getRepoMap(pluginConfig) {
     const entries = getRepoEntries(pluginConfig);
     const result = {};
     for (const [name, entry] of Object.entries(entries)) {
-        result[name] = entry.path;
+        if (entry.path)
+            result[name] = entry.path;
     }
     return result;
 }

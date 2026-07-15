@@ -4,9 +4,13 @@ import {
   repoWorkdir,
   buildRunArgs,
   buildCodexInner,
+  GIT_STATUS_SCRIPT,
+  OPEN_PR_SCRIPT,
+  parseContainerGitStatus,
   PROVISION_SCRIPT,
   CHECKOUT_PR_SCRIPT,
   PUBLISH_PR_REVIEW_SCRIPT,
+  PROVISION_GITHUB_REPO_SCRIPT,
   checkoutPullRequestInContainer,
   publishPullRequestReviewInContainer,
   parseContainerRows,
@@ -42,6 +46,7 @@ describe("buildRunArgs", () => {
     reposRoot: "/root/repos",
     clawHostDir: "/root/.claw/CORE-1740",
     createdAtMs: 1_000,
+    repositorySource: "local",
   };
 
   it("runs detached with a deterministic name, labels, and the RO repos + claw mounts", () => {
@@ -71,13 +76,81 @@ describe("buildRunArgs", () => {
     expect(args).toContain("4g");
     expect(args).toContain("--cpus");
   });
+
+  it("does not mount the host repository mirror in GitHub App mode", () => {
+    const args = buildRunArgs({ ...base, repositorySource: "github-app" });
+    expect(args.join(" ")).not.toContain(REPOS_RO_MOUNT);
+    expect(args).toContain(`/root/.claw/CORE-1740:${CLAW_MOUNT}`);
+  });
 });
 
 describe("PROVISION_SCRIPT", () => {
   it("uses --shared (cross-fs safe) and reads REPOS/BRANCH from env", () => {
     expect(PROVISION_SCRIPT).toContain('git clone --shared "/repos-ro/$r" "/work/$r"');
     expect(PROVISION_SCRIPT).toContain('checkout -B "$BRANCH"');
+    expect(PROVISION_SCRIPT).toContain("update-ref refs/openclaw/base HEAD");
     expect(PROVISION_SCRIPT).toContain("for r in $REPOS");
+  });
+});
+
+describe("PROVISION_GITHUB_REPO_SCRIPT", () => {
+  it("continues a remote branch or creates it from the live default branch", () => {
+    expect(PROVISION_GITHUB_REPO_SCRIPT).toContain('ls-remote --exit-code --heads origin "$BRANCH"');
+    expect(PROVISION_GITHUB_REPO_SCRIPT).toContain('pull --ff-only origin "$BRANCH"');
+    expect(PROVISION_GITHUB_REPO_SCRIPT).toContain('symbolic-ref --short refs/remotes/origin/HEAD');
+    expect(PROVISION_GITHUB_REPO_SCRIPT).toContain('checkout -B "$BRANCH" "$DEFAULT_REF"');
+    expect(PROVISION_GITHUB_REPO_SCRIPT).toContain('merge-base HEAD "$DEFAULT_REF"');
+    expect(PROVISION_GITHUB_REPO_SCRIPT).toContain('status --porcelain');
+    expect(PROVISION_GITHUB_REPO_SCRIPT).toContain("refs/openclaw/base");
+  });
+});
+
+describe("parseContainerGitStatus", () => {
+  it("treats an uncommitted file as implementation activity", () => {
+    expect(parseContainerGitStatus(
+      "PORCELAIN<<\n M src/a.ts\n>>\nLASTCOMMIT=abc existing\nCOMMITMESSAGE<<\nExisting\n>>\nCOMMITS_AHEAD=0\n",
+    )).toEqual({
+      hasChanges: true,
+      hasUncommitted: true,
+      lastCommit: "abc existing",
+      lastCommitMessage: "Existing",
+      commitsAhead: 0,
+    });
+  });
+
+  it("treats a clean committed branch as implementation activity", () => {
+    expect(parseContainerGitStatus(
+      "PORCELAIN<<\n>>\nLASTCOMMIT=def implementation\nCOMMITMESSAGE<<\nCORE-1: implementation\n\nChangelog:\n- code\n\nValidation:\n- test: pass\n>>\nCOMMITS_AHEAD=2\n",
+    )).toEqual({
+      hasChanges: true,
+      hasUncommitted: false,
+      lastCommit: "def implementation",
+      lastCommitMessage: "CORE-1: implementation\n\nChangelog:\n- code\n\nValidation:\n- test: pass",
+      commitsAhead: 2,
+    });
+  });
+
+  it("recognizes a completely untouched repo", () => {
+    expect(parseContainerGitStatus(
+      "PORCELAIN<<\n>>\nLASTCOMMIT=abc base\nCOMMITMESSAGE<<\nBase\n>>\nCOMMITS_AHEAD=0\n",
+    )).toEqual({
+      hasChanges: false,
+      hasUncommitted: false,
+      lastCommit: "abc base",
+      lastCommitMessage: "Base",
+      commitsAhead: 0,
+    });
+  });
+
+  it("compares against the provisioned base ref", () => {
+    expect(GIT_STATUS_SCRIPT).toContain("refs/openclaw/base");
+    expect(GIT_STATUS_SCRIPT).toContain("COMMITS_AHEAD");
+  });
+
+  it("requires a clean committed tree and resolves an existing PR URL", () => {
+    expect(OPEN_PR_SCRIPT).toContain("working tree is not clean");
+    expect(OPEN_PR_SCRIPT).not.toContain("git commit");
+    expect(OPEN_PR_SCRIPT).toContain('gh pr view "$BRANCH"');
   });
 });
 
