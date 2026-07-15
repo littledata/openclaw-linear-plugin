@@ -935,13 +935,15 @@ export async function handleLinearWebhook(
       });
 
       try {
-        // Emit initial thought
+        // Ephemeral "thinking" indicator — vanishes when the reply lands.
         await linearApi.emitActivity(session.id, {
           type: "thought",
-          body: `${label} is processing request for ${enrichedIssue?.identifier ?? issue.id}...`,
-        }).catch(() => {});
+          body: `Looking into ${enrichedIssue?.identifier ?? issue.id}…`,
+        }, { ephemeral: true }).catch(() => {});
 
-        // Run agent with streaming to Linear
+        // Run agent with streaming to Linear. Conversational replies stream their
+        // thinking/tool cards EPHEMERALLY (they disappear on the final response),
+        // so a mention feels like a chat, not a work log.
         const sessionId = `linear-session-${session.id}`;
         const { runAgent } = await import("../agent/agent.js");
         const result = await runAgent({
@@ -956,6 +958,7 @@ export async function handleLinearWebhook(
           streaming: {
             linearApi,
             agentSessionId: session.id,
+            ephemeralActivity: true,
           },
         });
 
@@ -963,22 +966,21 @@ export async function handleLinearWebhook(
           ? result.output
           : `Something went wrong while processing this. The system will retry automatically if possible. If this keeps happening, run \`openclaw openclaw-linear doctor\` to check for issues.`;
 
-        // Deliver the answer to BOTH surfaces: the AgentSession response (rich
-        // session thread) AND an inline issue comment, so the reply is visible
-        // in the session and in the normal comment thread (config-toggleable).
-        const labeledResponse = `**[${label}]** ${responseBody}`;
+        // Deliver the answer to BOTH surfaces: the AgentSession response (persistent
+        // — the ephemeral thinking above collapses into it) AND an inline issue
+        // comment. No agent-name prefix: the session/comment is already authored
+        // by this app.
         await linearApi.emitActivity(session.id, {
           type: "response",
-          body: labeledResponse,
+          body: responseBody,
         }).catch((err) => {
           api.logger.warn(`Could not emit response in AgentSession ${session.id}: ${err}`);
         });
         // Mirror only real answers (success) — never spam a generic failure
-        // message into the issue's comment thread.
+        // message. Plain comment authored by THIS app (the token identity), with
+        // no createAsUser override or agent-name prefix.
         if (result.success && conversationalCommentReply(pluginConfig as Record<string, unknown> | undefined)) {
-          const avatarUrl = profiles[agentId]?.avatarUrl;
-          const agentOpts = avatarUrl ? { createAsUser: label, displayIconUrl: avatarUrl } : undefined;
-          await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts)
+          await createCommentWithDedup(linearApi, issue.id, responseBody)
             .catch((err) => api.logger.warn(`Could not post comment reply for ${session.id}: ${err}`));
         }
 
@@ -1452,6 +1454,7 @@ export async function handleLinearWebhook(
           streaming: {
             linearApi,
             agentSessionId: session.id,
+            ephemeralActivity: true,
           },
         });
 
@@ -1459,23 +1462,19 @@ export async function handleLinearWebhook(
           ? result.output
           : `Something went wrong while processing this. The system will retry automatically if possible. If this keeps happening, run \`openclaw openclaw-linear doctor\` to check for issues.`;
 
-        // Deliver to BOTH the session response and an inline comment. If the
-        // session emit fails, the comment still lands (and vice-versa).
-        const labeledResponse = `**[${label}]** ${responseBody}`;
+        // Deliver to BOTH the session response and an inline comment (no agent-name
+        // prefix — the session/comment is already authored by this app). If the
+        // session emit fails, the comment still lands.
         const emitted = await linearApi.emitActivity(session.id, {
           type: "response",
-          body: labeledResponse,
+          body: responseBody,
         }).then(() => true).catch(() => false);
 
         // Mirror successful answers to a comment (dual output). Also fall back to
         // a comment if the session emit failed, so the reply isn't lost. Never
         // mirror a generic failure message on a clean session.
         if ((result.success && conversationalCommentReply(pluginConfig as Record<string, unknown> | undefined)) || !emitted) {
-          const avatarUrl = profiles[agentId]?.avatarUrl;
-          const agentOpts = avatarUrl
-            ? { createAsUser: label, displayIconUrl: avatarUrl }
-            : undefined;
-          await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts)
+          await createCommentWithDedup(linearApi, issue.id, responseBody)
             .catch((err) => api.logger.warn(`Could not post comment reply for ${session.id}: ${err}`));
         }
 

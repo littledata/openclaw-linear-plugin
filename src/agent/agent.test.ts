@@ -502,6 +502,36 @@ describe("embedded tool activity projection", () => {
     );
   });
 
+  it("emits thinking + tool cards EPHEMERALLY when streaming.ephemeralActivity is set (conversational)", async () => {
+    const api = createApi() as any;
+    const emitActivity = vi.fn().mockResolvedValue(undefined);
+    const runEmbeddedPiAgent = vi.fn().mockImplementation(async (opts: any) => {
+      opts.onAgentEvent({ stream: "assistant", data: { text: "Let me check the Redis config." } });
+      opts.onAgentEvent({ stream: "tool", data: { phase: "start", name: "container_exec", toolCallId: "c1", args: { command: "cat redis" } } });
+      opts.onAgentEvent({ stream: "tool", data: { phase: "result", name: "container_exec", toolCallId: "c1", isError: false } });
+      return { payloads: [{ text: "done" }], meta: { durationMs: 5 } };
+    });
+    api.runtime.agent = { defaults: { provider: "openrouter", model: "test-model" }, runEmbeddedPiAgent };
+
+    await runAgent({
+      api,
+      agentId: "main",
+      sessionId: "linear-session-conv",
+      issueIdentifier: "CORE-9",
+      message: "@lilagent status?",
+      streaming: { linearApi: { emitActivity } as any, agentSessionId: "linear-session", ephemeralActivity: true },
+    });
+
+    // thinking thought + tool result are ephemeral (they vanish on the reply)
+    expect(emitActivity).toHaveBeenNthCalledWith(
+      1, "linear-session",
+      { type: "thought", body: "Let me check the Redis config." },
+      { ephemeral: true },
+    );
+    const resultCall = emitActivity.mock.calls.find((c: any[]) => c[1]?.type === "action" && c[1]?.result !== undefined);
+    expect(resultCall?.[2]).toEqual({ ephemeral: true });
+  });
+
   it("pretty-prints JSON and caps oversized values", () => {
     expect(formatToolActivityValue('{"a":1}', 100)).toBe('{\n  "a": 1\n}');
     expect(formatToolActivityValue("abcdefgh", 4)).toContain("abcd\n…(4 more characters)");

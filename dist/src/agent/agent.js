@@ -404,6 +404,9 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
         "Your only output is your text response.",
     ].join(" ");
     const progressThoughtsEnabled = pluginConfig?.linearProgressThoughts !== false;
+    // Conversational runs surface thinking/tool cards ephemerally (they disappear
+    // on the final reply); coding runs persist them as a full action log.
+    const ephemeralActivity = streaming.ephemeralActivity === true;
     const progressNotice = progressThoughtsEnabled
         ? [
             "LINEAR PROGRESS VISIBILITY: Before the first tool batch and whenever your investigation",
@@ -424,7 +427,7 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
             return;
         lastEmittedCommentary = text;
         api.logger.info(`[linear] emitting agent commentary as thought (${text.length} chars)`);
-        emit({ type: "thought", body: formatToolActivityValue(text, 4_000) });
+        emit({ type: "thought", body: formatToolActivityValue(text, 4_000) }, ephemeralActivity ? { ephemeral: true } : undefined);
     };
     let codexBinding;
     const linearSessionId = streaming.agentSessionId;
@@ -519,7 +522,7 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
                 watchdog.tick();
                 const text = payload.text?.trim();
                 if (text && text.length > 10) {
-                    emit({ type: "thought", body: formatToolActivityValue(text, 4_000) });
+                    emit({ type: "thought", body: formatToolActivityValue(text, 4_000) }, ephemeralActivity ? { ephemeral: true } : undefined);
                 }
             },
             // OpenClaw supplies the actual result immediately before the matching
@@ -586,7 +589,7 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
                         action: pending?.name ?? formatToolActivityTitle(toolName),
                         parameter: pending?.parameter,
                         result: formatToolActivityResult(toolName, rawResult, isError),
-                    });
+                    }, ephemeralActivity ? { ephemeral: true } : undefined);
                 }
             },
             // Partial assistant text (for long responses)

@@ -51,6 +51,14 @@ export interface AgentRunResult {
 export interface AgentStreamCallbacks {
   linearApi: LinearAgentApi;
   agentSessionId: string;
+  /**
+   * Emit the agent's THINKING (reasoning summaries, commentary) and tool cards
+   * as EPHEMERAL Linear activities — they show transiently and vanish when the
+   * final response arrives. Used by the conversational agent so a mention gets a
+   * clean "thinking… → reply" experience. The coding agent leaves this off so
+   * its full action log persists in the session.
+   */
+  ephemeralActivity?: boolean;
 }
 
 /** Format structured tool data as readable activity content with a safe size cap. */
@@ -502,6 +510,9 @@ async function runEmbedded(
     "Your only output is your text response.",
   ].join(" ");
   const progressThoughtsEnabled = pluginConfig?.linearProgressThoughts !== false;
+  // Conversational runs surface thinking/tool cards ephemerally (they disappear
+  // on the final reply); coding runs persist them as a full action log.
+  const ephemeralActivity = streaming.ephemeralActivity === true;
   const progressNotice = progressThoughtsEnabled
     ? [
         "LINEAR PROGRESS VISIBILITY: Before the first tool batch and whenever your investigation",
@@ -522,7 +533,7 @@ async function runEmbedded(
     if (!progressThoughtsEnabled || text.length <= 10 || text === lastEmittedCommentary) return;
     lastEmittedCommentary = text;
     api.logger.info(`[linear] emitting agent commentary as thought (${text.length} chars)`);
-    emit({ type: "thought", body: formatToolActivityValue(text, 4_000) });
+    emit({ type: "thought", body: formatToolActivityValue(text, 4_000) }, ephemeralActivity ? { ephemeral: true } : undefined);
   };
 
   let codexBinding: ActiveCodexRunBinding | undefined;
@@ -619,7 +630,7 @@ async function runEmbedded(
         watchdog.tick();
         const text = payload.text?.trim();
         if (text && text.length > 10) {
-          emit({ type: "thought", body: formatToolActivityValue(text, 4_000) });
+          emit({ type: "thought", body: formatToolActivityValue(text, 4_000) }, ephemeralActivity ? { ephemeral: true } : undefined);
         }
       },
 
@@ -688,7 +699,7 @@ async function runEmbedded(
             action: pending?.name ?? formatToolActivityTitle(toolName),
             parameter: pending?.parameter,
             result: formatToolActivityResult(toolName, rawResult, isError),
-          });
+          }, ephemeralActivity ? { ephemeral: true } : undefined);
         }
       },
 
