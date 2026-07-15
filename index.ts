@@ -21,6 +21,7 @@ import { createDispatchHistoryTool } from "./src/tools/dispatch-history-tool.js"
 import { readDispatchState as readStateForHook, listActiveDispatches as listActiveForHook } from "./src/pipeline/dispatch-state.js";
 import { startTokenRefreshTimer, stopTokenRefreshTimer } from "./src/infra/token-refresh-timer.js";
 import { reapExpiredContainers, CONTAINER_TTL_MS, repoWorkdir } from "./src/infra/container-runner.js";
+import { codingEnabled } from "./src/pipeline/mode-config.js";
 import { bindAgentRunToIssue, unbindAgentRunSession, resolveRequesterIssueIdentifier } from "./src/pipeline/active-session.js";
 import { getContainerRecord } from "./src/infra/container-registry.js";
 import { resolveRole } from "./src/pipeline/roles.js";
@@ -576,8 +577,16 @@ export default function register(api: OpenClawPluginApi) {
   // Start proactive token refresh timer (runs immediately, then every 6h)
   startTokenRefreshTimer(api, pluginConfig);
 
-  // Start the container reaper (immediate sweep + every 30 min)
-  startContainerReaper(api, pluginConfig);
+  // Start the container reaper (immediate sweep + every 30 min) — ONLY when this
+  // profile runs the coding pipeline. The reaper is host-wide (it reaps any
+  // labeled container not in THIS profile's registry as an "orphan"), so a
+  // conversational-only profile sharing the Docker host would otherwise destroy
+  // the coding profile's ticket containers. No coding → no containers → no reaper.
+  if (codingEnabled(pluginConfig)) {
+    startContainerReaper(api, pluginConfig);
+  } else {
+    api.logger.info("Container reaper disabled — coding is disabled on this profile.");
+  }
 
   // Clean up timers on process exit
   process.on("beforeExit", () => {
