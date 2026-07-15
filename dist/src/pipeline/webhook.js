@@ -2189,6 +2189,10 @@ async function handleDispatch(api, linearApi, issue, opts) {
     let repoOverride = opts?.repoOverride;
     let grillGuidance = opts?.grillGuidance;
     let grillDone = opts?.grillDone;
+    // Repo(s) GUESSED from prior context/steering. A guess is a recommendation for
+    // the picker — NOT a definitive selection — so a wrong guess can't silently lock
+    // the dispatch to the wrong repo (which is what happened on CORE-1749).
+    let priorRepoReco = [];
     if (reviewOnly) {
         const priorSessions = await linearApi.listAgentSessions(issue.id).catch(() => []);
         const recentComments = await linearApi.getRecentComments(issue.id, 60).catch(() => []);
@@ -2244,8 +2248,11 @@ async function handleDispatch(api, linearApi, issue, opts) {
                 title: enrichedIssue.title ?? identifier,
                 description: enrichedIssue.description,
             }, repoNames, prior.fullContext, resolveAgentId(api));
-            if (!repoOverride?.length && analysis.repos.length)
-                repoOverride = analysis.repos;
+            // The synthesized repo(s) are an LLM GUESS from free text — treat as a
+            // recommendation to lead the picker, NOT a lock. (A confident continuation
+            // is handled below via the existing container record.)
+            if (analysis.repos.length)
+                priorRepoReco = analysis.repos;
             if (analysis.brief.trim()) {
                 grillGuidance = [analysis.brief.trim(), grillGuidance?.trim()]
                     .filter(Boolean)
@@ -2255,8 +2262,18 @@ async function handleDispatch(api, linearApi, issue, opts) {
             // implementer receives the handoff directly and continues immediately.
             grillDone = true;
             api.logger.info(`@dispatch: ${identifier} hydrated context from ${prior.sessionCount} prior session(s) ` +
-                `and ${prior.commentCount} steering note(s); repos=[${analysis.repos.join(",")}], ` +
+                `and ${prior.commentCount} steering note(s); repo-guess=[${analysis.repos.join(",")}], ` +
                 `brief=${analysis.brief ? "yes" : "no"}`);
+        }
+    }
+    // Confident continuation: if this issue ALREADY has a provisioned container, a
+    // repo was really chosen in a prior turn — reuse it without re-asking. (A
+    // prior-context text guess is NOT confident and must not skip the picker.)
+    if (!repoOverride?.length) {
+        const priorContainer = getContainerRecord(identifier);
+        if (priorContainer?.repos?.length) {
+            repoOverride = priorContainer.repos;
+            api.logger.info(`@dispatch: ${identifier} reusing repos=[${priorContainer.repos.join(",")}] from existing container (confident continuation)`);
         }
     }
     // NOTE: the /grill-me interview gate runs AFTER repo resolution (below), so the
@@ -2284,13 +2301,16 @@ async function handleDispatch(api, linearApi, issue, opts) {
                     .map((c) => c.body)
                     .join("\n");
                 const mentioned = detectMentionedRepos(`${enrichedIssue.description ?? ""}\n${commentText}`, repoNames);
-                if (mentioned.length === 1) {
+                if (mentioned.length === 1 && !priorRepoReco.length) {
+                    // A single explicit repo name in the text (and no competing prior-context
+                    // guess) is confident enough to use without asking.
                     repoResolution = resolveReposByNames(mentioned, pluginConfig);
                     api.logger.info(`@dispatch: ${identifier} repos=${mentioned[0]} source=text_mention (rescued from config_default)`);
                 }
                 else {
-                    // Ambiguous (0 or >1 exact mentions) → ask the model to recommend, then ask
-                    // the user. Never dispatch a blind default.
+                    // Ambiguous (0 or >1 mentions, or a prior-context guess to confirm) → ask
+                    // the model to recommend, then ASK the user. Never dispatch a blind default
+                    // or an unconfirmed guess.
                     mentionShortlist = mentioned;
                     const reco = await recommendRepos(api, {
                         identifier,
@@ -2299,9 +2319,11 @@ async function handleDispatch(api, linearApi, issue, opts) {
                         context: commentText,
                         repoNames,
                     }).catch(() => ({ repos: [], reasoning: "" }));
-                    recoOrder = reco.repos;
-                    recoReasoning = reco.reasoning;
-                    api.logger.info(`@dispatch: ${identifier} config_default ambiguous — reco=[${recoOrder.join(",")}] mentions=[${mentioned.join(",")}]`);
+                    // Lead with the ticket-text recommendation (most reliable), then the
+                    // prior-context guess, de-duplicated.
+                    recoOrder = [...reco.repos, ...priorRepoReco].filter((v, i, a) => a.indexOf(v) === i && repoNames.includes(v));
+                    recoReasoning = reco.reasoning || (priorRepoReco.length ? `Prior context suggests ${priorRepoReco.join(", ")}.` : "");
+                    api.logger.info(`@dispatch: ${identifier} config_default ambiguous — reco=[${recoOrder.join(",")}] mentions=[${mentioned.join(",")}] priorGuess=[${priorRepoReco.join(",")}]`);
                 }
             }
             catch (err) {

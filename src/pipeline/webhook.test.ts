@@ -2968,7 +2968,7 @@ describe("handleDispatch via a newly created delegation session", () => {
     }
   });
 
-  it("hydrates a new delegation from prior session summaries and skips redundant startup gates", async () => {
+  it("hydrates the brief from prior sessions but ASKS to confirm the repo (guess is not a lock)", async () => {
     const issueId = "issue-automatic-handoff";
     mockLinearApiInstance.getIssueDetails.mockResolvedValue({
       id: issueId,
@@ -3018,19 +3018,20 @@ describe("handleDispatch via a newly created delegation session", () => {
 
     expect(result.status).toBe(200);
     await new Promise((resolve) => setTimeout(resolve, 500));
-    expect(runStatePlanMock).toHaveBeenCalledOnce();
+    // Hydration still ran (prior sessions read).
     expect(mockLinearApiInstance.listAgentSessions).toHaveBeenCalledWith(
       issueId,
       { activityLimit: 12 },
     );
-    const [, dispatch] = registerDispatchMock.mock.calls[0];
-    expect(dispatch.containerRepos).toEqual(["ld-shopify-admin"]);
-    expect(dispatch.grillGuidance).toContain("implement the remaining UI and focused tests");
-    expect(
-      mockLinearApiInstance.emitActivity.mock.calls.some(([, activity]: any[]) =>
-        activity?.type === "elicitation" && /resume|fresh|which repository/i.test(activity.body),
-      ),
-    ).toBe(false);
+    // The repo was NOT auto-locked from the guess → dispatch is parked awaiting the
+    // user's pick; the orchestrator does not run yet.
+    expect(runStatePlanMock).not.toHaveBeenCalled();
+    // It asks which repository, leading with the extracted recommendation.
+    const repoAsk = mockLinearApiInstance.emitActivity.mock.calls.find(([, activity]: any[]) =>
+      activity?.type === "elicitation" && /which repository/i.test(activity.body),
+    );
+    expect(repoAsk).toBeDefined();
+    expect(repoAsk?.[1]?.body).toContain("ld-shopify-admin");
   });
 
   it("clears stale interactive state and binds work to the new session", async () => {
