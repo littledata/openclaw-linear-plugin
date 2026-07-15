@@ -93,13 +93,15 @@ describe("plan-implement no-change guard", () => {
 
     expect(execCodexMock).toHaveBeenCalledTimes(1);
     expect(runAgentMock).toHaveBeenCalledTimes(1); // Apex plan only; no self-review.
+    // Nothing was committed, so there is genuinely nothing to ship → still blocks.
+    expect(openPrMock).not.toHaveBeenCalled();
     expect(createComment).toHaveBeenCalledWith(
       "issue-1",
-      expect.stringContaining("no changes produced"),
+      expect.stringContaining("without producing code changes"),
     );
   });
 
-  it("requires a new commit when a fresh coding delegation starts from an existing branch", async () => {
+  it("ships existing committed work when a fresh delegation adds no new commit", async () => {
     containerGitStatusMock.mockReturnValue({
       hasChanges: true,
       hasUncommitted: false,
@@ -141,10 +143,66 @@ describe("plan-implement no-change guard", () => {
     });
 
     expect(execCodexMock).toHaveBeenCalledTimes(1); // implementation only; no self-review
-    expect(openPrMock).not.toHaveBeenCalled();
+    // Self-review / commit-hygiene never block the push: a valid commit already
+    // exists on the branch, so we ship it and let human code review be the gate.
+    expect(openPrMock).toHaveBeenCalled();
     expect(createComment).toHaveBeenCalledWith(
       "issue-remediate",
-      expect.stringContaining("remediation did not create a separate commit"),
+      expect.stringContaining("Implementation complete"),
+    );
+  });
+
+  it("ships committed work when self-review keeps failing, attaching findings to the PR", async () => {
+    const base = {
+      hasChanges: false, hasUncommitted: false,
+      lastCommit: "aaa base", lastCommitMessage: "base", commitsAhead: 0,
+    };
+    const coder = {
+      hasChanges: true, hasUncommitted: false,
+      lastCommit: "bbb coder commit",
+      lastCommitMessage: "CORE-SHIP: implement\n\nChangelog:\n- code\n\nValidation:\n- test: pass",
+      commitsAhead: 1,
+    };
+    containerGitStatusMock.mockReset().mockReturnValueOnce(base).mockReturnValue(coder);
+    execCodexMock
+      .mockReset()
+      .mockResolvedValueOnce({ success: true, output: "Implemented the change." })
+      .mockResolvedValueOnce({
+        success: true,
+        output: "Missing test coverage for the null path.\nREVIEW: fail — add tests",
+      });
+    const createComment = vi.fn().mockResolvedValue("comment-1");
+    const ctx = {
+      api: { logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } },
+      linearApi: {
+        getIssueDetails: vi.fn().mockResolvedValue({ title: "Implement", team: { id: "team-1" } }),
+        emitActivity: vi.fn().mockResolvedValue(undefined),
+        createComment,
+      },
+      notify: vi.fn().mockResolvedValue(undefined),
+      pluginConfig: { workerBackend: "codex", maxReworkAttempts: 0, planApprovalGate: false },
+    } as any;
+    const dispatch = {
+      issueId: "issue-ship", issueIdentifier: "CORE-SHIP", issueTitle: "Implement",
+      worktreePath: "/tmp/openclaw-linear-ship-test", branch: "CORE-SHIP/work",
+      tier: "medium", model: "test-model", status: "dispatched",
+      dispatchedAt: "2026-07-15T10:00:00.000Z", attempt: 0, agentSessionId: "session-ship",
+      containerName: "openclaw-linear-CORE-SHIP", containerRepos: ["api"],
+    } as any;
+
+    await runStatePlan(ctx, dispatch, {
+      stateLabel: "in-progress", phases: [{ type: "plan-implement" }], onSuccess: null,
+    });
+
+    // Self-review failed, but the committed work still ships — the human code
+    // review is the real gate — and the findings ride along on the PR body.
+    expect(openPrMock).toHaveBeenCalledOnce();
+    const prBody = openPrMock.mock.calls[0][4];
+    expect(prBody).toContain("Unresolved self-review findings");
+    expect(prBody).toContain("Missing test coverage");
+    expect(createComment).toHaveBeenCalledWith(
+      "issue-ship",
+      expect.stringContaining("Implementation complete"),
     );
   });
 

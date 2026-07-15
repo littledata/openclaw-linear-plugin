@@ -49,6 +49,36 @@ export function unbindAgentRunFromIssue(sessionId: string, agentId: string): voi
   if (!runs.size) agentRunIssuesByAgent.delete(agentId);
 }
 
+/**
+ * Remove a run binding by session id/key alone (agent id unknown). Used to clean
+ * up a spawned subagent binding on subagent_ended, where only the child session
+ * key is available. Scrubs the session from the session map and every agent map.
+ * @param sessionId - the child session id/key to unbind
+ */
+export function unbindAgentRunSession(sessionId: string): void {
+  agentRunIssueBySession.delete(sessionId);
+  for (const [agentId, runs] of agentRunIssuesByAgent) {
+    if (runs.delete(sessionId) && !runs.size) agentRunIssuesByAgent.delete(agentId);
+  }
+}
+
+/**
+ * Resolve the issue identifier a spawn REQUESTER (the coding lead) is bound to,
+ * so a cross-agent (isolated) subagent it spawns can be bound to the same ticket
+ * container. Tries the requester's own session-key binding first; falls back to
+ * the single active bound issue when exactly one exists (mirrors how the lead's
+ * own container resolves — safe while tickets run one lead at a time).
+ * @param requesterSessionKey - the spawn requester's session key (may be absent)
+ * @returns the bound issue identifier, or null when it cannot be resolved
+ */
+export function resolveRequesterIssueIdentifier(requesterSessionKey?: string): string | null {
+  if (requesterSessionKey && agentRunIssueBySession.has(requesterSessionKey)) {
+    return agentRunIssueBySession.get(requesterSessionKey)!;
+  }
+  const identifiers = new Set(agentRunIssueBySession.values());
+  return identifiers.size === 1 ? identifiers.values().next().value ?? null : null;
+}
+
 /** Resolve a trusted tool context to its explicitly-bound issue identifier. */
 export function getIssueIdentifierForAgentRun(
   sessionId?: string,

@@ -17,6 +17,8 @@ import {
   _resetAffinityForTesting,
   bindAgentRunToIssue,
   unbindAgentRunFromIssue,
+  unbindAgentRunSession,
+  resolveRequesterIssueIdentifier,
   getIssueIdentifierForAgentRun,
   type ActiveSession,
 } from "./active-session.js";
@@ -123,6 +125,26 @@ describe("embedded agent run bindings", () => {
     bindAgentRunToIssue("review-b", "warden", "CORE-2");
     expect(getIssueIdentifierForAgentRun(undefined, undefined, "warden")).toBeNull();
     expect(getIssueIdentifierForAgentRun("review-b", undefined, "warden")).toBe("CORE-2");
+  });
+
+  it("unbinds a spawned subagent session without knowing its agent id", () => {
+    bindAgentRunToIssue("child-xyz", "spine", "CORE-9");
+    expect(getIssueIdentifierForAgentRun("child-xyz", undefined, "spine")).toBe("CORE-9");
+    unbindAgentRunSession("child-xyz");
+    expect(getIssueIdentifierForAgentRun("child-xyz", undefined, undefined)).toBeNull();
+    expect(getIssueIdentifierForAgentRun(undefined, undefined, "spine")).toBeNull();
+  });
+
+  it("resolves the requester's issue for binding an isolated subagent", () => {
+    // A single active coding lead → the sole bound issue is unambiguous.
+    bindAgentRunToIssue("linear-impl-CORE-42", "apex", "CORE-42");
+    expect(resolveRequesterIssueIdentifier("linear-impl-CORE-42")).toBe("CORE-42");
+    // Requester key unknown but only one issue bound → single-active fallback.
+    expect(resolveRequesterIssueIdentifier("some-other-key")).toBe("CORE-42");
+    // Two concurrent leads → refuse to guess unless the requester key matches.
+    bindAgentRunToIssue("linear-impl-CORE-43", "apex", "CORE-43");
+    expect(resolveRequesterIssueIdentifier("mystery")).toBeNull();
+    expect(resolveRequesterIssueIdentifier("linear-impl-CORE-43")).toBe("CORE-43");
   });
 });
 

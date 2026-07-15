@@ -19,8 +19,20 @@ import { registerDispatchCommands } from "./src/infra/commands.js";
 import { createDispatchHistoryTool } from "./src/tools/dispatch-history-tool.js";
 import { readDispatchState as readStateForHook, listActiveDispatches as listActiveForHook } from "./src/pipeline/dispatch-state.js";
 import { startTokenRefreshTimer, stopTokenRefreshTimer } from "./src/infra/token-refresh-timer.js";
-import { reapExpiredContainers, CONTAINER_TTL_MS } from "./src/infra/container-runner.js";
+import { reapExpiredContainers, CONTAINER_TTL_MS, repoWorkdir } from "./src/infra/container-runner.js";
+import { bindAgentRunToIssue, unbindAgentRunSession, resolveRequesterIssueIdentifier } from "./src/pipeline/active-session.js";
+import { getContainerRecord } from "./src/infra/container-registry.js";
+import { resolveRole } from "./src/pipeline/roles.js";
+import { buildWorkspacePrompt } from "./src/pipeline/workspace-prompt.js";
 let containerReaperTimer;
+/**
+ * Cross-agent (isolated) subagents spawned by a coding lead: child session key →
+ * { issue identifier, target agent id }. Populated on subagent_spawned so the
+ * child's before_prompt_build can inject the ticket's container briefing (it
+ * starts with a fresh context and no orchestrator-supplied workspace prompt);
+ * cleared on subagent_ended.
+ */
+const spawnedSubagentIssue = new Map();
 /**
  * Start the container reaper: an immediate sweep plus every 30 min, removing
  * per-issue containers past their TTL (default 24h). Persistent containers keep
@@ -242,10 +254,51 @@ export default function register(api) {
             await escalateDispatchError(sessionKey, err, "agent_end");
         }
     });
+    // subagent_spawned — a coding lead (apex) delegated to a specialist subagent.
+    // Cross-agent spawns MUST use context:"isolated", which gives the child a fresh
+    // session NOT bound to the ticket — so its container_* tools can't resolve the
+    // workspace. Bind the child run to the requester's issue here so the specialist
+    // operates on the SAME per-ticket container, and record it so the child's
+    // prompt build injects the container briefing.
+    api.on("subagent_spawned", async (event, ctx) => {
+        try {
+            const childSessionKey = event.childSessionKey ?? ctx?.childSessionKey ?? "";
+            const childAgentId = event.agentId ?? "";
+            if (!childSessionKey || !childAgentId)
+                return;
+            const identifier = resolveRequesterIssueIdentifier(ctx?.requesterSessionKey);
+            if (!identifier) {
+                api.logger.warn(`subagent_spawned: could not resolve the ticket for ${childAgentId} (${childSessionKey}); ` +
+                    "the subagent's container_* tools will not resolve a workspace");
+                return;
+            }
+            // Bind by session key (matches the child tool ctx.sessionKey) AND run id so
+            // the child resolves its container regardless of which id the ctx carries.
+            bindAgentRunToIssue(childSessionKey, childAgentId, identifier);
+            if (event.runId)
+                bindAgentRunToIssue(event.runId, childAgentId, identifier);
+            spawnedSubagentIssue.set(childSessionKey, { identifier, agentId: childAgentId });
+            if (event.runId)
+                spawnedSubagentIssue.set(event.runId, { identifier, agentId: childAgentId });
+            api.logger.info(`subagent_spawned: bound ${childAgentId} (${childSessionKey}) to ${identifier}`);
+        }
+        catch (err) {
+            api.logger.warn(`subagent_spawned hook error: ${err}`);
+        }
+    });
     // subagent_ended — fires when a subagent session ends (proper lifecycle hook, new in 3.7)
     // This catches sessions_spawn sub-agents with structured outcome data.
     api.on("subagent_ended", async (event, ctx) => {
         const sessionKey = event.targetSessionKey ?? ctx?.childSessionKey ?? "";
+        // Release any ticket-container binding created at spawn (cross-agent subagent).
+        if (sessionKey) {
+            unbindAgentRunSession(sessionKey);
+            spawnedSubagentIssue.delete(sessionKey);
+        }
+        if (event.runId) {
+            unbindAgentRunSession(event.runId);
+            spawnedSubagentIssue.delete(event.runId);
+        }
         if (!sessionKey)
             return;
         try {
@@ -330,11 +383,23 @@ export default function register(api) {
             // Never block reset
         }
     });
-    api.logger.info("Dispatch lifecycle hooks registered: agent_end, subagent_ended, session_start, session_end, after_compaction, before_reset");
-    // Inject recent dispatch history as context for worker/audit agents.
+    api.logger.info("Dispatch lifecycle hooks registered: agent_end, subagent_spawned, subagent_ended, session_start, session_end, after_compaction, before_reset");
+    // Inject recent dispatch history as context for worker/audit agents, and the
+    // per-ticket container briefing for cross-agent (isolated) subagents.
     api.on("before_prompt_build", async (_event, ctx) => {
         try {
             const sessionKey = ctx?.sessionKey ?? "";
+            // Cross-agent subagent: brief it about the ticket container it's bound to.
+            // It started fresh (isolated), so it has no orchestrator workspace prompt.
+            const spawned = spawnedSubagentIssue.get(sessionKey) ?? spawnedSubagentIssue.get(ctx?.sessionId ?? "");
+            if (spawned) {
+                const rec = getContainerRecord(spawned.identifier);
+                const repos = (rec?.repos ?? []).map((r) => ({ name: r, workdir: repoWorkdir(r) }));
+                const briefing = buildWorkspacePrompt({ identifier: spawned.identifier, repos, kind: "plan-implement" });
+                const role = resolveRole(spawned.agentId);
+                const persona = role ? `You are ${role.label}, ${role.summary}\n\n` : "";
+                return { prependSystemContext: `${persona}${briefing}` };
+            }
             if (!sessionKey.startsWith("linear-worker-") && !sessionKey.startsWith("linear-audit-"))
                 return;
             const statePath = pluginConfig?.dispatchStatePath;

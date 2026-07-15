@@ -449,11 +449,15 @@ async function runContainerImplement(
     workspace,
     "",
     "## Leading this implementation",
-    "Scope the change, then DELEGATE each piece to the right specialist SUBAGENT in this same session via",
-    `sessions_spawn — do not write the code yourself. Your subagents:`,
+    "Scope the change, then DELEGATE each piece to the right specialist SUBAGENT via sessions_spawn — do not write",
+    "the code yourself. Your subagents:",
     delegates ? `- ${delegates}` : "- (no subagents configured — implement directly via container_* tools)",
-    "Each subagent shares THIS container and may only mutate through the container_* tools (host is read-only),",
-    "so all their work lands in the same workspace. Give each a precise task and the repos/paths to touch.",
+    "Your specialists are DIFFERENT agents from you, so you MUST spawn each with `context: \"isolated\"`. Do NOT use",
+    "`context: \"fork\"` — fork only works for a same-agent spawn and will error for a specialist. Each isolated",
+    `subagent is automatically bound to THIS ticket's container (Linear ${issue.identifier}), shares your exact`,
+    "workspace, and — like you — may only mutate through the container_* tools (host is read-only), so every change",
+    "lands in the same repos. When you spawn one, name the ticket and give it a precise task plus the repos/paths to",
+    "touch; it starts fresh, so include the context it needs. Wait for each subagent before reviewing its work.",
     "After they finish, VERIFY by running the project's build/tests via container_exec, and make sure every",
     `change is committed in each repo on branch \`${dispatch.branch}\` with this structured message:`,
     "",
@@ -649,7 +653,7 @@ async function runImplementPhase(
         body: `⚠️ ${lastReason} (attempt ${attempt + 1}/${limit + 1})`,
       });
       if (attempt < limit) continue;
-      return { success: false, reason: lastReason };
+      break; // budget spent — ship whatever is committed (self-review is advisory)
     }
 
     // No-change guard: never review an untouched workspace, even when an agent
@@ -670,7 +674,7 @@ async function runImplementPhase(
         }
         continue; // give rework a shot before giving up
       }
-      return { success: false, reason: `no changes produced — ${lastReason}` };
+      break; // budget spent — shipImplementation blocks only if nothing is committed
     }
     const newlyCommitted = repoStatuses.filter(
       ({ repo, status }) => beforeCommits.get(repo) !== status.lastCommit,
@@ -691,7 +695,7 @@ async function runImplementPhase(
         body: `⚠️ ${lastReason} (attempt ${attempt + 1}/${limit + 1})`,
       });
       if (attempt < limit) continue;
-      return { success: false, reason: lastReason };
+      break; // budget spent — ship the committed work; format is a code-review note
     }
     const requiresNewCommit =
       attempt > 0 ||
@@ -706,7 +710,7 @@ async function runImplementPhase(
         body: `⚠️ ${lastReason} (attempt ${attempt + 1}/${limit + 1})`,
       });
       if (attempt < limit) continue;
-      return { success: false, reason: lastReason };
+      break; // budget spent — ship the commits we do have rather than block
     }
 
     // Apex self-review — read-only, gates the phase.
@@ -738,17 +742,23 @@ async function runImplementPhase(
 
     lastReason = verdict.reason;
     lastReviewFindings = verdict.output.trim().slice(-12_000) || verdict.reason;
+    if (verdict.infrastructureFailure) {
+      // Self-review tooling broke — it's advisory, not a code verdict, so ship
+      // the committed work (a human code review remains the real gate) rather
+      // than block; don't attach the tooling error as a review finding.
+      emit(ctx, dispatch, {
+        type: "thought",
+        body: `⚙️ Apex self-review tooling failed (attempt ${attempt + 1}/${limit + 1}) — shipping for human code review: ${verdict.reason}`,
+      });
+      lastReviewFindings = "";
+      break;
+    }
     emit(ctx, dispatch, {
       type: "thought",
-      body: `🔁 Apex self-review failed (attempt ${attempt + 1}/${limit + 1}): ${verdict.reason}`,
+      body: attempt < limit
+        ? `🔁 Apex self-review found issues (attempt ${attempt + 1}/${limit + 1}) — fixing autonomously: ${verdict.reason}`
+        : `🚢 Apex self-review still has findings after ${limit + 1} attempt(s) — shipping for human code review: ${verdict.reason}`,
     });
-    if (verdict.infrastructureFailure) {
-      return {
-        success: false,
-        reason: verdict.reason,
-        details: lastReviewFindings,
-      };
-    }
     if (attempt < limit && !useContainerAgent) {
       // Legacy codex rework: re-task each implementer on the reviewer's findings.
       // (The container agent gets the findings via reworkNoteFrom(lastReason).)
@@ -759,11 +769,16 @@ async function runImplementPhase(
     }
   }
 
-  return {
-    success: false,
-    reason: lastReason || "implementation did not pass self-review",
-    details: lastReviewFindings || undefined,
-  };
+  // Attempt budget spent. Self-review is advisory — publish whatever valid
+  // committed work exists so a human code review can proceed, attaching any
+  // unresolved findings to the PR. Blocks only when nothing is committed.
+  return shipImplementation(
+    ctx,
+    dispatch,
+    issue,
+    lastReason || "implementation did not pass self-review",
+    lastReviewFindings,
+  );
 }
 
 /**
@@ -841,6 +856,7 @@ async function openPr(
   ctx: HookContext,
   dispatch: ActiveDispatch,
   issue: OrchIssue,
+  selfReviewNote?: string,
 ): Promise<PhaseResult> {
   const repos = dispatch.containerRepos ?? [];
   if (!dispatch.containerName || !repos.length) {
@@ -849,7 +865,12 @@ async function openPr(
   }
   const opened: string[] = [];
   const failures: string[] = [];
-  const body = `Implements ${issue.identifier}.\n\n_Opened by the state-driven agent pipeline (Apex → implementers → self-review)._`;
+  const note = selfReviewNote?.trim();
+  const flagged = note
+    ? `> ⚠️ **Unresolved self-review findings** — the autonomous fix loop did not fully clear these; ` +
+      `flagged here for code review:\n>\n${note.split("\n").map((line) => `> ${line}`).join("\n")}\n\n`
+    : "";
+  const body = `Implements ${issue.identifier}.\n\n${flagged}_Opened by the state-driven agent pipeline (Apex → implementers → self-review)._`;
   for (const repo of repos) {
     try {
       const status = containerGitStatus(dispatch.containerName, repo);
@@ -871,7 +892,10 @@ async function openPr(
     }
   }
   if (opened.length) {
-    await comment(ctx, dispatch, `## ✅ Implementation complete\n\nPR(s):\n${opened.map((o) => `- ${o}`).join("\n")}`);
+    const caveat = note
+      ? `\n\n> ⚠️ Shipped with unresolved self-review findings (carried on the PR for code review):\n> ${note.split("\n").join("\n> ")}`
+      : "";
+    await comment(ctx, dispatch, `## ✅ Implementation complete\n\nPR(s):\n${opened.map((o) => `- ${o}`).join("\n")}${caveat}`);
     if (!failures.length) return { success: true };
   }
   if (failures.length) {
@@ -884,6 +908,52 @@ async function openPr(
   ctx.api.logger.warn(`[orchestrator] ${issue.identifier} no pull request URL was produced`);
   emit(ctx, dispatch, { type: "thought", body: "No pull request URL was produced for the committed changes." });
   return { success: false, reason: "committed changes were not published to a pull request" };
+}
+
+/**
+ * Publish the committed implementation to a PR once the attempt budget is spent,
+ * REGARDLESS of the self-review verdict. Self-review is advisory: it drives the
+ * autonomous fix loop within the budget, but must never block shipping — a human
+ * code review is the real gate. Any unresolved findings ride along on the PR.
+ * Blocks only when there is genuinely nothing committed to publish.
+ * @param ctx - hook context
+ * @param dispatch - the active dispatch
+ * @param issue - the issue context
+ * @param reason - the last blocking reason (self-review or commit-hygiene)
+ * @param findings - unresolved self-review findings to attach to the PR
+ * @returns the publication result
+ */
+async function shipImplementation(
+  ctx: HookContext,
+  dispatch: ActiveDispatch,
+  issue: OrchIssue,
+  reason: string,
+  findings: string,
+): Promise<PhaseResult> {
+  let repoStatuses: Array<{ repo: string; status: ContainerGitStatus }>;
+  try {
+    repoStatuses = readRepoStatuses(dispatch);
+  } catch (err) {
+    return { success: false, reason: `could not verify committed implementation output: ${err}` };
+  }
+  // Only committed work is shippable — a PR needs commits ahead of base.
+  if (!repoStatuses.some(({ status }) => status.commitsAhead > 0)) {
+    return {
+      success: false,
+      reason: reason || "implementation produced no committed changes to publish",
+      details: findings || undefined,
+    };
+  }
+  // Only real self-review findings ride along as a PR note; commit-hygiene
+  // reasons are operational, not code review, so they never become a note.
+  const note = findings.trim();
+  if (note) {
+    emit(ctx, dispatch, {
+      type: "thought",
+      body: "🚢 Self-review still has open findings — shipping anyway; the PR carries them for code review.",
+    });
+  }
+  return openPr(ctx, dispatch, issue, note || undefined);
 }
 
 // ---------------------------------------------------------------------------
