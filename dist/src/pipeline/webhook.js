@@ -85,6 +85,81 @@ const pauseGenerations = new Map();
  * created webhook; delegation sessions are passed directly to handleDispatch.
  */
 const linearSessionByIssue = new Map();
+// Linear normally creates an AgentSession after delegation, but Developer
+// Preview delivery is not reliable enough to make that an unconditional
+// assumption. Keep one delayed reconciliation per issue so duplicate
+// Issue.update webhooks cannot create duplicate sessions.
+const pendingDelegationSessionChecks = new Map();
+const DEFAULT_DELEGATION_SESSION_GRACE_MS = 3_000;
+function clearPendingDelegationSessionCheck(issueId) {
+    const pending = pendingDelegationSessionChecks.get(issueId);
+    if (!pending)
+        return false;
+    clearTimeout(pending.timer);
+    pendingDelegationSessionChecks.delete(issueId);
+    return true;
+}
+function scheduleDelegationSessionReconciliation(api, linearApi, issue, delegatedAtMs, pluginConfig) {
+    if (pendingDelegationSessionChecks.has(issue.id)) {
+        api.logger.info(`Issue ${issue.identifier ?? issue.id}: delegation session reconciliation already scheduled`);
+        return;
+    }
+    const configuredGraceMs = pluginConfig?.delegationSessionGraceMs;
+    const graceMs = typeof configuredGraceMs === "number" && configuredGraceMs >= 0
+        ? configuredGraceMs
+        : DEFAULT_DELEGATION_SESSION_GRACE_MS;
+    const token = Symbol(issue.id);
+    const timer = setTimeout(() => {
+        void (async () => {
+            try {
+                const pending = pendingDelegationSessionChecks.get(issue.id);
+                if (!pending || pending.token !== token)
+                    return;
+                // The created webhook normally cancels this timer. Re-read Linear as a
+                // second race fence in case the session exists but its webhook is still
+                // in flight. A newly-created, non-complete session can precede the
+                // Issue.update webhook by a small amount, hence the two-second window.
+                const sessions = await linearApi.listAgentSessions(issue.id, { activityLimit: 1 });
+                const nativeSession = sessions.find((session) => {
+                    const createdAtMs = Date.parse(session.createdAt);
+                    if (!Number.isFinite(createdAtMs))
+                        return false;
+                    return createdAtMs >= delegatedAtMs ||
+                        (createdAtMs >= delegatedAtMs - 2_000 && session.status !== "complete");
+                });
+                if (nativeSession) {
+                    api.logger.info(`Issue ${issue.identifier ?? issue.id}: Linear session ${nativeSession.id} exists — fallback creation not needed`);
+                    return;
+                }
+                // A native created event may have arrived while listAgentSessions was
+                // running. Check the token again immediately before mutating Linear.
+                const current = pendingDelegationSessionChecks.get(issue.id);
+                if (!current || current.token !== token)
+                    return;
+                api.logger.warn(`Issue ${issue.identifier ?? issue.id}: Linear did not create an AgentSession after delegation — creating fallback session`);
+                const result = await linearApi.createSessionOnIssue(issue.id);
+                if (!result.sessionId) {
+                    api.logger.error(`Issue ${issue.identifier ?? issue.id}: fallback AgentSession creation failed: ${result.error ?? "no session ID returned"}`);
+                    return;
+                }
+                // Do not dispatch here. The resulting AgentSession.created webhook is
+                // still the sole work entry point and will bind the exact new session.
+                linearSessionByIssue.set(issue.id, result.sessionId);
+                api.logger.info(`Issue ${issue.identifier ?? issue.id}: created fallback AgentSession ${result.sessionId}; awaiting created webhook`);
+            }
+            catch (err) {
+                api.logger.error(`Issue ${issue.identifier ?? issue.id}: delegation session reconciliation failed: ${err}`);
+            }
+            finally {
+                const pending = pendingDelegationSessionChecks.get(issue.id);
+                if (pending?.token === token)
+                    pendingDelegationSessionChecks.delete(issue.id);
+            }
+        })();
+    }, graceMs);
+    timer.unref?.();
+    pendingDelegationSessionChecks.set(issue.id, { token, timer });
+}
 // Dedup: track recently processed keys to avoid double-handling.
 // Periodic sweep instead of O(n) scan on every call.
 // TTLs are configurable via pluginConfig (dedupTtlMs, dedupSweepIntervalMs).
@@ -117,6 +192,10 @@ function wasRecentlyProcessed(key) {
 }
 /** @internal — test-only; clears all in-memory dedup state. */
 export function _resetForTesting() {
+    for (const pending of pendingDelegationSessionChecks.values()) {
+        clearTimeout(pending.timer);
+    }
+    pendingDelegationSessionChecks.clear();
     activeRuns.clear();
     resumingRuns.clear();
     pausedIssues.clear();
@@ -344,6 +423,9 @@ export async function handleLinearWebhook(api, req, res) {
         if (!session?.id || !issue?.id) {
             api.logger.error("AgentSession.created missing session or issue data");
             return true;
+        }
+        if (clearPendingDelegationSessionCheck(issue.id)) {
+            api.logger.info(`AgentSession ${session.id}: native session arrived for ${issue.identifier ?? issue.id} — cancelled fallback creation`);
         }
         // Deduplicate only the exact session. Never deduplicate a fresh delegation
         // by issue id: each delegation owns a newly-created Linear session.
@@ -1370,7 +1452,8 @@ export async function handleLinearWebhook(api, req, res) {
         // corresponding AgentSessionEvent.created webhook is the sole work entry
         // point, guaranteeing that every run is bound to the new session rather
         // than racing this webhook and reusing an older awaiting-input session.
-        api.logger.info(`Issue ${trigger} to our app user (${appUserId}) — awaiting Linear's new AgentSession.created event`);
+        api.logger.info(`Issue ${trigger} to our app user (${appUserId}) — awaiting Linear's new AgentSession.created event with fallback reconciliation`);
+        scheduleDelegationSessionReconciliation(api, linearApi, issue, Date.now(), pluginConfig);
         return true;
     }
     // ── Issue.create — auto-triage new issues ───────────────────────

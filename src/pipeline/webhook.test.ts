@@ -2196,6 +2196,105 @@ describe("Issue.update dispatch flow", () => {
     expect(assessTierMock).not.toHaveBeenCalled();
   });
 
+  it("creates one fallback session when Linear omits the delegation session", async () => {
+    mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
+    mockLinearApiInstance.listAgentSessions.mockResolvedValue([]);
+    mockLinearApiInstance.createSessionOnIssue.mockResolvedValue({ sessionId: "sess-fallback" });
+
+    const payload = {
+      type: "Issue",
+      action: "update",
+      data: {
+        id: "issue-fallback-session",
+        identifier: "ENG-FALLBACK",
+        assigneeId: null,
+        delegateId: "viewer-1",
+      },
+      updatedFrom: { delegateId: null },
+    };
+
+    await postWebhook(payload, "/linear/webhook", { delegationSessionGraceMs: 10 });
+    await postWebhook(payload, "/linear/webhook", { delegationSessionGraceMs: 10 });
+
+    await vi.waitFor(() => {
+      expect(mockLinearApiInstance.createSessionOnIssue).toHaveBeenCalledOnce();
+    });
+    expect(mockLinearApiInstance.createSessionOnIssue).toHaveBeenCalledWith("issue-fallback-session");
+    expect(assessTierMock).not.toHaveBeenCalled();
+  });
+
+  it("cancels fallback creation when the native delegation session arrives", async () => {
+    mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: "issue-native-session",
+      identifier: "ENG-NATIVE",
+      title: "Native session",
+      description: "Use Linear's session",
+      state: { name: "In Progress", type: "started" },
+      team: { id: "team-1", key: "ENG" },
+      delegate: { id: "viewer-1", name: "Agent" },
+      labels: { nodes: [] },
+      comments: { nodes: [] },
+    });
+
+    await postWebhook({
+      type: "Issue",
+      action: "update",
+      data: {
+        id: "issue-native-session",
+        identifier: "ENG-NATIVE",
+        assigneeId: null,
+        delegateId: "viewer-1",
+      },
+      updatedFrom: { delegateId: null },
+    }, "/linear/webhook", { delegationSessionGraceMs: 50 });
+
+    const created = await postDelegationSession(
+      { id: "issue-native-session", identifier: "ENG-NATIVE", title: "Native session" },
+      { delegationSessionGraceMs: 50 },
+      "sess-native",
+      "viewer-1",
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const infoCalls = (created.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    expect(infoCalls.some((msg: string) => msg.includes("cancelled fallback creation"))).toBe(true);
+    expect(mockLinearApiInstance.createSessionOnIssue).not.toHaveBeenCalled();
+  });
+
+  it("does not create a fallback when a recent native session already exists", async () => {
+    mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
+    mockLinearApiInstance.listAgentSessions.mockResolvedValue([{
+      id: "sess-native-in-flight",
+      createdAt: new Date().toISOString(),
+      status: "pending",
+      summary: null,
+      plan: null,
+      url: null,
+      pullRequests: [],
+      activities: [],
+    }]);
+
+    await postWebhook({
+      type: "Issue",
+      action: "update",
+      data: {
+        id: "issue-native-in-flight",
+        identifier: "ENG-INFLIGHT",
+        assigneeId: null,
+        delegateId: "viewer-1",
+      },
+      updatedFrom: { delegateId: null },
+    }, "/linear/webhook", { delegationSessionGraceMs: 10 });
+
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(mockLinearApiInstance.listAgentSessions).toHaveBeenCalledWith(
+      "issue-native-in-flight",
+      { activityLimit: 1 },
+    );
+    expect(mockLinearApiInstance.createSessionOnIssue).not.toHaveBeenCalled();
+  });
+
   it("skips when no Linear access token for issue update", async () => {
     resolveLinearTokenMock.mockReturnValue({ accessToken: null, source: "none" });
 

@@ -49,6 +49,7 @@
       "githubOwner": { "type": "string", "description": "Default GitHub organization for repo entries that omit an explicit github owner/repo identity." },
       "repositorySource": { "type": "string", "enum": ["local", "github-app"], "description": "Repository source for ticket containers. 'github-app' discovers installed repositories and clones/pulls them directly with short-lived App tokens; 'local' retains the legacy read-only host mirror.", "default": "local" },
       "repositoryCatalogCacheSec": { "type": "number", "description": "Seconds to cache the GitHub App installation repository list before refreshing it.", "default": 300 },
+      "delegationSessionGraceMs": { "type": "number", "minimum": 0, "description": "Milliseconds to wait for Linear to create its native AgentSession after delegation before the plugin creates one through agentSessionCreateOnIssue.", "default": 3000 },
       "githubApps": {
         "type": "object",
         "additionalProperties": false,
