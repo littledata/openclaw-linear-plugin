@@ -357,9 +357,9 @@ describe("webhook scenario tests — full handler flows", () => {
       expect(activityCallsOfType("thought").length).toBeGreaterThan(0);
       expect(activityCallsOfType("response").length).toBeGreaterThan(0);
 
-      // Response delivered via emitActivity (session-first pattern),
-      // NOT via createComment — avoids duplicate visible messages.
-      expect(mockCreateComment).not.toHaveBeenCalled();
+      // Dual output: the answer is delivered via emitActivity (session) AND
+      // mirrored to an issue comment on success.
+      expect(mockCreateComment).toHaveBeenCalled();
 
       // Session lifecycle
       expect(mockSetActiveSession).toHaveBeenCalledWith(
@@ -368,7 +368,7 @@ describe("webhook scenario tests — full handler flows", () => {
       expect(mockClearActiveSession).toHaveBeenCalledWith("issue-1");
     });
 
-    it("created: does not mirror a failed session response onto the issue", async () => {
+    it("created: still delivers the answer as a comment when session emit fails", async () => {
       // Make the response emitActivity fail.
       let emitCallCount = 0;
       mockEmitActivity.mockImplementation(async (_sessionId: string, content: any) => {
@@ -388,7 +388,8 @@ describe("webhook scenario tests — full handler flows", () => {
       // runAgent was called
       expect(mockRunAgent).toHaveBeenCalledOnce();
 
-      expect(mockCreateComment).not.toHaveBeenCalled();
+      // Dual output on success: the comment lands even though the session emit failed.
+      expect(mockCreateComment).toHaveBeenCalled();
     });
 
     it("prompted: processes follow-up, delivers via emitActivity", async () => {
@@ -403,9 +404,9 @@ describe("webhook scenario tests — full handler flows", () => {
       const msg = mockRunAgent.mock.calls[0][0].message;
       expect(msg).toContain("Follow-up question here");
 
-      // Response via emitActivity, not createComment
+      // Dual output: response via emitActivity (session) AND mirrored to a comment.
       expect(activityCallsOfType("response").length).toBeGreaterThan(0);
-      expect(mockCreateComment).not.toHaveBeenCalled();
+      expect(mockCreateComment).toHaveBeenCalled();
       expect(mockClearActiveSession).toHaveBeenCalledWith("issue-1");
     });
 

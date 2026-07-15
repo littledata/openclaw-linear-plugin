@@ -439,6 +439,12 @@ async function runEmbedded(
   const pluginConfig = api.pluginConfig as Record<string, unknown> | undefined;
   const codexHarnessEnabled = isCodexHarnessSteeringEnabled(pluginConfig);
   const configuredCodexModel = pluginConfig?.codexHarnessModel;
+  // Reasoning-summary streaming level for the embedded run (see runEmbeddedPiAgent
+  // call). Default "stream" so the agent's thinking reaches Linear live.
+  const reasoningLevel: "off" | "on" | "stream" =
+    pluginConfig?.reasoningLevel === "off" || pluginConfig?.reasoningLevel === "on"
+      ? pluginConfig.reasoningLevel
+      : "stream";
   if (codexHarnessEnabled && typeof configuredCodexModel === "string" && configuredCodexModel.trim()) {
     const normalized = configuredCodexModel.trim();
     const separator = normalized.indexOf("/");
@@ -588,6 +594,12 @@ async function runEmbedded(
       // rejected with "missing scope: operator.write". Inert for read-only
       // reviewers (their tool policy denies sessions_spawn anyway).
       allowGatewaySubagentBinding: true,
+      // Stream the model's reasoning summaries so onReasoningStream fires and we
+      // can surface the agent's THINKING to Linear as `thought` activities. Codex
+      // coding models emit almost no assistant prose (assistantTexts is empty),
+      // so without this the session shows only tool cards. Config-overridable;
+      // defaults to "stream" (vs "off"/"on") for live thinking.
+      reasoningLevel,
       timeoutMs,
       config,
       provider,

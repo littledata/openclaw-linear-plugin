@@ -223,6 +223,9 @@
       "autoRegisterAgents": { "type": "boolean", "description": "Register provisioned agents in agents.list during provisioning.", "default": true },
       "codingLeadAgentId": { "type": "string", "description": "Agent id that leads the coding phase and delegates to implementer subagents.", "default": "apex" },
       "planApprovalGate": { "type": "boolean", "description": "Pause after Apex plans and require user approval before implementing.", "default": true },
+      "reasoningLevel": { "type": "string", "enum": ["off", "on", "stream"], "description": "How the agent's reasoning summaries are surfaced to Linear. \"stream\" (default) shows live thinking as thought activities; \"off\" hides it.", "default": "stream" },
+      "coding": { "type": "object", "additionalProperties": true, "description": "Coding capability (delegation/assignment -> specialist pipeline). Set enabled:false on a conversational-only profile.", "properties": { "enabled": { "type": "boolean", "description": "Whether this profile runs the coding pipeline. Default true.", "default": true } } },
+      "conversational": { "type": "object", "additionalProperties": true, "description": "Conversational capability (@mention -> agent-session reply). Set enabled:false on a coding-only profile.", "properties": { "enabled": { "type": "boolean", "description": "Whether this profile replies to @mentions. Default true.", "default": true }, "agentId": { "type": "string", "description": "Agent id that answers mentions (defaults to the plugin default agent)." }, "commentReply": { "type": "boolean", "description": "Also mirror the final answer to an inline issue comment, not just the session response. Default true.", "default": true } } },
       "orchestratorPublishesReviews": { "type": "boolean", "description": "Force the orchestrator to publish the review bundle even when reviewers self-publish (embedded path).", "default": false }
     }
   }

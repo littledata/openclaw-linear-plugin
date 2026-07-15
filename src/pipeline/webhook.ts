@@ -6,6 +6,7 @@ import { LinearAgentApi, resolveLinearToken } from "../api/linear-api.js";
 import { buildProjectContext, type HookContext } from "./pipeline.js";
 import { setActiveSession, clearActiveSession, getActiveSession, getIssueAffinity, _configureAffinityTtl, _resetAffinityForTesting } from "./active-session.js";
 import { readDispatchState, getActiveDispatch, registerDispatch, updateDispatchStatus, updateDispatchProgress, completeDispatch, removeActiveDispatch, type ActiveDispatch } from "./dispatch-state.js";
+import { codingEnabled, conversationalEnabled, conversationalCommentReply } from "./mode-config.js";
 import { createManagedFlowForDispatch } from "./taskflow-bridge.js";
 import { createNotifierFromConfig, type NotifyFn } from "../infra/notify.js";
 import { assessTier } from "./tier-assess.js";
@@ -821,6 +822,17 @@ export async function handleLinearWebhook(
       `Respond within the scope defined above. Be concise and action-oriented.`,
     ].filter(Boolean).join("\n");
 
+    // Capability gate: conversational replies may be disabled on this profile
+    // (a coding-only agent). Close the session cleanly rather than reply.
+    if (!conversationalEnabled(pluginConfig)) {
+      api.logger.info(`AgentSession ${session.id}: conversational disabled — not replying to ${issueRef}`);
+      await linearApi.emitActivity(session.id, {
+        type: "response",
+        body: "This agent handles delegated work here and doesn't reply to mentions. Assign an issue to me to start.",
+      }).catch(() => {});
+      return true;
+    }
+
     // Run agent directly (non-blocking)
     activeRuns.add(issue.id);
     void (async () => {
@@ -866,8 +878,9 @@ export async function handleLinearWebhook(
           ? result.output
           : `Something went wrong while processing this. The system will retry automatically if possible. If this keeps happening, run \`openclaw openclaw-linear doctor\` to check for issues.`;
 
-        // Agent-session invocations communicate only through their session.
-        // Linear renders these activities in the session thread itself.
+        // Deliver the answer to BOTH surfaces: the AgentSession response (rich
+        // session thread) AND an inline issue comment, so the reply is visible
+        // in the session and in the normal comment thread (config-toggleable).
         const labeledResponse = `**[${label}]** ${responseBody}`;
         await linearApi.emitActivity(session.id, {
           type: "response",
@@ -875,6 +888,14 @@ export async function handleLinearWebhook(
         }).catch((err) => {
           api.logger.warn(`Could not emit response in AgentSession ${session.id}: ${err}`);
         });
+        // Mirror only real answers (success) — never spam a generic failure
+        // message into the issue's comment thread.
+        if (result.success && conversationalCommentReply(pluginConfig as Record<string, unknown> | undefined)) {
+          const avatarUrl = profiles[agentId]?.avatarUrl;
+          const agentOpts = avatarUrl ? { createAsUser: label, displayIconUrl: avatarUrl } : undefined;
+          await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts)
+            .catch((err) => api.logger.warn(`Could not post comment reply for ${session.id}: ${err}`));
+        }
 
         api.logger.info(`Posted agent response to ${enrichedIssue?.identifier ?? issue.id} (session ${session.id})`);
       } catch (err) {
@@ -1185,6 +1206,16 @@ export async function handleLinearWebhook(
 
     api.logger.info(`AgentSession prompted (follow-up): ${session.id} issue=${issue?.identifier ?? issue?.id} agent=${agentId} message="${userMessage.slice(0, 80)}..."`);
 
+    // Capability gate: conversational replies may be disabled on this profile.
+    if (!conversationalEnabled(pluginConfig)) {
+      api.logger.info(`AgentSession prompted ${session.id}: conversational disabled — not replying to ${issue?.identifier ?? issue?.id}`);
+      await linearApi.emitActivity(session.id, {
+        type: "response",
+        body: "This agent handles delegated work here and doesn't reply to mentions.",
+      }).catch(() => {});
+      return true;
+    }
+
     // Run agent for follow-up (non-blocking)
     activeRuns.add(issue.id);
     void (async () => {
@@ -1336,19 +1367,24 @@ export async function handleLinearWebhook(
           ? result.output
           : `Something went wrong while processing this. The system will retry automatically if possible. If this keeps happening, run \`openclaw openclaw-linear doctor\` to check for issues.`;
 
-        // Emit response via session (preferred). Fall back to comment if it fails.
+        // Deliver to BOTH the session response and an inline comment. If the
+        // session emit fails, the comment still lands (and vice-versa).
         const labeledResponse = `**[${label}]** ${responseBody}`;
         const emitted = await linearApi.emitActivity(session.id, {
           type: "response",
           body: labeledResponse,
         }).then(() => true).catch(() => false);
 
-        if (!emitted) {
+        // Mirror successful answers to a comment (dual output). Also fall back to
+        // a comment if the session emit failed, so the reply isn't lost. Never
+        // mirror a generic failure message on a clean session.
+        if ((result.success && conversationalCommentReply(pluginConfig as Record<string, unknown> | undefined)) || !emitted) {
           const avatarUrl = profiles[agentId]?.avatarUrl;
           const agentOpts = avatarUrl
             ? { createAsUser: label, displayIconUrl: avatarUrl }
             : undefined;
-          await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts);
+          await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts)
+            .catch((err) => api.logger.warn(`Could not post comment reply for ${session.id}: ${err}`));
         }
 
         api.logger.info(`Posted follow-up response to ${enrichedIssue?.identifier ?? issue.id} (session ${session.id})`);
@@ -2458,6 +2494,19 @@ async function handleDispatch(
   const worktreeBaseDir = pluginConfig?.worktreeBaseDir as string | undefined;
   const baseRepo = (pluginConfig?.codexBaseRepo as string) ?? join(process.env.HOME ?? homedir(), "ai-workspace");
   const identifier = issue.identifier ?? issue.id;
+
+  // Capability gate: this profile may be conversational-only (coding disabled).
+  // Ignore delegation/assignment-driven dispatch entirely on such profiles.
+  if (!codingEnabled(pluginConfig)) {
+    api.logger.info(`@dispatch: coding disabled on this profile — ignoring dispatch for ${identifier}`);
+    if (opts?.existingSessionId) {
+      await linearApi.emitActivity(opts.existingSessionId, {
+        type: "response",
+        body: "This agent isn't configured for coding work here. Mention me with a question instead.",
+      }).catch(() => {});
+    }
+    return;
+  }
 
   api.logger.info(`@dispatch: processing ${identifier}`);
 

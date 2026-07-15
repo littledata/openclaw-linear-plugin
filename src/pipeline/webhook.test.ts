@@ -900,7 +900,9 @@ describe("AgentSessionEvent.created full flow", () => {
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(runAgentMock).toHaveBeenCalled();
     expect(assessTierMock).not.toHaveBeenCalled();
-    expect(mockLinearApiInstance.createComment).not.toHaveBeenCalled();
+    // Conversational replies are now mirrored to an issue comment (dual output),
+    // in addition to the session response.
+    expect(mockLinearApiInstance.createComment).toHaveBeenCalled();
   });
 
   it("resolves agent, fetches issue details, and runs agent for valid session", async () => {
@@ -1031,7 +1033,7 @@ describe("AgentSessionEvent.created full flow", () => {
     expect(clearActiveSessionMock).toHaveBeenCalledWith("issue-err");
   });
 
-  it("does not create an issue comment when session response emission fails", async () => {
+  it("still delivers the answer as a comment when session response emission fails", async () => {
     // emitActivity fails for 'response' type but succeeds for 'thought'
     mockLinearApiInstance.emitActivity
       .mockImplementation((_sessionId: string, content: any) => {
@@ -1051,7 +1053,9 @@ describe("AgentSessionEvent.created full flow", () => {
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 100));
-    expect(mockLinearApiInstance.createComment).not.toHaveBeenCalled();
+    // Dual output: a successful answer is mirrored to a comment, so a failed
+    // session emit never loses the reply.
+    expect(mockLinearApiInstance.createComment).toHaveBeenCalled();
   });
 
   it("posts failure message when agent returns success=false", async () => {
@@ -3601,7 +3605,7 @@ describe("AgentSession.created .catch callbacks", () => {
     expect(agentCall.message).toContain("Full access");
   });
 
-  it("does not mirror a failed session response onto the issue", async () => {
+  it("mirrors a successful answer to a comment even without an avatar identity", async () => {
     // Set profiles with no avatarUrl
     loadAgentProfilesMock.mockReturnValue({
       mal: { label: "Mal", mission: "captain", mentionAliases: ["mal"], isDefault: true },
@@ -3624,7 +3628,9 @@ describe("AgentSession.created .catch callbacks", () => {
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 150));
-    expect(mockLinearApiInstance.createComment).not.toHaveBeenCalled();
+    // Dual output: without an avatar the comment posts as a labeled fallback,
+    // but the answer still lands on the issue.
+    expect(mockLinearApiInstance.createComment).toHaveBeenCalled();
   });
 
   it("covers getIssueDetails failure in created handler", async () => {
@@ -5435,7 +5441,7 @@ describe("plan_finalize approval error paths", () => {
 // ---------------------------------------------------------------------------
 
 describe("session response failures", () => {
-  it("does not fall back to an issue comment when no agentOpts are available", async () => {
+  it("mirrors the answer to a labeled comment when no agentOpts are available", async () => {
     loadAgentProfilesMock.mockReturnValue({
       mal: { label: "Mal", mission: "captain", mentionAliases: ["mal"], isDefault: true },
     });
@@ -5456,7 +5462,9 @@ describe("session response failures", () => {
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 150));
-    expect(mockLinearApiInstance.createComment).not.toHaveBeenCalled();
+    // Dual output on success: the answer is mirrored to a comment (labeled,
+    // since there's no avatar identity to post as).
+    expect(mockLinearApiInstance.createComment).toHaveBeenCalled();
   });
 });
 
