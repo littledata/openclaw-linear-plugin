@@ -616,6 +616,23 @@ async function runEmbedded(
         watchdog.tick();
         const { stream, data } = evt;
 
+        // The codex app-server harness delivers the agent's visible narration as
+        // `stream:"assistant"` events (NOT via onPartialReply/onBlockReply), so
+        // buffer that text here. flushAssistantCommentary() emits it as a Linear
+        // `thought` when the next tool starts; the final answer has no tool after
+        // it, so it stays unflushed and is never duplicated.
+        if (stream === "assistant") {
+          const delta = typeof data.delta === "string" ? data.delta : "";
+          const full =
+            typeof data.text === "string" ? data.text
+            : typeof data.content === "string" ? data.content
+            : typeof data.message === "string" ? data.message
+            : "";
+          if (delta && !full) pendingAssistantCommentary += delta;
+          else if (full.trim()) pendingAssistantCommentary = full;
+          return;
+        }
+
         if (stream !== "tool") return;
 
         const phase = String(data.phase ?? "");

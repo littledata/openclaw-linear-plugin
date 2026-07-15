@@ -459,6 +459,46 @@ describe("embedded tool activity projection", () => {
     expect(runEmbeddedPiAgent.mock.calls[0][0]).not.toHaveProperty("agentHarnessRuntimeOverride");
   });
 
+  it("forwards codex app-server stream:\"assistant\" narration to Linear as a thought", async () => {
+    const api = createApi() as any;
+    const emitActivity = vi.fn().mockResolvedValue(undefined);
+    const runEmbeddedPiAgent = vi.fn().mockImplementation(async (opts: any) => {
+      // The codex app-server delivers the agent's narration as an `assistant`
+      // stream event — NOT via onPartialReply/onBlockReply.
+      opts.onAgentEvent({
+        stream: "assistant",
+        data: { text: "I'm checking the ticket's current branch and prior changes first." },
+      });
+      opts.onAgentEvent({
+        stream: "tool",
+        data: { phase: "start", name: "container_exec", toolCallId: "c1", args: { command: "git status" } },
+      });
+      opts.onAgentEvent({
+        stream: "tool",
+        data: { phase: "result", name: "container_exec", toolCallId: "c1", isError: false },
+      });
+      return { payloads: [{ text: "done" }], meta: { durationMs: 5 } };
+    });
+    api.runtime.agent = { defaults: { provider: "openrouter", model: "test-model" }, runEmbeddedPiAgent };
+
+    await runAgent({
+      api,
+      agentId: "apex",
+      sessionId: "linear-impl-CORE-9",
+      issueIdentifier: "CORE-9",
+      message: "implement",
+      streaming: { linearApi: { emitActivity } as any, agentSessionId: "linear-session" },
+    });
+
+    // The assistant narration is emitted as a thought BEFORE the tool card.
+    expect(emitActivity).toHaveBeenNthCalledWith(
+      1,
+      "linear-session",
+      { type: "thought", body: "I'm checking the ticket's current branch and prior changes first." },
+      undefined,
+    );
+  });
+
   it("pretty-prints JSON and caps oversized values", () => {
     expect(formatToolActivityValue('{"a":1}', 100)).toBe('{\n  "a": 1\n}');
     expect(formatToolActivityValue("abcdefgh", 4)).toContain("abcd\n…(4 more characters)");
