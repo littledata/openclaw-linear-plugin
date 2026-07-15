@@ -107,6 +107,16 @@ export function buildWorkspacePrompt(opts: WorkspacePromptOptions): string {
     "all transitions. Start discovery with ONE bounded container_exec that batches git status/log, targeted rg,",
     "and small sed excerpts (keep output under ~20k chars); use container_search_code to orient when you don't",
     "know exact names. Do not fetch repository files through GitHub search/fetch tools — the container is authoritative.",
+    "",
+    "## Check for an existing PR FIRST",
+    "ALWAYS check whether this ticket/branch already has a pull request before you plan or change anything, and",
+    "READ it end to end — description, the review verdicts, and every inline review comment:",
+    "- `container_exec: gh pr list --head <this repo's branch> --state all` (or search by the ticket id) to find it",
+    "- `container_exec: gh pr view <number> --comments` for the body + conversation, and",
+    "- `container_exec: gh api repos/<owner>/<repo>/pulls/<number>/comments` for line-level review comments.",
+    "If the ticket came back from Code Review (Code Review → In Progress → reassigned), those review comments are",
+    "the reason it returned — treat them as REQUIREMENTS: your plan and changes MUST address every requested",
+    "change, and build on the existing PR branch rather than starting over.",
   ];
 
   if (opts.kind === "plan-implement") {

@@ -14,6 +14,16 @@ describe("buildWorkspacePrompt", () => {
     expect(p).toContain("api: /work/api");
   });
 
+  it("always tells the agent to find and read an existing PR + its review comments", () => {
+    for (const kind of ["plan-implement", "review", "qa"] as const) {
+      const p = buildWorkspacePrompt({ ...base, kind, reviewStyle: "comment" });
+      expect(p).toContain("Check for an existing PR FIRST");
+      expect(p).toContain("gh pr view");
+      expect(p).toContain("pulls/<number>/comments");
+      expect(p).toContain("Code Review → In Progress → reassigned");
+    }
+  });
+
   it("implement kind explains commit/verify and forbids push/PR", () => {
     const p = buildWorkspacePrompt({ ...base, kind: "plan-implement" });
     expect(p).toContain("## Implementing");
