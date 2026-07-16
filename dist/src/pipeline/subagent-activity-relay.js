@@ -9,6 +9,17 @@ const MESSAGE_DEDUPE_MS = 5 * 60_000;
 const MAX_DEDUPE_ENTRIES = 500;
 const MAX_COMPLETED_TOOL_IDS = 1_000;
 const PREAMBLE_QUIET_MS = 750;
+/** Create an isolated relay state store. */
+export function createSubagentActivityRelayState() {
+    return {
+        bindings: new Map(),
+        pendingTools: new Map(),
+        startedToolIds: new Set(),
+        completedToolIds: new Set(),
+        messageFingerprints: new Map(),
+        pendingPreambles: new Map(),
+    };
+}
 /** Extract only user-visible assistant text; thinking/reasoning blocks are excluded. */
 export function extractVisibleAssistantText(message) {
     if (!message || typeof message !== "object")
@@ -37,19 +48,26 @@ export function extractVisibleAssistantText(message) {
 export class SubagentActivityRelay {
     linearApi;
     logger;
-    bindings = new Map();
-    pendingTools = new Map();
-    startedToolIds = new Set();
-    completedToolIds = new Set();
-    messageFingerprints = new Map();
-    pendingPreambles = new Map();
+    bindings;
+    pendingTools;
+    startedToolIds;
+    completedToolIds;
+    messageFingerprints;
+    pendingPreambles;
     /**
      * @param linearApi - Linear activity API
      * @param logger - best-effort diagnostic logger
+     * @param state - shared runtime state; isolated by default for callers/tests
      */
-    constructor(linearApi, logger) {
+    constructor(linearApi, logger, state = createSubagentActivityRelayState()) {
         this.linearApi = linearApi;
         this.logger = logger;
+        this.bindings = state.bindings;
+        this.pendingTools = state.pendingTools;
+        this.startedToolIds = state.startedToolIds;
+        this.completedToolIds = state.completedToolIds;
+        this.messageFingerprints = state.messageFingerprints;
+        this.pendingPreambles = state.pendingPreambles;
     }
     /** Bind every known child identity (session key, session id, run id). */
     bind(keys, binding) {

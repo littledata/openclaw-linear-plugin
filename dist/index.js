@@ -23,12 +23,17 @@ import { reapExpiredContainers, CONTAINER_TTL_MS, repoWorkdir } from "./src/infr
 import { codingEnabled } from "./src/pipeline/mode-config.js";
 import { bindAgentRunToIssue, getActiveSessionByIdentifier, unbindAgentRunSession, resolveRequesterIssueIdentifier, } from "./src/pipeline/active-session.js";
 import { updateAssignmentStatus } from "./src/pipeline/agent-plan.js";
-import { SubagentActivityRelay } from "./src/pipeline/subagent-activity-relay.js";
+import { SubagentActivityRelay, createSubagentActivityRelayState, } from "./src/pipeline/subagent-activity-relay.js";
 import { getContainerRecord } from "./src/infra/container-registry.js";
 import { resolveRole } from "./src/pipeline/roles.js";
 import { buildWorkspacePrompt } from "./src/pipeline/workspace-prompt.js";
 import { completeNativeSubagent, registerNativeSubagent, } from "./src/pipeline/native-subagent-batch.js";
 let containerReaperTimer;
+// Embedded/native agents initialise separate plugin runtimes inside the same
+// gateway process. Keep child-to-parent routing and dedupe state process-wide so
+// the runtime receiving child commentary can see the binding registered by the
+// parent's `subagent_spawned` hook.
+const sharedSubagentActivityState = createSubagentActivityRelayState();
 /**
  * Cross-agent (isolated) subagents spawned by a coding lead: child session key →
  * { issue identifier, target agent id }. Populated on subagent_spawned so the
@@ -111,7 +116,7 @@ export default function register(api) {
             refreshToken: tokenInfo.refreshToken,
             expiresAt: tokenInfo.expiresAt,
         })
-        : null, api.logger);
+        : null, api.logger, sharedSubagentActivityState);
     api.agent.events.registerAgentEventSubscription({
         id: "linear-subagent-activity",
         description: "Relay native specialist progress into the parent Linear AgentSession",

@@ -79,6 +79,33 @@ interface PendingPreamble {
   timer: ReturnType<typeof setTimeout>;
 }
 
+/**
+ * Mutable relay state shared by every plugin runtime in one gateway process.
+ * Native subagents initialise their own plugin runtime, while the parent
+ * runtime receives `subagent_spawned`; sharing this state lets the child
+ * runtime resolve the binding registered by its parent.
+ */
+export interface SubagentActivityRelayState {
+  bindings: Map<string, SubagentActivityBinding>;
+  pendingTools: Map<string, PendingTool>;
+  startedToolIds: Set<string>;
+  completedToolIds: Set<string>;
+  messageFingerprints: Map<string, number>;
+  pendingPreambles: Map<string, PendingPreamble>;
+}
+
+/** Create an isolated relay state store. */
+export function createSubagentActivityRelayState(): SubagentActivityRelayState {
+  return {
+    bindings: new Map(),
+    pendingTools: new Map(),
+    startedToolIds: new Set(),
+    completedToolIds: new Set(),
+    messageFingerprints: new Map(),
+    pendingPreambles: new Map(),
+  };
+}
+
 /** Extract only user-visible assistant text; thinking/reasoning blocks are excluded. */
 export function extractVisibleAssistantText(message: unknown): string[] {
   if (!message || typeof message !== "object") return [];
@@ -105,21 +132,30 @@ export function extractVisibleAssistantText(message: unknown): string[] {
  * Every method is best-effort: Linear telemetry must never block coding work.
  */
 export class SubagentActivityRelay {
-  private readonly bindings = new Map<string, SubagentActivityBinding>();
-  private readonly pendingTools = new Map<string, PendingTool>();
-  private readonly startedToolIds = new Set<string>();
-  private readonly completedToolIds = new Set<string>();
-  private readonly messageFingerprints = new Map<string, number>();
-  private readonly pendingPreambles = new Map<string, PendingPreamble>();
+  private readonly bindings: Map<string, SubagentActivityBinding>;
+  private readonly pendingTools: Map<string, PendingTool>;
+  private readonly startedToolIds: Set<string>;
+  private readonly completedToolIds: Set<string>;
+  private readonly messageFingerprints: Map<string, number>;
+  private readonly pendingPreambles: Map<string, PendingPreamble>;
 
   /**
    * @param linearApi - Linear activity API
    * @param logger - best-effort diagnostic logger
+   * @param state - shared runtime state; isolated by default for callers/tests
    */
   constructor(
     private readonly linearApi: SubagentActivityApi | null,
     private readonly logger?: { warn: (message: string) => void },
-  ) {}
+    state: SubagentActivityRelayState = createSubagentActivityRelayState(),
+  ) {
+    this.bindings = state.bindings;
+    this.pendingTools = state.pendingTools;
+    this.startedToolIds = state.startedToolIds;
+    this.completedToolIds = state.completedToolIds;
+    this.messageFingerprints = state.messageFingerprints;
+    this.pendingPreambles = state.pendingPreambles;
+  }
 
   /** Bind every known child identity (session key, session id, run id). */
   bind(keys: Array<string | undefined>, binding: SubagentActivityBinding): void {

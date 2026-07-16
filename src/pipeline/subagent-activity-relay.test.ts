@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  createSubagentActivityRelayState,
   extractVisibleAssistantText,
   SubagentActivityRelay,
 } from "./subagent-activity-relay.js";
@@ -43,6 +44,50 @@ describe("SubagentActivityRelay", () => {
       2,
       "linear-session",
       { type: "thought", body: "Spine — Finished the delegated work." },
+      undefined,
+    );
+  });
+
+  it("shares parent bindings with a separately initialised child plugin runtime", async () => {
+    const state = createSubagentActivityRelayState();
+    const parentEmitActivity = vi.fn().mockResolvedValue(undefined);
+    const childEmitActivity = vi.fn().mockResolvedValue(undefined);
+    const parentRelay = new SubagentActivityRelay(
+      { emitActivity: parentEmitActivity },
+      undefined,
+      state,
+    );
+    const childRelay = new SubagentActivityRelay(
+      { emitActivity: childEmitActivity },
+      undefined,
+      state,
+    );
+
+    parentRelay.bind(["child-session", "child-run"], {
+      issueIdentifier: "CORE-1747",
+      agentId: "spine",
+      agentLabel: "Spine",
+      agentSessionId: "linear-session",
+    });
+    await childRelay.agentEvent({
+      runId: "child-run",
+      sessionKey: "child-session",
+      stream: "item",
+      data: {
+        kind: "preamble",
+        itemId: "child-commentary",
+        progressText: "The repository audit is complete; running tests next.",
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 800));
+
+    expect(parentEmitActivity).not.toHaveBeenCalled();
+    expect(childEmitActivity).toHaveBeenCalledWith(
+      "linear-session",
+      {
+        type: "thought",
+        body: "Spine — The repository audit is complete; running tests next.",
+      },
       undefined,
     );
   });
