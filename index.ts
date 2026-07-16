@@ -125,6 +125,14 @@ export default function register(api: OpenClawPluginApi) {
       : null,
     api.logger,
   );
+  api.agent.events.registerAgentEventSubscription({
+    id: "linear-subagent-activity",
+    description: "Relay native specialist progress into the parent Linear AgentSession",
+    streams: ["tool", "item", "assistant"],
+    handle: async (event) => {
+      await subagentActivityRelay.agentEvent(event);
+    },
+  });
   if (!tokenInfo.accessToken) {
     api.logger.warn(
       "Linear: no access token found. Options: (1) run OAuth flow, (2) set LINEAR_ACCESS_TOKEN env var, " +

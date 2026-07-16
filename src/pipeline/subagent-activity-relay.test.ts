@@ -17,6 +17,145 @@ function createRelay() {
 }
 
 describe("SubagentActivityRelay", () => {
+  it("relays native Codex agent events before the child transcript is persisted", async () => {
+    const { relay, emitActivity } = createRelay();
+
+    await relay.agentEvent({
+      runId: "child-run",
+      sessionKey: "child-session",
+      stream: "tool",
+      data: {
+        phase: "start",
+        name: "container_search_code",
+        toolCallId: "native-call",
+        args: { query: "MetricEmitter" },
+      },
+    });
+    await relay.agentEvent({
+      runId: "child-run",
+      sessionKey: "child-session",
+      stream: "tool",
+      data: {
+        phase: "result",
+        name: "container_search_code",
+        toolCallId: "native-call",
+        result: { matches: ["src/metric.ts:1"] },
+      },
+    });
+
+    expect(emitActivity).toHaveBeenNthCalledWith(
+      1,
+      "linear-session",
+      {
+        type: "action",
+        action: "Search Code",
+        parameter: "Specialist: Spine\n\nMetricEmitter",
+      },
+      { ephemeral: true },
+    );
+    expect(emitActivity).toHaveBeenNthCalledWith(
+      2,
+      "linear-session",
+      expect.objectContaining({
+        type: "action",
+        action: "Search Code",
+        parameter: "Specialist: Spine\n\nMetricEmitter",
+      }),
+      undefined,
+    );
+  });
+
+  it("deduplicates a native tool event observed again through lifecycle hooks", async () => {
+    const { relay, emitActivity } = createRelay();
+    const event = {
+      toolName: "container_exec",
+      toolCallId: "same-call",
+      params: { command: "git status --short" },
+    };
+
+    await relay.agentEvent({
+      runId: "child-run",
+      stream: "tool",
+      data: {
+        phase: "start",
+        name: event.toolName,
+        toolCallId: event.toolCallId,
+        args: event.params,
+      },
+    });
+    await relay.toolStarted(event, { sessionKey: "child-session" });
+    await relay.agentEvent({
+      runId: "child-run",
+      stream: "tool",
+      data: {
+        phase: "result",
+        name: event.toolName,
+        toolCallId: event.toolCallId,
+        result: { stdout: "clean", exitCode: 0 },
+      },
+    });
+    await relay.toolFinished(
+      { ...event, result: { stdout: "clean", exitCode: 0 } },
+      { sessionKey: "child-session" },
+    );
+
+    expect(emitActivity).toHaveBeenCalledTimes(2);
+  });
+
+  it("coalesces visible Codex preamble updates into a specialist thought", async () => {
+    vi.useFakeTimers();
+    const { relay, emitActivity } = createRelay();
+
+    await relay.agentEvent({
+      runId: "child-run",
+      stream: "item",
+      data: {
+        kind: "preamble",
+        itemId: "message-1",
+        progressText: "Inspecting the",
+      },
+    });
+    await relay.agentEvent({
+      runId: "child-run",
+      stream: "item",
+      data: {
+        kind: "preamble",
+        itemId: "message-1",
+        progressText: "Inspecting the deployment files.",
+      },
+    });
+    await vi.advanceTimersByTimeAsync(750);
+
+    expect(emitActivity).toHaveBeenCalledTimes(1);
+    expect(emitActivity).toHaveBeenCalledWith(
+      "linear-session",
+      { type: "thought", body: "Spine — Inspecting the deployment files." },
+      undefined,
+    );
+    vi.useRealTimers();
+  });
+
+  it("relays only terminal assistant snapshots from the native stream", async () => {
+    const { relay, emitActivity } = createRelay();
+    await relay.agentEvent({
+      runId: "child-run",
+      stream: "assistant",
+      data: { text: "partial", delta: "partial" },
+    });
+    await relay.agentEvent({
+      runId: "child-run",
+      stream: "assistant",
+      data: { text: "Completed the infrastructure cleanup." },
+    });
+
+    expect(emitActivity).toHaveBeenCalledTimes(1);
+    expect(emitActivity).toHaveBeenCalledWith(
+      "linear-session",
+      { type: "thought", body: "Spine — Completed the infrastructure cleanup." },
+      undefined,
+    );
+  });
+
   it("relays a child container command as formatted start and completion cards", async () => {
     const { relay, emitActivity } = createRelay();
     await relay.toolStarted(
