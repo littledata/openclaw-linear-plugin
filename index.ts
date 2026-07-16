@@ -362,12 +362,15 @@ export default function register(api: OpenClawPluginApi) {
         agentSessionId = dispatch?.agentSessionId;
       }
       if (agentSessionId) {
-        subagentActivityRelay.bind([childSessionKey, event.runId], {
+        const activityBinding = {
           issueIdentifier: identifier,
           agentId: childAgentId,
           agentLabel: resolveRole(childAgentId)?.label ?? childAgentId,
           agentSessionId,
-        });
+        };
+        const childIdentities = [childSessionKey, event.runId];
+        subagentActivityRelay.bind(childIdentities, activityBinding);
+        await subagentActivityRelay.announceStarted(childIdentities);
       } else {
         api.logger.warn(
           `subagent_spawned: no parent Linear AgentSession found for ${childAgentId} on ${identifier}; ` +
@@ -395,6 +398,10 @@ export default function register(api: OpenClawPluginApi) {
         spawnInfo.agentId,
         event.outcome === "ok" ? "completed" : "canceled",
       ).catch((err) => api.logger.warn(`subagent_ended plan update error: ${err}`));
+      await subagentActivityRelay.announceFinished(
+        [sessionKey, event.runId],
+        event.outcome === "ok",
+      );
     }
     // Release any ticket-container binding created at spawn (cross-agent subagent).
     if (sessionKey) {
@@ -545,7 +552,13 @@ export default function register(api: OpenClawPluginApi) {
         const briefing = buildWorkspacePrompt({ identifier: spawned.identifier, repos, kind: "plan-implement" });
         const role = resolveRole(spawned.agentId);
         const persona = role ? `You are ${role.label}, ${role.summary}\n\n` : "";
-        return { prependSystemContext: `${persona}${briefing}` };
+        const progressVisibility = [
+          "LINEAR PROGRESS VISIBILITY: Your visible commentary is relayed live to the parent Linear AgentSession.",
+          "Before your first tool call, publish a short numbered plan for your delegated slice.",
+          "After every few tool batches, publish one concise progress update with the finding so far and next step.",
+          "Use visible commentary only; never expose private chain-of-thought or hidden reasoning.",
+        ].join(" ");
+        return { prependSystemContext: `${persona}${briefing}\n\n${progressVisibility}` };
       }
 
       if (!sessionKey.startsWith("linear-worker-") && !sessionKey.startsWith("linear-audit-")) return;

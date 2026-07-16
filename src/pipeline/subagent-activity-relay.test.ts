@@ -17,6 +17,36 @@ function createRelay() {
 }
 
 describe("SubagentActivityRelay", () => {
+  it("announces specialist start and finish as labelled thoughts", async () => {
+    const { relay, emitActivity } = createRelay();
+    relay.bind(["announcement-child"], {
+      issueIdentifier: "CORE-1747",
+      agentId: "spine",
+      agentLabel: "Spine",
+      agentSessionId: "linear-session",
+    });
+
+    await relay.announceStarted(["announcement-child"]);
+    await relay.announceFinished(["announcement-child"], true);
+
+    expect(emitActivity).toHaveBeenNthCalledWith(
+      1,
+      "linear-session",
+      {
+        type: "thought",
+        body:
+          "Spine — Started work in the CORE-1747 ticket workspace. Live progress and tool calls will appear here.",
+      },
+      undefined,
+    );
+    expect(emitActivity).toHaveBeenNthCalledWith(
+      2,
+      "linear-session",
+      { type: "thought", body: "Spine — Finished the delegated work." },
+      undefined,
+    );
+  });
+
   it("relays native Codex agent events before the child transcript is persisted", async () => {
     const { relay, emitActivity } = createRelay();
 

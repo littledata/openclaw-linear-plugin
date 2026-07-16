@@ -58,6 +58,20 @@ export class SubagentActivityRelay {
                 this.bindings.set(key, binding);
         }
     }
+    /** Announce that a bound specialist has started work in the shared ticket workspace. */
+    async announceStarted(identities) {
+        const binding = this.resolveBindingFromKeys(identities);
+        if (!binding)
+            return;
+        await this.emitAssistantText(binding, `Started work in the ${binding.issueIdentifier} ticket workspace. Live progress and tool calls will appear here.`);
+    }
+    /** Announce the terminal specialist lifecycle state before its routing keys are released. */
+    async announceFinished(identities, success) {
+        const binding = this.resolveBindingFromKeys(identities);
+        if (!binding)
+            return;
+        await this.emitAssistantText(binding, success ? "Finished the delegated work." : "Stopped before completing the delegated work.");
+    }
     /** Drop child identities and any pending tool records associated with them. */
     unbind(keys) {
         const bindings = new Set(keys.map((key) => (key ? this.bindings.get(key) : undefined)).filter(Boolean));
