@@ -30,6 +30,7 @@ import { optionsSignal } from "./select-signal.js";
 import { isCancelled, clearCancel } from "./cancellation.js";
 import { isCodexHarnessSteeringEnabled } from "../agent/codex-steering.js";
 import { createSessionPlan, getSessionPlan, disposeSessionPlan } from "./agent-plan.js";
+import { captureNativeSubagentGeneration, waitForNativeSubagentBatch, } from "./native-subagent-batch.js";
 /**
  * Deny list for the coding LEAD: host writes/exec/code-runners are blocked (all
  * mutation goes through container_* tools), but sessions_spawn/sessions_send
@@ -456,6 +457,7 @@ async function runContainerImplement(ctx, dispatch, issue, assignments, reworkNo
     // Run as the coding LEAD agent (default "apex") so its configured
     // subagents.allowAgents apply and it can delegate via sessions_spawn.
     const agentId = codingLeadAgentId(ctx.pluginConfig);
+    const subagentGeneration = captureNativeSubagentGeneration(dispatch.issueIdentifier);
     const r = await runAgent({
         api: ctx.api,
         agentId,
@@ -472,7 +474,28 @@ async function runContainerImplement(ctx, dispatch, issue, assignments, reworkNo
             : undefined,
         abortKey: dispatch.issueId,
     });
-    return { success: r.success, output: r.output };
+    const batch = await waitForNativeSubagentBatch(dispatch.issueIdentifier, subagentGeneration, {
+        timeoutMs: typeof ctx.pluginConfig?.subagentWaitTimeoutMs === "number"
+            ? ctx.pluginConfig.subagentWaitTimeoutMs
+            : undefined,
+        isCancelled: () => isCancelled(dispatch.issueId),
+    });
+    if (!batch.spawned)
+        return { success: r.success, output: r.output };
+    if (batch.cancelled) {
+        return { success: false, output: "Specialist batch was cancelled." };
+    }
+    if (batch.timedOut) {
+        return { success: false, output: "Timed out waiting for the delegated specialist batch." };
+    }
+    const failures = batch.outcomes.filter((entry) => entry.outcome !== "ok");
+    const specialistSummary = batch.outcomes
+        .map((entry) => `${entry.key}: ${entry.outcome}${entry.detail ? ` — ${entry.detail}` : ""}`)
+        .join("\n");
+    return {
+        success: r.success && failures.length === 0,
+        output: [r.output, specialistSummary].filter(Boolean).join("\n\n"),
+    };
 }
 async function runImplementPhase(ctx, dispatch, issue, resumeGuidance) {
     const limit = maxRework(ctx.pluginConfig);

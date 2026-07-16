@@ -33,6 +33,10 @@ import { SubagentActivityRelay } from "./src/pipeline/subagent-activity-relay.js
 import { getContainerRecord } from "./src/infra/container-registry.js";
 import { resolveRole } from "./src/pipeline/roles.js";
 import { buildWorkspacePrompt } from "./src/pipeline/workspace-prompt.js";
+import {
+  completeNativeSubagent,
+  registerNativeSubagent,
+} from "./src/pipeline/native-subagent-batch.js";
 
 let containerReaperTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -43,7 +47,10 @@ let containerReaperTimer: ReturnType<typeof setInterval> | undefined;
  * starts with a fresh context and no orchestrator-supplied workspace prompt);
  * cleared on subagent_ended.
  */
-const spawnedSubagentIssue = new Map<string, { identifier: string; agentId: string }>();
+const spawnedSubagentIssue = new Map<
+  string,
+  { identifier: string; agentId: string; childSessionKey: string }
+>();
 
 /**
  * Start the container reaper: an immediate sweep plus every 30 min, removing
@@ -348,8 +355,10 @@ export default function register(api: OpenClawPluginApi) {
       // the child resolves its container regardless of which id the ctx carries.
       bindAgentRunToIssue(childSessionKey, childAgentId, identifier);
       if (event.runId) bindAgentRunToIssue(event.runId, childAgentId, identifier);
-      spawnedSubagentIssue.set(childSessionKey, { identifier, agentId: childAgentId });
-      if (event.runId) spawnedSubagentIssue.set(event.runId, { identifier, agentId: childAgentId });
+      const spawnInfo = { identifier, agentId: childAgentId, childSessionKey };
+      spawnedSubagentIssue.set(childSessionKey, spawnInfo);
+      if (event.runId) spawnedSubagentIssue.set(event.runId, spawnInfo);
+      registerNativeSubagent(identifier, childSessionKey);
       // Child sessions do not inherit the parent's embedded-run streaming
       // callbacks. Retain the parent Linear AgentSession so gateway-level tool
       // and message hooks can relay the specialist's visible activity there.
@@ -393,6 +402,12 @@ export default function register(api: OpenClawPluginApi) {
     // binding is released (the map holds the ticket identifier + specialist id).
     const spawnInfo = spawnedSubagentIssue.get(sessionKey) ?? (event.runId ? spawnedSubagentIssue.get(event.runId) : undefined);
     if (spawnInfo) {
+      completeNativeSubagent(
+        spawnInfo.identifier,
+        spawnInfo.childSessionKey,
+        event.outcome ?? "unknown",
+        event.error ?? event.reason,
+      );
       await updateAssignmentStatus(
         spawnInfo.identifier,
         spawnInfo.agentId,
