@@ -597,9 +597,8 @@ export default function register(api) {
         }
     }
     const agentId = pluginConfig?.defaultAgentId ?? "default";
-    const orchestration = pluginConfig?.enableOrchestration !== false ? "enabled" : "disabled";
     const cliSummary = Object.entries(cliChecks).map(([k, v]) => `${k}: ${v}`).join(", ");
-    api.logger.info(`Linear agent extension registered (agent: ${agentId}, token: ${tokenInfo.source !== "none" ? `${tokenInfo.source}` : "missing"}, ${cliSummary}, orchestration: ${orchestration})`);
+    api.logger.info(`Linear agent extension registered (agent: ${agentId}, token: ${tokenInfo.source !== "none" ? `${tokenInfo.source}` : "missing"}, ${cliSummary})`);
     // Start proactive token refresh timer (runs immediately, then every 6h)
     startTokenRefreshTimer(api, pluginConfig);
     // Start the container reaper (immediate sweep + every 30 min) — ONLY when this

@@ -201,7 +201,7 @@ openclaw openclaw-linear status
 You should see a valid token and connected status. Check the gateway logs for a clean startup:
 
 ```
-Linear agent extension registered (agent: default, token: profile, orchestration: enabled)
+Linear agent extension registered (agent: default, token: profile)
 ```
 
 Test the webhook endpoint:

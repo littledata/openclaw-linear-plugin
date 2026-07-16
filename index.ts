@@ -665,10 +665,9 @@ export default function register(api: OpenClawPluginApi) {
   }
 
   const agentId = (pluginConfig?.defaultAgentId as string) ?? "default";
-  const orchestration = pluginConfig?.enableOrchestration !== false ? "enabled" : "disabled";
   const cliSummary = Object.entries(cliChecks).map(([k, v]) => `${k}: ${v}`).join(", ");
   api.logger.info(
-    `Linear agent extension registered (agent: ${agentId}, token: ${tokenInfo.source !== "none" ? `${tokenInfo.source}` : "missing"}, ${cliSummary}, orchestration: ${orchestration})`,
+    `Linear agent extension registered (agent: ${agentId}, token: ${tokenInfo.source !== "none" ? `${tokenInfo.source}` : "missing"}, ${cliSummary})`,
   );
 
   // Start proactive token refresh timer (runs immediately, then every 6h)
