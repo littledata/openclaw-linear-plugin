@@ -641,14 +641,6 @@ export async function handleLinearWebhook(
       return true;
     }
 
-    // Linear owns the session lifecycle for mentions and delegations. Acknowledge
-    // this exact session immediately; all subsequent work for this invocation
-    // must stay attached to session.id.
-    await linearApi.emitActivity(session.id, {
-      type: "thought",
-      body: `Starting a new session for ${issue.identifier ?? issue.id}...`,
-    }, { ephemeral: true }).catch(() => {});
-
     const previousComments = payload.previousComments ?? [];
     const guidanceCtx = extractGuidance(payload);
 
@@ -783,6 +775,10 @@ export async function handleLinearWebhook(
     // A delegation starts the coding pipeline — but only on a coding-enabled
     // profile. (Conversational-only delegations were already ignored above.)
     if (isDelegationSession && codingEnabled(pluginConfig)) {
+      await linearApi.emitActivity(session.id, {
+        type: "thought",
+        body: `Starting a new session for ${issue.identifier ?? issue.id}...`,
+      }, { ephemeral: true }).catch(() => {});
       // A fresh delegation owns a fresh Linear session. Clear any interaction
       // parked by an older session, but do not cancel a real implementation.
       const supersedesParkedInteraction = Boolean(getGrill(issue.id));
@@ -852,6 +848,23 @@ export async function handleLinearWebhook(
         api.logger.warn(`AgentSession ${session.id}: dispatch-state active-check failed: ${err}`);
       }
     }
+
+    // Coding-only app users are intentionally installed without
+    // `app:mentionable`. Ignore any non-delegation session silently so tokens
+    // issued with the older scope cannot produce a misleading mention reply.
+    if (!conversationalEnabled(pluginConfig)) {
+      api.logger.info(
+        `AgentSession ${session.id}: coding-only profile, non-delegation session ignored for ${issue.identifier ?? issue.id}`,
+      );
+      return true;
+    }
+
+    // Acknowledge genuine conversational sessions only after routing has
+    // established that this profile supports them.
+    await linearApi.emitActivity(session.id, {
+      type: "thought",
+      body: `Starting a new session for ${issue.identifier ?? issue.id}...`,
+    }, { ephemeral: true }).catch(() => {});
 
     const description = enrichedIssue?.description ?? issue?.description ?? "(no description)";
 
@@ -953,17 +966,6 @@ export async function handleLinearWebhook(
       ``,
       `Respond within the scope defined above. Be concise and action-oriented.`,
     ].filter(Boolean).join("\n");
-
-    // Capability gate: conversational replies may be disabled on this profile
-    // (a coding-only agent). Close the session cleanly rather than reply.
-    if (!conversationalEnabled(pluginConfig)) {
-      api.logger.info(`AgentSession ${session.id}: conversational disabled — not replying to ${issueRef}`);
-      await linearApi.emitActivity(session.id, {
-        type: "response",
-        body: "This agent handles delegated work here and doesn't reply to mentions. Assign an issue to me to start.",
-      }).catch(() => {});
-      return true;
-    }
 
     // Run agent directly (non-blocking)
     activeRuns.add(issue.id);
@@ -1390,11 +1392,9 @@ export async function handleLinearWebhook(
 
     // Capability gate: conversational replies may be disabled on this profile.
     if (!conversationalEnabled(pluginConfig)) {
-      api.logger.info(`AgentSession prompted ${session.id}: conversational disabled — not replying to ${issue?.identifier ?? issue?.id}`);
-      await linearApi.emitActivity(session.id, {
-        type: "response",
-        body: "This agent handles delegated work here and doesn't reply to mentions.",
-      }).catch(() => {});
+      api.logger.info(
+        `AgentSession prompted ${session.id}: coding-only profile ignored non-delegation prompt for ${issue?.identifier ?? issue?.id}`,
+      );
       return true;
     }
 
@@ -1880,6 +1880,30 @@ export async function handleLinearWebhook(
     res.end("ok");
 
     const issue = payload.data;
+    const updatedFrom = payload.updatedFrom ?? {};
+    const assigneeWasUpdated = Object.prototype.hasOwnProperty.call(
+      updatedFrom,
+      "assigneeId",
+    );
+    const delegateWasUpdated = Object.prototype.hasOwnProperty.call(
+      updatedFrom,
+      "delegateId",
+    );
+    const assigneeId = issue?.assigneeId;
+    const prevAssigneeId = updatedFrom.assigneeId;
+    const delegateId = issue?.delegateId;
+    const prevDelegateId = updatedFrom.delegateId;
+
+    // A terminal workflow releases the delegate in a second Issue.update.
+    // Cancel any reconciliation scheduled by an earlier delivery before the
+    // timer can synthesize a session for work that has already finished.
+    if (delegateWasUpdated && !delegateId && issue?.id) {
+      if (clearPendingDelegationSessionCheck(issue.id)) {
+        api.logger.info(
+          `Issue.update ${issue?.identifier ?? issue.id}: delegate released — cancelled pending session reconciliation`,
+        );
+      }
+    }
 
     // Guard: check activeRuns FIRST (synchronous, O(1)) before any async work.
     // Linear can send duplicate Issue.update webhooks <20ms apart for the same
@@ -1890,19 +1914,16 @@ export async function handleLinearWebhook(
       return true;
     }
 
-    const updatedFrom = payload.updatedFrom ?? {};
-
-    // Check both assigneeId and delegateId — Linear uses delegateId for agent delegation
-    const assigneeId = issue?.assigneeId;
-    const prevAssigneeId = updatedFrom.assigneeId;
-    const delegateId = issue?.delegateId;
-    const prevDelegateId = updatedFrom.delegateId;
-
     api.logger.info(`Issue.update ${issue?.identifier ?? issue?.id}: assigneeId=${assigneeId} prev=${prevAssigneeId} delegateId=${delegateId} prevDelegate=${prevDelegateId}`);
 
-    // Check if either assignee or delegate changed to our app user
-    const assigneeChanged = assigneeId && assigneeId !== prevAssigneeId;
-    const delegateChanged = delegateId && delegateId !== prevDelegateId;
+    // `updatedFrom` contains only fields changed by this mutation. Issue.data
+    // contains the full current issue, so comparing a current delegate against
+    // an absent previous value falsely treats status-only updates as a new
+    // delegation (the CORE-1747 Code Review transition).
+    const assigneeChanged =
+      assigneeWasUpdated && assigneeId && assigneeId !== prevAssigneeId;
+    const delegateChanged =
+      delegateWasUpdated && delegateId && delegateId !== prevDelegateId;
 
     if (!assigneeChanged && !delegateChanged) {
       api.logger.info("Issue.update: no assignment/delegation change, ignoring");

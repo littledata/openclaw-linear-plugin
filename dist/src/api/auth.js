@@ -1,7 +1,8 @@
 export const LINEAR_OAUTH_AUTH_URL = "https://linear.app/oauth/authorize";
 export const LINEAR_OAUTH_TOKEN_URL = "https://api.linear.app/oauth/token";
-// Agent scopes: read/write + assignable (appear in assignment menus) + mentionable (respond to @mentions)
-export const LINEAR_AGENT_SCOPES = "read,write,app:assignable,app:mentionable";
+// Coding agents are invoked only through delegation. Keep them assignable, but
+// do not make the app user available in Linear's @mention surfaces.
+export const LINEAR_AGENT_SCOPES = "read,write,app:assignable";
 // Token refresh helper — Linear tokens expire; refresh before they do
 export async function refreshLinearToken(clientId, clientSecret, refreshToken) {
     const response = await fetch(LINEAR_OAUTH_TOKEN_URL, {

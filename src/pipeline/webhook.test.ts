@@ -902,6 +902,44 @@ describe("AgentSessionEvent.created full flow", () => {
     )).toBe(true);
   });
 
+  it("silently ignores a legacy mention session on a coding-only profile", async () => {
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: "issue-coding-mention",
+      identifier: "CORE-MENTION",
+      title: "Coding-only mention",
+      description: "Implementation issue",
+      state: { name: "Code Review", type: "started" },
+      delegate: null,
+      team: { id: "team-1", key: "CORE" },
+    });
+
+    const { api } = await postWebhook({
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: {
+        id: "sess-coding-mention",
+        issue: { id: "issue-coding-mention", identifier: "CORE-MENTION" },
+        comment: { id: "comment-coding-mention", body: "@vasile status?" },
+      },
+      previousComments: [
+        { body: "@vasile status?", user: { name: "Human" } },
+      ],
+    }, "/linear/webhook", {
+      coding: { enabled: true },
+      conversational: { enabled: false },
+    });
+
+    expect(runAgentMock).not.toHaveBeenCalled();
+    expect(classifyIntentMock).not.toHaveBeenCalled();
+    expect(mockLinearApiInstance.emitActivity).not.toHaveBeenCalled();
+    const infos = (api.logger.info as any).mock.calls.map((c: any[]) => String(c[0]));
+    expect(
+      infos.some((line: string) =>
+        line.includes("coding-only profile, non-delegation session ignored"),
+      ),
+    ).toBe(true);
+  });
+
   it("conversational-only profile routes to the conversational agent, ignoring agent names in promptContext", async () => {
     runAgentMock.mockReset().mockResolvedValue({ success: true, output: "hi" });
     mockLinearApiInstance.getIssueDetails.mockResolvedValue({
@@ -2245,6 +2283,32 @@ describe("Issue.update dispatch flow", () => {
     expect(infoCalls.some((msg: string) => msg.includes("no assignment/delegation change"))).toBe(true);
   });
 
+  it("does not treat a status-only update as a fresh delegation", async () => {
+    mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
+
+    const result = await postWebhook({
+      type: "Issue",
+      action: "update",
+      data: {
+        id: "issue-status-transition",
+        identifier: "CORE-1747",
+        stateId: "code-review",
+        delegateId: "viewer-1",
+      },
+      updatedFrom: { stateId: "in-progress" },
+    }, "/linear/webhook", { delegationSessionGraceMs: 10 });
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(result.status).toBe(200);
+    expect(mockLinearApiInstance.createSessionOnIssue).not.toHaveBeenCalled();
+    const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    expect(
+      infoCalls.some((msg: string) =>
+        msg.includes("no assignment/delegation change"),
+      ),
+    ).toBe(true);
+  });
+
   it("skips when assignment is not to our viewer", async () => {
     mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
 
@@ -2392,6 +2456,42 @@ describe("Issue.update dispatch flow", () => {
     const infoCalls = (created.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
     expect(infoCalls.some((msg: string) => msg.includes("cancelled fallback creation"))).toBe(true);
     expect(mockLinearApiInstance.createSessionOnIssue).not.toHaveBeenCalled();
+  });
+
+  it("cancels fallback creation when the delegate is released", async () => {
+    mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
+    mockLinearApiInstance.listAgentSessions.mockResolvedValue([]);
+
+    await postWebhook({
+      type: "Issue",
+      action: "update",
+      data: {
+        id: "issue-released-before-fallback",
+        identifier: "ENG-RELEASED",
+        delegateId: "viewer-1",
+      },
+      updatedFrom: { delegateId: null },
+    }, "/linear/webhook", { delegationSessionGraceMs: 30 });
+
+    const released = await postWebhook({
+      type: "Issue",
+      action: "update",
+      data: {
+        id: "issue-released-before-fallback",
+        identifier: "ENG-RELEASED",
+        delegateId: null,
+      },
+      updatedFrom: { delegateId: "viewer-1" },
+    }, "/linear/webhook", { delegationSessionGraceMs: 30 });
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(mockLinearApiInstance.createSessionOnIssue).not.toHaveBeenCalled();
+    const infoCalls = (released.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    expect(
+      infoCalls.some((msg: string) =>
+        msg.includes("delegate released — cancelled pending session reconciliation"),
+      ),
+    ).toBe(true);
   });
 
   it("does not create a fallback when a recent native session already exists", async () => {
