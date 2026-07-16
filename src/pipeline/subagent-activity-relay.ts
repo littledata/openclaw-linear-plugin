@@ -1,0 +1,262 @@
+/**
+ * Relays a spawned specialist's visible activity into the parent Linear
+ * AgentSession. Spawned OpenClaw sessions do not inherit the parent's embedded
+ * streaming callbacks, so their tool cards and assistant messages need a
+ * gateway-level bridge keyed by the child session/run identifiers.
+ */
+import {
+  formatToolActivityParameter,
+  formatToolActivityResult,
+  formatToolActivityTitle,
+} from "../agent/agent.js";
+
+/** Minimal Linear API surface required by the relay. */
+export interface SubagentActivityApi {
+  emitActivity(
+    agentSessionId: string,
+    content:
+      | { type: "thought"; body: string }
+      | {
+          type: "action";
+          action: string;
+          parameter?: string;
+          result?: string;
+        },
+    opts?: { ephemeral?: boolean },
+  ): Promise<void>;
+}
+
+/** Parent/child routing metadata retained for one spawned specialist. */
+export interface SubagentActivityBinding {
+  issueIdentifier: string;
+  agentId: string;
+  agentLabel: string;
+  agentSessionId: string;
+}
+
+interface ToolHookContext {
+  sessionKey?: string;
+  sessionId?: string;
+  runId?: string;
+}
+
+interface ToolStartEvent {
+  toolName: string;
+  params?: Record<string, unknown>;
+  runId?: string;
+  toolCallId?: string;
+}
+
+interface ToolEndEvent extends ToolStartEvent {
+  result?: unknown;
+  error?: string;
+}
+
+interface PendingTool {
+  binding: SubagentActivityBinding;
+  toolName: string;
+  action: string;
+  parameter?: string;
+}
+
+const MESSAGE_DEDUPE_MS = 5 * 60_000;
+const MAX_DEDUPE_ENTRIES = 500;
+const MAX_COMPLETED_TOOL_IDS = 1_000;
+
+/** Extract only user-visible assistant text; thinking/reasoning blocks are excluded. */
+export function extractVisibleAssistantText(message: unknown): string[] {
+  if (!message || typeof message !== "object") return [];
+  const record = message as Record<string, unknown>;
+  if (record.role !== "assistant") return [];
+  if (typeof record.content === "string") {
+    const text = record.content.trim();
+    return text ? [text] : [];
+  }
+  if (!Array.isArray(record.content)) return [];
+  return record.content
+    .filter((block): block is Record<string, unknown> =>
+      !!block &&
+      typeof block === "object" &&
+      (block as Record<string, unknown>).type === "text" &&
+      typeof (block as Record<string, unknown>).text === "string",
+    )
+    .map((block) => String(block.text).trim())
+    .filter(Boolean);
+}
+
+/**
+ * Gateway-level relay for child tool calls and visible assistant messages.
+ * Every method is best-effort: Linear telemetry must never block coding work.
+ */
+export class SubagentActivityRelay {
+  private readonly bindings = new Map<string, SubagentActivityBinding>();
+  private readonly pendingTools = new Map<string, PendingTool>();
+  private readonly completedToolIds = new Set<string>();
+  private readonly messageFingerprints = new Map<string, number>();
+
+  /**
+   * @param linearApi - Linear activity API
+   * @param logger - best-effort diagnostic logger
+   */
+  constructor(
+    private readonly linearApi: SubagentActivityApi | null,
+    private readonly logger?: { warn: (message: string) => void },
+  ) {}
+
+  /** Bind every known child identity (session key, session id, run id). */
+  bind(keys: Array<string | undefined>, binding: SubagentActivityBinding): void {
+    for (const key of keys) {
+      if (key) this.bindings.set(key, binding);
+    }
+  }
+
+  /** Drop child identities and any pending tool records associated with them. */
+  unbind(keys: Array<string | undefined>): void {
+    const bindings = new Set(
+      keys.map((key) => (key ? this.bindings.get(key) : undefined)).filter(Boolean),
+    );
+    for (const key of keys) {
+      if (key) this.bindings.delete(key);
+    }
+    if (!bindings.size) return;
+    for (const [key, pending] of this.pendingTools) {
+      if (bindings.has(pending.binding)) this.pendingTools.delete(key);
+    }
+  }
+
+  /** Emit the transient start card for a mapped child tool call. */
+  async toolStarted(event: ToolStartEvent, ctx: ToolHookContext): Promise<void> {
+    const binding = this.resolveBinding(event, ctx);
+    if (!binding || !this.linearApi) return;
+    const action = formatToolActivityTitle(event.toolName);
+    const parameter = this.withSpecialist(
+      binding,
+      formatToolActivityParameter(event.toolName, event.params),
+    );
+    const key = this.toolKey(event, ctx);
+    if (key) {
+      this.pendingTools.set(key, { binding, toolName: event.toolName, action, parameter });
+    }
+    await this.emit(
+      binding.agentSessionId,
+      { type: "action", action, parameter },
+      { ephemeral: true },
+    );
+  }
+
+  /** Emit the persistent completion card for a mapped child tool call. */
+  async toolFinished(event: ToolEndEvent, ctx: ToolHookContext): Promise<void> {
+    const binding = this.resolveBinding(event, ctx);
+    if (!binding || !this.linearApi) return;
+    const key = this.toolKey(event, ctx);
+    if (key && this.completedToolIds.has(key)) return;
+    const pending = key ? this.pendingTools.get(key) : undefined;
+    if (key) {
+      this.pendingTools.delete(key);
+      this.rememberCompletedTool(key);
+    }
+    const isError = typeof event.error === "string" && event.error.length > 0;
+    await this.emit(binding.agentSessionId, {
+      type: "action",
+      action: pending?.action ?? formatToolActivityTitle(event.toolName),
+      parameter:
+        pending?.parameter ??
+        this.withSpecialist(
+          binding,
+          formatToolActivityParameter(event.toolName, event.params),
+        ),
+      result: formatToolActivityResult(
+        pending?.toolName ?? event.toolName,
+        event.result ?? event.error ?? (isError ? "failed" : "completed"),
+        isError,
+      ),
+    });
+  }
+
+  /** Relay visible child assistant prose as a specialist-labelled thought. */
+  async assistantText(text: string, identities: Array<string | undefined>): Promise<void> {
+    const binding = this.resolveBindingFromKeys(identities);
+    const body = text.trim();
+    if (!binding || !this.linearApi || !body) return;
+    const fingerprint = `${binding.agentSessionId}:${binding.agentId}:${body}`;
+    const now = Date.now();
+    const seenAt = this.messageFingerprints.get(fingerprint);
+    if (seenAt && now - seenAt < MESSAGE_DEDUPE_MS) return;
+    this.messageFingerprints.set(fingerprint, now);
+    this.trimMessageFingerprints(now);
+    await this.emit(binding.agentSessionId, {
+      type: "thought",
+      body: `${binding.agentLabel} — ${body}`,
+    });
+  }
+
+  /** Relay visible text blocks from a persisted child assistant message. */
+  async assistantMessage(
+    message: unknown,
+    identities: Array<string | undefined>,
+  ): Promise<void> {
+    for (const text of extractVisibleAssistantText(message)) {
+      await this.assistantText(text, identities);
+    }
+  }
+
+  private resolveBinding(event: ToolStartEvent, ctx: ToolHookContext): SubagentActivityBinding | undefined {
+    return this.resolveBindingFromKeys([
+      ctx.sessionKey,
+      ctx.sessionId,
+      ctx.runId,
+      event.runId,
+    ]);
+  }
+
+  private resolveBindingFromKeys(keys: Array<string | undefined>): SubagentActivityBinding | undefined {
+    for (const key of keys) {
+      const binding = key ? this.bindings.get(key) : undefined;
+      if (binding) return binding;
+    }
+    return undefined;
+  }
+
+  private toolKey(event: ToolStartEvent, ctx: ToolHookContext): string | undefined {
+    const callId = event.toolCallId;
+    if (!callId) return undefined;
+    const owner = ctx.sessionKey ?? ctx.sessionId ?? ctx.runId ?? event.runId ?? "child";
+    return `${owner}:${callId}`;
+  }
+
+  private withSpecialist(binding: SubagentActivityBinding, parameter?: string): string {
+    return parameter
+      ? `Specialist: ${binding.agentLabel}\n\n${parameter}`
+      : `Specialist: ${binding.agentLabel}`;
+  }
+
+  private rememberCompletedTool(key: string): void {
+    this.completedToolIds.add(key);
+    if (this.completedToolIds.size <= MAX_COMPLETED_TOOL_IDS) return;
+    const oldest = this.completedToolIds.values().next().value;
+    if (oldest) this.completedToolIds.delete(oldest);
+  }
+
+  private trimMessageFingerprints(now: number): void {
+    for (const [key, seenAt] of this.messageFingerprints) {
+      if (now - seenAt >= MESSAGE_DEDUPE_MS) this.messageFingerprints.delete(key);
+    }
+    while (this.messageFingerprints.size > MAX_DEDUPE_ENTRIES) {
+      const oldest = this.messageFingerprints.keys().next().value;
+      if (!oldest) break;
+      this.messageFingerprints.delete(oldest);
+    }
+  }
+
+  private async emit(
+    agentSessionId: string,
+    content: Parameters<SubagentActivityApi["emitActivity"]>[1],
+    opts?: { ephemeral?: boolean },
+  ): Promise<void> {
+    try {
+      await this.linearApi?.emitActivity(agentSessionId, content, opts);
+    } catch (error) {
+      this.logger?.warn(`[subagent-activity] could not emit Linear activity: ${error}`);
+    }
+  }
+}

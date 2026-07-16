@@ -21,8 +21,9 @@ import { readDispatchState as readStateForHook, listActiveDispatches as listActi
 import { startTokenRefreshTimer, stopTokenRefreshTimer } from "./src/infra/token-refresh-timer.js";
 import { reapExpiredContainers, CONTAINER_TTL_MS, repoWorkdir } from "./src/infra/container-runner.js";
 import { codingEnabled } from "./src/pipeline/mode-config.js";
-import { bindAgentRunToIssue, unbindAgentRunSession, resolveRequesterIssueIdentifier } from "./src/pipeline/active-session.js";
+import { bindAgentRunToIssue, getActiveSessionByIdentifier, unbindAgentRunSession, resolveRequesterIssueIdentifier, } from "./src/pipeline/active-session.js";
 import { updateAssignmentStatus } from "./src/pipeline/agent-plan.js";
+import { SubagentActivityRelay } from "./src/pipeline/subagent-activity-relay.js";
 import { getContainerRecord } from "./src/infra/container-registry.js";
 import { resolveRole } from "./src/pipeline/roles.js";
 import { buildWorkspacePrompt } from "./src/pipeline/workspace-prompt.js";
@@ -104,6 +105,12 @@ export default function register(api) {
     const pluginConfig = api.pluginConfig;
     // Check token availability (config → env → auth profile store)
     const tokenInfo = resolveLinearToken(pluginConfig);
+    const subagentActivityRelay = new SubagentActivityRelay(tokenInfo.accessToken
+        ? new LinearAgentApi(tokenInfo.accessToken, {
+            refreshToken: tokenInfo.refreshToken,
+            expiresAt: tokenInfo.expiresAt,
+        })
+        : null, api.logger);
     if (!tokenInfo.accessToken) {
         api.logger.warn("Linear: no access token found. Options: (1) run OAuth flow, (2) set LINEAR_ACCESS_TOKEN env var, " +
             "(3) add accessToken to plugin config. Agent pipeline will not function without it.");
@@ -290,6 +297,27 @@ export default function register(api) {
             spawnedSubagentIssue.set(childSessionKey, { identifier, agentId: childAgentId });
             if (event.runId)
                 spawnedSubagentIssue.set(event.runId, { identifier, agentId: childAgentId });
+            // Child sessions do not inherit the parent's embedded-run streaming
+            // callbacks. Retain the parent Linear AgentSession so gateway-level tool
+            // and message hooks can relay the specialist's visible activity there.
+            let agentSessionId = getActiveSessionByIdentifier(identifier)?.agentSessionId;
+            if (!agentSessionId) {
+                const state = await readDispatchState(pluginConfig?.dispatchStatePath);
+                const dispatch = Object.values(state.dispatches.active).find((candidate) => candidate.issueIdentifier === identifier);
+                agentSessionId = dispatch?.agentSessionId;
+            }
+            if (agentSessionId) {
+                subagentActivityRelay.bind([childSessionKey, event.runId], {
+                    issueIdentifier: identifier,
+                    agentId: childAgentId,
+                    agentLabel: resolveRole(childAgentId)?.label ?? childAgentId,
+                    agentSessionId,
+                });
+            }
+            else {
+                api.logger.warn(`subagent_spawned: no parent Linear AgentSession found for ${childAgentId} on ${identifier}; ` +
+                    "child tools/messages will remain in the OpenClaw transcript");
+            }
             api.logger.info(`subagent_spawned: bound ${childAgentId} (${childSessionKey}) to ${identifier}`);
             // Flip this specialist's row on the ticket's session plan to in-progress.
             await updateAssignmentStatus(identifier, childAgentId, "inProgress");
@@ -317,6 +345,7 @@ export default function register(api) {
             unbindAgentRunSession(event.runId);
             spawnedSubagentIssue.delete(event.runId);
         }
+        subagentActivityRelay.unbind([sessionKey, event.runId]);
         if (!sessionKey)
             return;
         try {
@@ -327,6 +356,39 @@ export default function register(api) {
         catch (err) {
             api.logger.error(`subagent_ended hook error: ${err}`);
             await escalateDispatchError(sessionKey, err, "subagent_ended");
+        }
+    });
+    // Spawned specialists execute as separate OpenClaw sessions, outside the
+    // parent's runAgent streaming callbacks. Relay their dynamic tool lifecycle
+    // through the global hooks. The relay filters strictly to child session/run
+    // ids registered by subagent_spawned, so parent tool cards are not duplicated.
+    api.on("before_tool_call", async (event, ctx) => {
+        await subagentActivityRelay.toolStarted(event, ctx);
+    });
+    api.on("after_tool_call", async (event, ctx) => {
+        await subagentActivityRelay.toolFinished(event, ctx);
+    });
+    // Persisted assistant messages provide an event-driven replacement for
+    // transcript polling. Only visible text blocks are relayed; thinking and
+    // reasoning blocks are deliberately excluded by the extractor.
+    api.on("before_message_write", (event, ctx) => {
+        void subagentActivityRelay.assistantMessage(event.message, [
+            event.sessionKey,
+            ctx.sessionKey,
+        ]);
+    });
+    // Some harnesses report visible assistant text through llm_output without a
+    // standard message write. Use it as a fallback; relay-level fingerprints
+    // suppress duplicates when both hooks observe the same prose.
+    api.on("llm_output", async (event, ctx) => {
+        for (const text of event.assistantTexts ?? []) {
+            await subagentActivityRelay.assistantText(text, [
+                ctx.sessionKey,
+                ctx.sessionId,
+                ctx.runId,
+                event.sessionId,
+                event.runId,
+            ]);
         }
     });
     // session_start — track dispatch session lifecycle
