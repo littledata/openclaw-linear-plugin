@@ -9,7 +9,7 @@
  */
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { resolveRoster, type RosterAgent } from "./agent-roster.js";
+import { resolveRoster, tononeAgentsForRoster, type RosterAgent } from "./agent-roster.js";
 import { fetchTononeSource } from "./tonone-source.js";
 import { installSkills, defaultSkillsInstallDir } from "./install-skills.js";
 import { ensureAgentsRegistered } from "./register-agents.js";
@@ -42,12 +42,15 @@ export async function provisionTononeAgents(
   }
   api.logger.info(`[provision] roster: ${roster.map((a) => a.id).join(", ")}`);
 
-  const source = fetchTononeSource({
-    repo: pluginConfig?.tononeRepo as string | undefined,
-    ref: pluginConfig?.tononeRef as string | undefined,
-    cacheDir: pluginConfig?.tononeCacheDir as string | undefined,
-    logger: api.logger,
-  });
+  const needsTonone = tononeAgentsForRoster(roster).length > 0;
+  const source = needsTonone
+    ? fetchTononeSource({
+      repo: pluginConfig?.tononeRepo as string | undefined,
+      ref: pluginConfig?.tononeRef as string | undefined,
+      cacheDir: pluginConfig?.tononeCacheDir as string | undefined,
+      logger: api.logger,
+    })
+    : { dir: "", sha: "bundled", ref: "bundled" };
 
   const installDir = (pluginConfig?.skillsInstallDir as string) || defaultSkillsInstallDir();
   const install = installSkills(source.dir, roster, installDir, api.logger);

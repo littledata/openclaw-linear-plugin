@@ -22,6 +22,15 @@ const REVIEWERS = ["spine", "warden", "proof", "forge", "prism"];
  */
 export const DEFAULT_ROSTER = [
     {
+        id: "sift",
+        label: "Sift",
+        tononeAgent: "sift",
+        source: "bundled",
+        skills: ["sift-triage"],
+        kind: "triage",
+        summary: "the triage specialist — investigates bug reports, separates evidence from hypotheses, and prepares delivery-ready handoffs.",
+    },
+    {
         id: "apex",
         label: "Apex",
         tononeAgent: "apex",
@@ -139,5 +148,5 @@ export function resolveRoster(pluginConfig) {
  * @returns unique tonone agent directory names
  */
 export function tononeAgentsForRoster(roster) {
-    return [...new Set(roster.map((a) => a.tononeAgent))];
+    return [...new Set(roster.filter((a) => a.source !== "bundled").map((a) => a.tononeAgent))];
 }

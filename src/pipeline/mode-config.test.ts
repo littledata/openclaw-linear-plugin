@@ -4,6 +4,8 @@ import {
   conversationalEnabled,
   conversationalConfig,
   conversationalCommentReply,
+  triageConfig,
+  triageEnabled,
 } from "./mode-config.js";
 
 describe("mode-config", () => {
@@ -39,5 +41,12 @@ describe("mode-config", () => {
     expect(conversationalCommentReply(undefined)).toBe(false);
     expect(conversationalCommentReply({ conversational: { commentReply: false } })).toBe(false);
     expect(conversationalCommentReply({ conversational: { commentReply: true } })).toBe(true);
+  });
+
+  it("keeps triage opt-in and exposes its agent", () => {
+    expect(triageEnabled(undefined)).toBe(false);
+    expect(triageEnabled({ triage: { enabled: false } })).toBe(false);
+    expect(triageEnabled({ triage: { enabled: true, agentId: "sift" } })).toBe(true);
+    expect(triageConfig({ triage: { agentId: "sift" } }).agentId).toBe("sift");
   });
 });

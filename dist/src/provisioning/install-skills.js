@@ -12,10 +12,20 @@
  */
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 /** Default install root: `<workspace-coding>/skills/tonone`. */
 export function defaultSkillsInstallDir() {
     return join(homedir(), ".openclaw", "workspace-coding", "skills", "tonone");
+}
+/** Locate skills shipped inside this npm package in source and compiled layouts. */
+export function defaultBundledSkillsDir() {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const candidates = [
+        resolve(here, "../../../agent-skills"),
+        resolve(here, "../../agent-skills"),
+    ];
+    return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0];
 }
 /**
  * Parse a leading YAML frontmatter block (`--- ... ---`) into flat string
@@ -82,16 +92,17 @@ export function readPersona(sourceDir, tononeAgent) {
  * @param roster - the resolved roster to install skills for
  * @param installDir - target skills dir (default `<workspace>/skills/tonone`)
  * @param logger - optional progress logger
+ * @param bundledSkillsDir - package directory containing bundled skills
  * @returns installed/missing skill names + personas per tonone agent
  */
-export function installSkills(sourceDir, roster, installDir = defaultSkillsInstallDir(), logger) {
+export function installSkills(sourceDir, roster, installDir = defaultSkillsInstallDir(), logger, bundledSkillsDir = defaultBundledSkillsDir()) {
     mkdirSync(installDir, { recursive: true });
     const installed = [];
     const missing = [];
     const personas = {};
     const seen = new Set();
     for (const agent of roster) {
-        if (!personas[agent.tononeAgent]) {
+        if (agent.source !== "bundled" && !personas[agent.tononeAgent]) {
             const persona = readPersona(sourceDir, agent.tononeAgent);
             if (persona)
                 personas[agent.tononeAgent] = persona;
@@ -100,11 +111,13 @@ export function installSkills(sourceDir, roster, installDir = defaultSkillsInsta
             if (seen.has(skill))
                 continue;
             seen.add(skill);
-            const srcSkillDir = join(sourceDir, "team", agent.tononeAgent, "skills", skill);
+            const srcSkillDir = agent.source === "bundled"
+                ? join(bundledSkillsDir, skill)
+                : join(sourceDir, "team", agent.tononeAgent, "skills", skill);
             const srcSkillMd = join(srcSkillDir, "SKILL.md");
             if (!existsSync(srcSkillMd)) {
                 missing.push(skill);
-                logger?.warn(`[provision] skill not found in source: ${agent.tononeAgent}/${skill}`);
+                logger?.warn(`[provision] skill not found in ${agent.source === "bundled" ? "bundle" : "source"}: ${agent.tononeAgent}/${skill}`);
                 continue;
             }
             const destSkillDir = join(installDir, skill);

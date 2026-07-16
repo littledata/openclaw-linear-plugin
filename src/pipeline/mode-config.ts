@@ -38,6 +38,14 @@ export interface ConversationalModeConfig {
   [key: string]: unknown;
 }
 
+/** Triage settings (delegation → evidence gathering and delivery handoff). */
+export interface TriageModeConfig {
+  enabled?: boolean;
+  /** Agent id that handles triage delegations. Defaults to `sift`. */
+  agentId?: string;
+  [key: string]: unknown;
+}
+
 /** Whether the coding pipeline is active on this profile. Default ON. */
 export function codingEnabled(cfg?: Record<string, unknown>): boolean {
   return (cfg?.coding as CodingModeConfig | undefined)?.enabled !== false;
@@ -51,6 +59,16 @@ export function conversationalEnabled(cfg?: Record<string, unknown>): boolean {
 /** The conversational settings block (never null). */
 export function conversationalConfig(cfg?: Record<string, unknown>): ConversationalModeConfig {
   return (cfg?.conversational as ConversationalModeConfig | undefined) ?? {};
+}
+
+/** Whether delegated-ticket triage is active on this profile. Default OFF. */
+export function triageEnabled(cfg?: Record<string, unknown>): boolean {
+  return (cfg?.triage as TriageModeConfig | undefined)?.enabled === true;
+}
+
+/** The triage settings block (never null). */
+export function triageConfig(cfg?: Record<string, unknown>): TriageModeConfig {
+  return (cfg?.triage as TriageModeConfig | undefined) ?? {};
 }
 
 /**

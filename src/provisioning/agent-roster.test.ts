@@ -41,6 +41,13 @@ describe("roster shape", () => {
     expect(apex.subagents).toContain("spine");
   });
 
+  it("ships Sift as a bundled triage agent", () => {
+    const sift = DEFAULT_ROSTER.find((a) => a.id === "sift")!;
+    expect(sift.kind).toBe("triage");
+    expect(sift.source).toBe("bundled");
+    expect(sift.skills).toEqual(["sift-triage"]);
+  });
+
   it("apex-reviewer is a distinct review agent with inline comments + approve", () => {
     const rev = DEFAULT_ROSTER.find((a) => a.id === "apex-reviewer")!;
     expect(rev.kind).toBe("review");
@@ -59,5 +66,6 @@ describe("roster shape", () => {
     const sources = tononeAgentsForRoster(resolveRoster());
     expect(sources.filter((s) => s === "apex")).toHaveLength(1);
     expect(sources).toContain("spine");
+    expect(sources).not.toContain("sift");
   });
 });

@@ -5,7 +5,8 @@ import { LinearAgentApi, resolveLinearToken } from "../api/linear-api.js";
 import { buildProjectContext } from "./pipeline.js";
 import { setActiveSession, clearActiveSession, getActiveSession, getIssueAffinity, _resetAffinityForTesting } from "./active-session.js";
 import { readDispatchState, getActiveDispatch, registerDispatch, updateDispatchStatus, updateDispatchProgress, removeActiveDispatch } from "./dispatch-state.js";
-import { codingEnabled, conversationalEnabled, conversationalCommentReply, conversationalConfig } from "./mode-config.js";
+import { codingEnabled, conversationalEnabled, conversationalCommentReply, conversationalConfig, triageConfig, triageEnabled, } from "./mode-config.js";
+import { delegateRoutingConfig, routeDelegateForState } from "./delegate-routing.js";
 import { createManagedFlowForDispatch } from "./taskflow-bridge.js";
 import { createNotifierFromConfig } from "../infra/notify.js";
 import { assessTier } from "./tier-assess.js";
@@ -636,6 +637,12 @@ export async function handleLinearWebhook(api, req, res) {
         const isDelegationSession = !hasUserAuthoredSessionComment &&
             typeof webhookAppUserId === "string" &&
             enrichedIssue?.delegate?.id === webhookAppUserId;
+        const isTriageSession = isDelegationSession && triageEnabled(pluginConfig);
+        if (isTriageSession) {
+            agentId = triageConfig(pluginConfig).agentId || "sift";
+            mentionOverride = true;
+            api.logger.info(`AgentSession ${session.id}: triage delegation for ${issue.identifier ?? issue.id} — routing to ${agentId}`);
+        }
         // Conversational-only profile: only respond to a genuine conversation
         // trigger — a user comment that @mentioned this app. Linear ALSO creates
         // sessions from delegation, assignment, and triage automations, which carry
@@ -645,13 +652,14 @@ export async function handleLinearWebhook(api, req, res) {
         // profile has no coding pipeline to hand such work to, so ignore them.
         if (conversationalEnabled(pluginConfig) &&
             !codingEnabled(pluginConfig) &&
-            !hasUserAuthoredSessionComment) {
+            !hasUserAuthoredSessionComment &&
+            !isTriageSession) {
             api.logger.info(`AgentSession ${session.id}: conversational-only profile, non-mention trigger (delegation/assignment/automation, no user comment) — ignoring ${issue.identifier ?? issue.id}`);
             return true;
         }
         // A delegation starts the coding pipeline — but only on a coding-enabled
         // profile. (Conversational-only delegations were already ignored above.)
-        if (isDelegationSession && codingEnabled(pluginConfig)) {
+        if (isDelegationSession && codingEnabled(pluginConfig) && !isTriageSession) {
             await linearApi.emitActivity(session.id, {
                 type: "thought",
                 body: `Starting a new session for ${issue.identifier ?? issue.id}...`,
@@ -720,7 +728,7 @@ export async function handleLinearWebhook(api, req, res) {
         // Coding-only app users are intentionally installed without
         // `app:mentionable`. Ignore any non-delegation session silently so tokens
         // issued with the older scope cannot produce a misleading mention reply.
-        if (!conversationalEnabled(pluginConfig)) {
+        if (!conversationalEnabled(pluginConfig) && !isTriageSession) {
             api.logger.info(`AgentSession ${session.id}: coding-only profile, non-delegation session ignored for ${issue.identifier ?? issue.id}`);
             return true;
         }
@@ -747,26 +755,36 @@ export async function handleLinearWebhook(api, req, res) {
         const stateType = enrichedIssue?.state?.type ?? "";
         const isTriaged = stateType === "started" || stateType === "completed" || stateType === "canceled";
         const cliTool = resolveToolName(loadCodingConfig(), agentId);
-        const toolAccessLines = isTriaged
+        const toolAccessLines = isTriageSession
             ? [
                 `**Tool access:**`,
-                `- \`linear_issues\` tool: Full access. Use action="read" with issueId="${issueRef}" to get details, action="create" to create issues (with parentIssueId to create sub-issues for granular work breakdown), action="update" with status/priority/labels/estimate to modify issues, action="comment" to post comments, action="list_states" to see available workflow states.`,
-                `- \`${cliTool}\`: Dispatch coding work to a worker. Workers return text — they cannot access linear_issues.`,
-                `- \`sessions_spawn\`/\`sessions_send\`: Use OpenClaw's native session tools to delegate to other crew agents.`,
-                `- Standard tools: exec, read, edit, write, web_search, etc.`,
-                ``,
-                `**Sub-issue guidance:** When a task is too large or has multiple distinct parts, break it into sub-issues using action="create" with parentIssueId="${issueRef}". Each sub-issue should be an atomic, independently testable unit of work with its own acceptance criteria. This enables parallel dispatch and clearer progress tracking.`,
+                "- Use the `sift-triage` skill for this investigation.",
+                "- `linear_issues` is read-only for triage. Do not change status, assignment, delegation, or comments from the tool; the handler publishes your final response.",
+                `- Use read-only repository, observability, and web tools when they can provide decisive evidence.`,
+                `- Do not dispatch coding work, edit source, commit, push, or deploy.`,
             ]
-            : [
-                `**Tool access:**`,
-                `- \`linear_issues\` tool: READ ONLY. Use action="read" with issueId="${issueRef}" to get details, action="list_states"/"list_labels" for metadata. Do NOT use action="update", action="create", or action="comment".`,
-                `- \`${cliTool}\`: **Planning mode only.** Workers may explore code and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete source code, run deployments, or make system changes. Use for codebase exploration and planning only.`,
-                `- \`sessions_spawn\`/\`sessions_send\`: Use OpenClaw's native session tools to delegate to other crew agents.`,
-                `- Standard tools: exec, read, edit, write, web_search, etc.`,
-            ];
-        const roleLines = isTriaged
-            ? [`**Your role:** Orchestrator with full Linear access. You can update issue fields, change status, and dispatch work via \`${cliTool}\`. Do NOT post comments yourself — the handler posts your text output.`]
-            : [`**Your role:** You are the dispatcher. For any coding or implementation work, use \`${cliTool}\` to dispatch it. Workers return text output. You summarize results. You do NOT update issue status or post comments via linear_issues — the audit system handles lifecycle transitions.`];
+            : isTriaged
+                ? [
+                    `**Tool access:**`,
+                    `- \`linear_issues\` tool: Full access. Use action="read" with issueId="${issueRef}" to get details, action="create" to create issues (with parentIssueId to create sub-issues for granular work breakdown), action="update" with status/priority/labels/estimate to modify issues, action="comment" to post comments, action="list_states" to see available workflow states.`,
+                    `- \`${cliTool}\`: Dispatch coding work to a worker. Workers return text — they cannot access linear_issues.`,
+                    `- \`sessions_spawn\`/\`sessions_send\`: Use OpenClaw's native session tools to delegate to other crew agents.`,
+                    `- Standard tools: exec, read, edit, write, web_search, etc.`,
+                    ``,
+                    `**Sub-issue guidance:** When a task is too large or has multiple distinct parts, break it into sub-issues using action="create" with parentIssueId="${issueRef}". Each sub-issue should be an atomic, independently testable unit of work with its own acceptance criteria. This enables parallel dispatch and clearer progress tracking.`,
+                ]
+                : [
+                    `**Tool access:**`,
+                    `- \`linear_issues\` tool: READ ONLY. Use action="read" with issueId="${issueRef}" to get details, action="list_states"/"list_labels" for metadata. Do NOT use action="update", action="create", or action="comment".`,
+                    `- \`${cliTool}\`: **Planning mode only.** Workers may explore code and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete source code, run deployments, or make system changes. Use for codebase exploration and planning only.`,
+                    `- \`sessions_spawn\`/\`sessions_send\`: Use OpenClaw's native session tools to delegate to other crew agents.`,
+                    `- Standard tools: exec, read, edit, write, web_search, etc.`,
+                ];
+        const roleLines = isTriageSession
+            ? [`**Your role:** You are Sift, Littledata's triage specialist. Investigate and classify this ticket, distinguish evidence from hypotheses, and prepare a bounded handoff for Vasile when delivery work is justified.`]
+            : isTriaged
+                ? [`**Your role:** Orchestrator with full Linear access. You can update issue fields, change status, and dispatch work via \`${cliTool}\`. Do NOT post comments yourself — the handler posts your text output.`]
+                : [`**Your role:** You are the dispatcher. For any coding or implementation work, use \`${cliTool}\` to dispatch it. Workers return text output. You summarize results. You do NOT update issue status or post comments via linear_issues — the audit system handles lifecycle transitions.`];
         if (guidanceAppendix) {
             api.logger.info(`Guidance injected (${guidanceCtx.source}): ${guidanceCtx.guidance?.slice(0, 120)}...`);
         }
@@ -781,23 +799,27 @@ export async function handleLinearWebhook(api, req, res) {
             }
             catch { /* proceed without planning context */ }
         }
-        const intentResult = await classifyIntent(api, {
-            commentBody: classifyText,
-            issueTitle: enrichedIssue?.title ?? "(untitled)",
-            issueStatus: enrichedIssue?.state?.name,
-            isPlanning,
-            agentNames: Object.keys(profiles),
-            hasProject: !!projectId,
-        }, pluginConfig);
-        api.logger.info(`AgentSession.created intent: ${intentResult.intent}${intentResult.agentId ? ` (agent: ${intentResult.agentId})` : ""} — ${intentResult.reasoning}`);
-        const blockMsg = shouldBlockWorkRequest(intentResult.intent, stateType, enrichedIssue?.state?.name ?? "Unknown", issueRef);
-        if (blockMsg) {
-            api.logger.info(`AgentSession.created: blocking work request on untriaged issue ${issueRef}`);
-            await linearApi.emitActivity(session.id, { type: "response", body: blockMsg }).catch(() => { });
-            return true;
+        if (!isTriageSession) {
+            const intentResult = await classifyIntent(api, {
+                commentBody: classifyText,
+                issueTitle: enrichedIssue?.title ?? "(untitled)",
+                issueStatus: enrichedIssue?.state?.name,
+                isPlanning,
+                agentNames: Object.keys(profiles),
+                hasProject: !!projectId,
+            }, pluginConfig);
+            api.logger.info(`AgentSession.created intent: ${intentResult.intent}${intentResult.agentId ? ` (agent: ${intentResult.agentId})` : ""} — ${intentResult.reasoning}`);
+            const blockMsg = shouldBlockWorkRequest(intentResult.intent, stateType, enrichedIssue?.state?.name ?? "Unknown", issueRef);
+            if (blockMsg) {
+                api.logger.info(`AgentSession.created: blocking work request on untriaged issue ${issueRef}`);
+                await linearApi.emitActivity(session.id, { type: "response", body: blockMsg }).catch(() => { });
+                return true;
+            }
         }
         const message = [
-            `You are an orchestrator responding in a Linear issue session. Your text output will be posted as activities visible to the user.`,
+            isTriageSession
+                ? `Use $sift-triage to investigate this Littledata ticket. Your text output will be posted as activities visible to the user.`
+                : `You are an orchestrator responding in a Linear issue session. Your text output will be posted as activities visible to the user.`,
             ``,
             ...toolAccessLines,
             ``,
@@ -813,11 +835,19 @@ export async function handleLinearWebhook(api, req, res) {
             userMessage ? `\n**Latest message:**\n> ${userMessage}` : "",
             ``,
             `## Scope Rules`,
-            `1. **Read the issue first.** The issue title + description define your scope. Everything you do must serve the issue as written.`,
-            `2. **\`${cliTool}\` is ONLY for issue-body work.** Only dispatch \`${cliTool}\` when the issue description contains implementation requirements. A greeting, question, or conversational issue gets a conversational response — NOT ${cliTool}.`,
-            `3. **Comments explore, issue body builds.** User comments may explore scope or ask questions but NEVER trigger \`${cliTool}\` alone. If a comment requests new implementation, update the issue description first, then build from the issue text.`,
-            `4. **Plan before building.** For non-trivial work, respond with a plan first. Only dispatch \`${cliTool}\` after the plan is clear and grounded in the issue body.`,
-            `5. **Match response to request.** Greeting → greet. Question → answer. No implementation requirements → no ${cliTool}.`,
+            ...(isTriageSession
+                ? [
+                    `1. **Investigate, do not implement.** Gather the cheapest decisive evidence and produce the triage result defined by the skill.`,
+                    `2. **Label uncertainty.** Keep confirmed facts, hypotheses, and missing information distinct.`,
+                    `3. **Prepare the handoff.** If delivery is justified, give Vasile bounded scope, acceptance criteria, risks, and validation guidance.`,
+                ]
+                : [
+                    `1. **Read the issue first.** The issue title + description define your scope. Everything you do must serve the issue as written.`,
+                    `2. **\`${cliTool}\` is ONLY for issue-body work.** Only dispatch \`${cliTool}\` when the issue description contains implementation requirements. A greeting, question, or conversational issue gets a conversational response — NOT ${cliTool}.`,
+                    `3. **Comments explore, issue body builds.** User comments may explore scope or ask questions but NEVER trigger \`${cliTool}\` alone. If a comment requests new implementation, update the issue description first, then build from the issue text.`,
+                    `4. **Plan before building.** For non-trivial work, respond with a plan first. Only dispatch \`${cliTool}\` after the plan is clear and grounded in the issue body.`,
+                    `5. **Match response to request.** Greeting → greet. Question → answer. No implementation requirements → no ${cliTool}.`,
+                ]),
             ``,
             `Respond within the scope defined above. Be concise and action-oriented.`,
         ].filter(Boolean).join("\n");
@@ -1631,6 +1661,23 @@ export async function handleLinearWebhook(api, req, res) {
         const prevAssigneeId = updatedFrom.assigneeId;
         const delegateId = issue?.delegateId;
         const prevDelegateId = updatedFrom.delegateId;
+        // State ownership is independent of assignment-field changes. A plain
+        // workflow transition can require handing the ticket from Sift to Vasile
+        // (or back), so evaluate routing before the assignment-only fast paths.
+        let linearApi = createLinearApi(api);
+        const routing = delegateRoutingConfig(pluginConfig);
+        if (routing.enabled && issue?.id && linearApi) {
+            try {
+                const routed = await routeDelegateForState(routing, issue, linearApi);
+                if (routed.action === "transferred") {
+                    api.logger.info(`Issue.update ${issue.identifier ?? issue.id}: ${routed.state} routes ${routed.fromOwner} → ${routed.toOwner}; delegate transferred to ${routed.delegateId}`);
+                    return true;
+                }
+            }
+            catch (err) {
+                api.logger.error(`Issue.update ${issue.identifier ?? issue.id}: delegate routing failed: ${err}`);
+            }
+        }
         // A terminal workflow releases the delegate in a second Issue.update.
         // Cancel any reconciliation scheduled by an earlier delivery before the
         // timer can synthesize a session for work that has already finished.
@@ -1658,7 +1705,7 @@ export async function handleLinearWebhook(api, req, res) {
             api.logger.info("Issue.update: no assignment/delegation change, ignoring");
             return true;
         }
-        const linearApi = createLinearApi(api);
+        linearApi ??= createLinearApi(api);
         if (!linearApi) {
             api.logger.error("No Linear access token — cannot process issue update");
             return true;

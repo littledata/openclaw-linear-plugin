@@ -14,7 +14,10 @@
  */
 
 /** The pipeline role a provisioned agent plays (drives GitHub key + tool policy). */
-export type ProvisionKind = "plan-implement" | "review" | "qa";
+export type ProvisionKind = "plan-implement" | "review" | "qa" | "triage";
+
+/** Where an agent persona and its skills are sourced during provisioning. */
+export type AgentSource = "tonone" | "bundled";
 
 /** How a reviewer publishes its verdict on the PR. */
 export type ReviewStyle = "comment" | "approve";
@@ -26,6 +29,8 @@ export interface RosterAgent {
   label: string;
   /** Source agent directory in the tonone repo (`team/<tononeAgent>/`). */
   tononeAgent: string;
+  /** Source checkout to use. Defaults to the upstream tonone repository. */
+  source?: AgentSource;
   /** tonone skill names to install + bind (subset of the agent's skills). */
   skills: string[];
   /** Pipeline kind. */
@@ -54,6 +59,15 @@ const REVIEWERS = ["spine", "warden", "proof", "forge", "prism"];
  * when unset, the full default roster is provisioned.
  */
 export const DEFAULT_ROSTER: RosterAgent[] = [
+  {
+    id: "sift",
+    label: "Sift",
+    tononeAgent: "sift",
+    source: "bundled",
+    skills: ["sift-triage"],
+    kind: "triage",
+    summary: "the triage specialist — investigates bug reports, separates evidence from hypotheses, and prepares delivery-ready handoffs.",
+  },
   {
     id: "apex",
     label: "Apex",
@@ -176,5 +190,5 @@ export function resolveRoster(pluginConfig?: Record<string, unknown>): RosterAge
  * @returns unique tonone agent directory names
  */
 export function tononeAgentsForRoster(roster: RosterAgent[]): string[] {
-  return [...new Set(roster.map((a) => a.tononeAgent))];
+  return [...new Set(roster.filter((a) => a.source !== "bundled").map((a) => a.tononeAgent))];
 }

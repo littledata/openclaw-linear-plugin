@@ -28,6 +28,14 @@ export function conversationalEnabled(cfg) {
 export function conversationalConfig(cfg) {
     return cfg?.conversational ?? {};
 }
+/** Whether delegated-ticket triage is active on this profile. Default OFF. */
+export function triageEnabled(cfg) {
+    return cfg?.triage?.enabled === true;
+}
+/** The triage settings block (never null). */
+export function triageConfig(cfg) {
+    return cfg?.triage ?? {};
+}
 /**
  * Whether to DUAL-post a conversational reply as a separate issue comment on top
  * of the AgentSession `response` activity. Default OFF: the response activity

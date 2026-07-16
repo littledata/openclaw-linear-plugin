@@ -24,6 +24,7 @@
   "files": [
     "dist/",
     "src/",
+    "agent-skills/",
     "openclaw.plugin.json",
     "prompts.yaml",
     "README.md"

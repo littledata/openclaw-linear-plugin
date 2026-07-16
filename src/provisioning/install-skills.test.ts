@@ -102,4 +102,28 @@ describe("installSkills", () => {
   it("readPersona returns null when the persona file is absent", () => {
     expect(readPersona(source, "nonexistent")).toBeNull();
   });
+
+  it("installs a bundled skill without a tonone source directory", () => {
+    const bundle = join(source, "bundle");
+    const bundledSkill = join(bundle, "sift-triage");
+    mkdirSync(bundledSkill, { recursive: true });
+    writeFileSync(
+      join(bundledSkill, "SKILL.md"),
+      "---\nname: sift-triage\ndescription: Triage tickets\n---\n# Sift",
+    );
+    const bundledRoster: RosterAgent[] = [{
+      id: "sift",
+      label: "Sift",
+      tononeAgent: "sift",
+      source: "bundled",
+      skills: ["sift-triage"],
+      kind: "triage",
+      summary: "triage",
+    }];
+
+    const result = installSkills("", bundledRoster, dest, undefined, bundle);
+    expect(result.installed).toEqual(["sift-triage"]);
+    expect(result.personas).toEqual({});
+    expect(readFileSync(join(dest, "sift-triage", "SKILL.md"), "utf8")).toContain("# Sift");
+  });
 });

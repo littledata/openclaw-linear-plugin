@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sift Triage"
+  short_description: "Triage and investigate Littledata tickets"
+  default_prompt: "Use $sift-triage to investigate and triage this Littledata ticket."

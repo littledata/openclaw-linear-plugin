@@ -7,7 +7,7 @@
  * NOT blind on every startup — honoring "never blind-install skills": pinned
  * ref, explicit step, logged file list.
  */
-import { resolveRoster } from "./agent-roster.js";
+import { resolveRoster, tononeAgentsForRoster } from "./agent-roster.js";
 import { fetchTononeSource } from "./tonone-source.js";
 import { installSkills, defaultSkillsInstallDir } from "./install-skills.js";
 import { ensureAgentsRegistered } from "./register-agents.js";
@@ -24,12 +24,15 @@ export async function provisionTononeAgents(api, options = {}) {
         throw new Error("provisionAgents resolved to an empty roster — nothing to provision");
     }
     api.logger.info(`[provision] roster: ${roster.map((a) => a.id).join(", ")}`);
-    const source = fetchTononeSource({
-        repo: pluginConfig?.tononeRepo,
-        ref: pluginConfig?.tononeRef,
-        cacheDir: pluginConfig?.tononeCacheDir,
-        logger: api.logger,
-    });
+    const needsTonone = tononeAgentsForRoster(roster).length > 0;
+    const source = needsTonone
+        ? fetchTononeSource({
+            repo: pluginConfig?.tononeRepo,
+            ref: pluginConfig?.tononeRef,
+            cacheDir: pluginConfig?.tononeCacheDir,
+            logger: api.logger,
+        })
+        : { dir: "", sha: "bundled", ref: "bundled" };
     const installDir = pluginConfig?.skillsInstallDir || defaultSkillsInstallDir();
     const install = installSkills(source.dir, roster, installDir, api.logger);
     const registration = pluginConfig?.autoRegisterAgents === false

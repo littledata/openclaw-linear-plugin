@@ -996,6 +996,42 @@ describe("AgentSessionEvent.created full flow", () => {
     expect(infos.some((l: string) => l.includes("non-mention trigger"))).toBe(true);
   });
 
+  it("runs a delegated triage session with Sift instead of ignoring it", async () => {
+    runAgentMock.mockReset().mockResolvedValue({ success: true, output: "Triage complete" });
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: "issue-triage-1",
+      identifier: "CORE-TRIAGE",
+      title: "Customer events are missing",
+      description: "Investigate why the events disappeared.",
+      state: { name: "Triage", type: "triage" },
+      delegate: { id: "viewer-1", name: "LilAgent" },
+      team: { id: "team-1", key: "CORE" },
+    });
+
+    await postWebhook({
+      type: "AgentSessionEvent",
+      action: "created",
+      appUserId: "viewer-1",
+      agentSession: {
+        id: "sess-triage-1",
+        issue: { id: "issue-triage-1", identifier: "CORE-TRIAGE" },
+      },
+      previousComments: [],
+    }, "/linear/webhook", {
+      coding: { enabled: false },
+      conversational: { enabled: true, agentId: "sift" },
+      triage: { enabled: true, agentId: "sift" },
+    });
+
+    await vi.waitFor(() => expect(runAgentMock).toHaveBeenCalled());
+    const call = runAgentMock.mock.calls[0][0];
+    expect(call.agentId).toBe("sift");
+    expect(call.message).toContain("Use $sift-triage");
+    expect(call.message).toContain("Investigate, do not implement");
+    expect(classifyIntentMock).not.toHaveBeenCalled();
+    expect(runFullPipelineMock).not.toHaveBeenCalled();
+  });
+
   it("keeps a comment-backed mention conversational even when the issue is delegated", async () => {
     mockLinearApiInstance.getIssueDetails.mockResolvedValue({
       id: "issue-mentioned-while-delegated",
@@ -2307,6 +2343,34 @@ describe("Issue.update dispatch flow", () => {
         msg.includes("no assignment/delegation change"),
       ),
     ).toBe(true);
+  });
+
+  it("routes a status-only transition to the configured delivery agent", async () => {
+    const result = await postWebhook({
+      type: "Issue",
+      action: "update",
+      data: {
+        id: "issue-routed",
+        identifier: "CORE-ROUTED",
+        state: { name: "Code Review" },
+        delegateId: "lil-agent-id",
+      },
+      updatedFrom: { stateId: "in-progress" },
+    }, "/linear/webhook", {
+      delegateRouting: {
+        enabled: true,
+        selfOwner: "triage",
+        owners: { triage: "lil-agent-id", delivery: "vasile-id" },
+        stateOwners: { Triage: "triage", "Code Review": "delivery" },
+      },
+    });
+
+    expect(result.status).toBe(200);
+    expect(mockLinearApiInstance.updateIssue).toHaveBeenCalledWith(
+      "issue-routed",
+      { delegateId: "vasile-id" },
+    );
+    expect(mockLinearApiInstance.createSessionOnIssue).not.toHaveBeenCalled();
   });
 
   it("skips when assignment is not to our viewer", async () => {
