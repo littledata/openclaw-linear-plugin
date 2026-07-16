@@ -1,10 +1,19 @@
 import { randomUUID } from "node:crypto";
+import { AsyncResource } from "node:async_hooks";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { mkdirSync } from "node:fs";
 import { InactivityWatchdog, resolveWatchdogConfig } from "./watchdog.js";
 import { bindAgentRunToIssue, unbindAgentRunFromIssue } from "../pipeline/active-session.js";
 import { bindActiveCodexRun, buildLinearCodexSessionKey, drainCodexControls, isCodexHarnessSteeringEnabled, unbindActiveCodexRun, } from "./codex-steering.js";
+// Linear webhooks run inside OpenClaw's request-scoped gateway context. That
+// context may carry a narrow client which is appropriate for the webhook but
+// must not become the authority of a long-running embedded agent turn. Native
+// tools such as sessions_spawn otherwise reuse the narrow client and fail with
+// "missing scope: operator.write" instead of using OpenClaw's trusted internal
+// operator client. Capture a clean async scope at plugin load and admit embedded
+// runs through it so their explicit sessionTarget owns the runtime lifecycle.
+const embeddedAgentRuntimeScope = new AsyncResource("openclaw-linear:embedded-agent-runtime");
 function resolveAgentDirs(agentId, config) {
     const home = homedir();
     const agentList = config?.agents?.list;
@@ -336,6 +345,8 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
     }
     catch { }
     const sessionFile = join(sessionsDir, `${sessionId}.jsonl`);
+    const sessionRuntime = api.runtime.agent.session;
+    const storePath = sessionRuntime.resolveStorePath(configAny?.session?.store, { agentId });
     // Resolve model/provider from config — default is anthropic which requires
     // a separate API key. Our agents use openrouter.
     const agentList = configAny?.agents?.list;
@@ -450,7 +461,6 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
             providerOverride: provider,
             modelOverride: model,
         };
-        const sessionRuntime = api.runtime.agent.session;
         const existingEntry = sessionRuntime?.getSessionEntry?.({
             agentId,
             sessionKey: codexSessionKey,
@@ -482,8 +492,14 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
     }
     let result;
     try {
-        result = await api.runtime.agent.runEmbeddedPiAgent({
+        result = await embeddedAgentRuntimeScope.runInAsyncScope(() => api.runtime.agent.runEmbeddedPiAgent({
             sessionId,
+            sessionTarget: {
+                agentId,
+                sessionId,
+                sessionKey: codexHarnessEnabled ? codexSessionKey : sessionId,
+                storePath,
+            },
             ...(codexHarnessEnabled ? {
                 sessionKey: codexSessionKey,
                 agentHarnessRuntimeOverride: "codex",
@@ -497,14 +513,9 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
             prompt: message,
             agentId,
             runId,
-            // Bind this run to the gateway subagent runtime so sessions_spawn can
-            // delegate to OTHER agents (context:"isolated"). Cross-agent spawns go
-            // through the gateway "agent" method, which requires operator.write; only
-            // the gateway-subagent-bound path supplies it (via the synthetic operator
-            // client). Every core run path (channels, commands, CLI) sets this — our
-            // embedded runs omitted it, so a coding lead's cross-agent delegation was
-            // rejected with "missing scope: operator.write". Inert for read-only
-            // reviewers (their tool policy denies sessions_spawn anyway).
+            // Retained for compatibility with OpenClaw versions predating
+            // sessionTarget. Current versions derive runtime ownership from the
+            // explicit sessionTarget above.
             allowGatewaySubagentBinding: true,
             // Stream the model's reasoning summaries so onReasoningStream fires and we
             // can surface the agent's THINKING to Linear as `thought` activities. Codex
@@ -636,7 +647,7 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
                 // is never flushed here and remains the caller's response (no duplication).
                 pendingAssistantCommentary = text;
             },
-        });
+        }));
     }
     finally {
         await activityQueue;

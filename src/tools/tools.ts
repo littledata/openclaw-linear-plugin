@@ -1,6 +1,5 @@
 import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { createCodeTools } from "./code-tool.js";
-import { createOrchestrationTools } from "./orchestration-tools.js";
 import { createLinearIssuesTool } from "./linear-issues-tool.js";
 import { createSteeringTools } from "./steering-tools.js";
 import { createContainerTools } from "./container-tools.js";
@@ -14,17 +13,6 @@ export function createLinearTools(api: OpenClawPluginApi, ctx: Record<string, un
     codeTools.push(...createCodeTools(api, ctx));
   } catch (err) {
     api.logger.warn(`CLI coding tools not available: ${err}`);
-  }
-
-  // Orchestration tools (conditional on config — defaults to enabled)
-  const orchestrationTools: AnyAgentTool[] = [];
-  const enableOrchestration = pluginConfig?.enableOrchestration !== false;
-  if (enableOrchestration) {
-    try {
-      orchestrationTools.push(...createOrchestrationTools(api, ctx));
-    } catch (err) {
-      api.logger.warn(`Orchestration tools not available: ${err}`);
-    }
   }
 
   // Linear issue management — native GraphQL API tool
@@ -58,7 +46,6 @@ export function createLinearTools(api: OpenClawPluginApi, ctx: Record<string, un
 
   return [
     ...codeTools,
-    ...orchestrationTools,
     ...linearIssuesTools,
     ...containerTools,
     ...steeringTools,

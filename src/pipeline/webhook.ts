@@ -94,7 +94,8 @@ const activeRuns = new Set<string>();
 // all issue work happens in the per-ticket container (container_*/dispatch). Deny
 // host file mutation + host shell so a conversational run can't run e.g. `git`
 // against ~/repos on the box (which it did, and failed). Orchestration tools
-// (linear_issues, the coding dispatch tool, spawn_agent/ask_agent, read, web)
+// (linear_issues, the coding dispatch tool, native sessions_spawn/sessions_send,
+// read, web)
 // stay available.
 const LINEAR_SESSION_HOST_DENY = ["write", "edit", "apply_patch", "group:runtime"];
 // A STOP follow-up can arrive while the aborted pipeline is still unwinding.
@@ -852,7 +853,7 @@ export async function handleLinearWebhook(
         `**Tool access:**`,
         `- \`linear_issues\` tool: Full access. Use action="read" with issueId="${issueRef}" to get details, action="create" to create issues (with parentIssueId to create sub-issues for granular work breakdown), action="update" with status/priority/labels/estimate to modify issues, action="comment" to post comments, action="list_states" to see available workflow states.`,
         `- \`${cliTool}\`: Dispatch coding work to a worker. Workers return text — they cannot access linear_issues.`,
-        `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
+        `- \`sessions_spawn\`/\`sessions_send\`: Use OpenClaw's native session tools to delegate to other crew agents.`,
         `- Standard tools: exec, read, edit, write, web_search, etc.`,
         ``,
         `**Sub-issue guidance:** When a task is too large or has multiple distinct parts, break it into sub-issues using action="create" with parentIssueId="${issueRef}". Each sub-issue should be an atomic, independently testable unit of work with its own acceptance criteria. This enables parallel dispatch and clearer progress tracking.`,
@@ -861,7 +862,7 @@ export async function handleLinearWebhook(
         `**Tool access:**`,
         `- \`linear_issues\` tool: READ ONLY. Use action="read" with issueId="${issueRef}" to get details, action="list_states"/"list_labels" for metadata. Do NOT use action="update", action="create", or action="comment".`,
         `- \`${cliTool}\`: **Planning mode only.** Workers may explore code and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete source code, run deployments, or make system changes. Use for codebase exploration and planning only.`,
-        `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
+        `- \`sessions_spawn\`/\`sessions_send\`: Use OpenClaw's native session tools to delegate to other crew agents.`,
         `- Standard tools: exec, read, edit, write, web_search, etc.`,
       ];
 
@@ -1372,7 +1373,7 @@ export async function handleLinearWebhook(
           `**Tool access:**`,
           `- \`linear_issues\` tool: Full access. Use action="read" with issueId="${followUpIssueRef}" to get details, action="create" to create issues (with parentIssueId to create sub-issues for granular work breakdown), action="update" with status/priority/labels/estimate to modify issues, action="comment" to post comments, action="list_states" to see available workflow states.`,
           `- \`${followUpCliTool}\`: Dispatch coding work to a worker. Workers return text — they cannot access linear_issues.`,
-          `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
+          `- \`sessions_spawn\`/\`sessions_send\`: Use OpenClaw's native session tools to delegate to other crew agents.`,
           `- Standard tools: exec, read, edit, write, web_search, etc.`,
           ``,
           `**Sub-issue guidance:** When a task is too large or has multiple distinct parts, break it into sub-issues using action="create" with parentIssueId="${followUpIssueRef}". Each sub-issue should be an atomic, independently testable unit of work with its own acceptance criteria. This enables parallel dispatch and clearer progress tracking.`,
@@ -1381,7 +1382,7 @@ export async function handleLinearWebhook(
           `**Tool access:**`,
           `- \`linear_issues\` tool: READ ONLY. Use action="read" with issueId="${followUpIssueRef}" to get details, action="list_states"/"list_labels" for metadata. Do NOT use action="update", action="create", or action="comment".`,
           `- \`${followUpCliTool}\`: **Planning mode only.** Workers may explore code and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete source code, run deployments, or make system changes. Use for codebase exploration and planning only.`,
-          `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
+          `- \`sessions_spawn\`/\`sessions_send\`: Use OpenClaw's native session tools to delegate to other crew agents.`,
           `- Standard tools: exec, read, edit, write, web_search, etc.`,
         ];
 
@@ -3637,8 +3638,8 @@ async function handleSteeringInput(
         "write",
         "edit",
         "apply_patch",
-        "spawn_agent",
-        "ask_agent",
+        "sessions_spawn",
+        "sessions_send",
       ],
     });
 

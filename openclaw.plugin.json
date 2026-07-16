@@ -11,8 +11,6 @@
       "cli_codex",
       "cli_claude",
       "cli_gemini",
-      "spawn_agent",
-      "ask_agent",
       "linear_issues",
       "steer_agent",
       "capture_agent_output",
@@ -125,7 +123,6 @@
       "codexBin": { "type": "string", "description": "Path to the Codex CLI binary used by codex_run diagnostics and tools" },
       "claudeBin": { "type": "string", "description": "Path to the Claude CLI binary used by claude_run diagnostics and tools" },
       "geminiBin": { "type": "string", "description": "Path to the Gemini CLI binary used by gemini_run diagnostics and tools" },
-      "enableOrchestration": { "type": "boolean", "description": "Allow agents to spawn sub-agents via spawn_agent/ask_agent tools", "default": true },
       "worktreeBaseDir": { "type": "string", "description": "Base directory for persistent git worktrees (default: ~/.openclaw/worktrees)" },
       "repos": {
         "type": "object",

@@ -37,7 +37,7 @@ Connect Linear to AI agents. Issues get triaged, implemented, and audited — au
 - [x] Cross-model plan review (Claude ↔ Codex ↔ Gemini)
 - [x] Issue closure with summary report
 - [x] Sub-issue decomposition (orchestrator-level only)
-- [x] `spawn_agent` / `ask_agent` sub-agent tools
+- [x] Native OpenClaw `sessions_spawn` / `sessions_send` sub-agent tools
 - [x] CI + coverage badges (1170+ tests, Codecov integration)
 - [x] Setup wizard (`openclaw openclaw-linear setup`) + `doctor --fix` auto-repair
 - [x] Project context auto-detection (repo, framework, build/test commands → worker/audit prompts)
@@ -45,7 +45,7 @@ Connect Linear to AI agents. Issues get triaged, implemented, and audited — au
 - [x] Immediate thought emission on comment receipt and tool dispatch (visible before long-running tasks complete)
 - [x] Proactive OAuth token refresh timer (runs on startup, then every 6h)
 - [ ] **Worktree → PR merge** — `createPullRequest()` exists but is not wired into the pipeline. After audit pass, commits sit on a `codex/{identifier}` branch. You create the PR manually.
-- [ ] **Sub-agent worktree sharing** — Sub-agents spawned via `spawn_agent`/`ask_agent` do not inherit the parent worktree. They run in their own session without code access.
+- [x] **Sub-agent workspace sharing** — Native OpenClaw sub-agents are bound to the ticket container and their activity is relayed to the parent Linear session.
 - [ ] **Parallel worktree conflict resolution** — DAG dispatch runs up to 3 issues concurrently in separate worktrees, but there's no merge conflict detection across them.
 
 ---
@@ -887,7 +887,6 @@ Add settings under the plugin entry in `openclaw.json`:
 | `classifierAgentId` | string | — | Agent for intent classification (use a small/fast model like Haiku) |
 | `plannerReviewModel` | string | auto | Cross-model plan reviewer: `"claude"`, `"codex"`, or `"gemini"`. Auto-detects the complement of your primary model. |
 | `enableAudit` | boolean | `true` | Run auditor after implementation |
-| `enableOrchestration` | boolean | `true` | Allow `spawn_agent` / `ask_agent` tools |
 | `maxReworkAttempts` | number | `2` | Max audit failures before escalation |
 | `codexBaseRepo` | string | `"/home/claw/ai-workspace"` | Git repo for worktrees |
 | `worktreeBaseDir` | string | `"~/.openclaw/worktrees"` | Where worktrees are created |
@@ -1330,11 +1329,9 @@ Agents call `linear_issues` with typed JSON parameters. The tool wraps the Linea
 
 **Sub-issues:** Use `action="create"` with `parentIssueId` to create sub-issues under an existing issue. The new issue inherits `teamId` and `projectId` from its parent automatically. Only orchestrators on triaged issues have `create` access — workers and auditors cannot create issues.
 
-### `spawn_agent` / `ask_agent` — Multi-agent orchestration
+### `sessions_spawn` / `sessions_send` — Native multi-agent orchestration
 
-Delegate work to other crew agents. `spawn_agent` is fire-and-forget (parallel), `ask_agent` waits for a reply (synchronous). Disabled with `enableOrchestration: false`.
-
-Sub-agents run in their own context — they do **not** share the parent's worktree or get CLI tool access. They're useful for reasoning, research, and coordination (e.g., "ask Inara how to phrase this error message") but cannot directly modify code. To give a sub-agent code context, include the relevant snippets in the task message.
+Delegate work through OpenClaw's native session tools. Spawned agents receive a native child session, inherit the ticket's container binding, and relay their visible messages and tool activity to the parent Linear session.
 
 ### `dispatch_history` — Recent dispatch context
 
@@ -1344,7 +1341,7 @@ Returns recent dispatch activity. Agents use this for situational awareness when
 
 Tool access varies by context. Orchestrators get the full toolset; workers and auditors are restricted:
 
-| Context | `linear_issues` | `cli_*` | `spawn_agent` / `ask_agent` | Filesystem |
+| Context | `linear_issues` | `cli_*` | `sessions_spawn` / `sessions_send` | Filesystem |
 |---|---|---|---|---|
 | Orchestrator (triaged issue) | Full (read, create, update, comment) | Yes (backend-specific tool) | Yes | Read + write |
 | Orchestrator (untriaged issue) | Read only | Planning only | Yes | Read + write |
@@ -1356,7 +1353,7 @@ Tool access varies by context. Orchestrators get the full toolset; workers and a
 
 **Auditors** have access to `linear_issues` (the tool is registered) but are instructed via prompt to verify only — they return a JSON verdict, not code or issue mutations. Write access is not enforced at the tool level.
 
-**Sub-agents** spawned via `spawn_agent`/`ask_agent` run in their own session with no worktree access and no CLI tools. They're information workers — useful for reasoning and coordination, not code execution.
+**Sub-agents** spawned through the native session tools run in their own OpenClaw session while sharing the ticket's writable container workspace.
 
 ---
 

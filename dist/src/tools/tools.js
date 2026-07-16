@@ -1,5 +1,4 @@
 import { createCodeTools } from "./code-tool.js";
-import { createOrchestrationTools } from "./orchestration-tools.js";
 import { createLinearIssuesTool } from "./linear-issues-tool.js";
 import { createSteeringTools } from "./steering-tools.js";
 import { createContainerTools } from "./container-tools.js";
@@ -12,17 +11,6 @@ export function createLinearTools(api, ctx) {
     }
     catch (err) {
         api.logger.warn(`CLI coding tools not available: ${err}`);
-    }
-    // Orchestration tools (conditional on config — defaults to enabled)
-    const orchestrationTools = [];
-    const enableOrchestration = pluginConfig?.enableOrchestration !== false;
-    if (enableOrchestration) {
-        try {
-            orchestrationTools.push(...createOrchestrationTools(api, ctx));
-        }
-        catch (err) {
-            api.logger.warn(`Orchestration tools not available: ${err}`);
-        }
     }
     // Linear issue management — native GraphQL API tool
     const linearIssuesTools = [];
@@ -55,7 +43,6 @@ export function createLinearTools(api, ctx) {
     }
     return [
         ...codeTools,
-        ...orchestrationTools,
         ...linearIssuesTools,
         ...containerTools,
         ...steeringTools,

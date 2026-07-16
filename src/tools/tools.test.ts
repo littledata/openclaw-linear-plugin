@@ -19,13 +19,6 @@ vi.mock("./code-tool.js", () => ({
   ]),
 }));
 
-vi.mock("./orchestration-tools.js", () => ({
-  createOrchestrationTools: vi.fn(() => [
-    { name: "spawn_agent", execute: vi.fn() },
-    { name: "ask_agent", execute: vi.fn() },
-  ]),
-}));
-
 vi.mock("./linear-issues-tool.js", () => ({
   createLinearIssuesTool: vi.fn(() => ({ name: "linear_issues", execute: vi.fn() })),
 }));
@@ -52,7 +45,6 @@ vi.mock("./container-tools.js", () => ({
 
 import { createLinearTools } from "./tools.js";
 import { createCodeTools } from "./code-tool.js";
-import { createOrchestrationTools } from "./orchestration-tools.js";
 import { createLinearIssuesTool } from "./linear-issues-tool.js";
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -72,35 +64,8 @@ function makeApi(pluginConfig?: Record<string, unknown>) {
 // ── Tests ──────────────────────────────────────────────────────────
 
 describe("createLinearTools", () => {
-  it("returns cli_codex, cli_claude, cli_gemini, orchestration, linear_issues, and steering tools", () => {
+  it("returns CLI, Linear, container, and steering tools without legacy orchestration tools", () => {
     const api = makeApi();
-    const tools = createLinearTools(api, {});
-
-    expect(tools).toHaveLength(16);
-    const names = tools.map((t: any) => t.name);
-    expect(names).toContain("cli_codex");
-    expect(names).toContain("cli_claude");
-    expect(names).toContain("cli_gemini");
-    expect(names).toContain("spawn_agent");
-    expect(names).toContain("ask_agent");
-    expect(names).toContain("linear_issues");
-    expect(names).toContain("steer_agent");
-    expect(names).toContain("capture_agent_output");
-    expect(names).toContain("abort_agent");
-    expect(names).toContain("container_exec");
-    expect(names).toContain("container_search_code");
-  });
-
-  it("includes orchestration tools by default", () => {
-    const api = makeApi();
-    createLinearTools(api, {});
-
-    expect(createOrchestrationTools).toHaveBeenCalled();
-  });
-
-  it("excludes orchestration tools when enableOrchestration is false", () => {
-    vi.mocked(createOrchestrationTools).mockClear();
-    const api = makeApi({ enableOrchestration: false });
     const tools = createLinearTools(api, {});
 
     expect(tools).toHaveLength(14);
@@ -108,9 +73,14 @@ describe("createLinearTools", () => {
     expect(names).toContain("cli_codex");
     expect(names).toContain("cli_claude");
     expect(names).toContain("cli_gemini");
+    expect(names).not.toContain("spawn_agent");
+    expect(names).not.toContain("ask_agent");
     expect(names).toContain("linear_issues");
     expect(names).toContain("steer_agent");
-    expect(createOrchestrationTools).not.toHaveBeenCalled();
+    expect(names).toContain("capture_agent_output");
+    expect(names).toContain("abort_agent");
+    expect(names).toContain("container_exec");
+    expect(names).toContain("container_search_code");
   });
 
   it("handles CLI tools creation failure gracefully", () => {
@@ -121,34 +91,14 @@ describe("createLinearTools", () => {
     const api = makeApi();
     const tools = createLinearTools(api, {});
 
-    expect(tools).toHaveLength(13);
+    expect(tools).toHaveLength(11);
     const names = tools.map((t: any) => t.name);
-    expect(names).toContain("spawn_agent");
-    expect(names).toContain("ask_agent");
+    expect(names).not.toContain("spawn_agent");
+    expect(names).not.toContain("ask_agent");
     expect(names).toContain("linear_issues");
     expect(names).toContain("steer_agent");
     expect(api.logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("CLI coding tools not available"),
-    );
-  });
-
-  it("handles orchestration tools creation failure gracefully", () => {
-    vi.mocked(createOrchestrationTools).mockImplementationOnce(() => {
-      throw new Error("orchestration init failed");
-    });
-
-    const api = makeApi();
-    const tools = createLinearTools(api, {});
-
-    expect(tools).toHaveLength(14);
-    const names = tools.map((t: any) => t.name);
-    expect(names).toContain("cli_codex");
-    expect(names).toContain("cli_claude");
-    expect(names).toContain("cli_gemini");
-    expect(names).toContain("linear_issues");
-    expect(names).toContain("steer_agent");
-    expect(api.logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining("Orchestration tools not available"),
     );
   });
 
@@ -160,13 +110,13 @@ describe("createLinearTools", () => {
     const api = makeApi();
     const tools = createLinearTools(api, {});
 
-    expect(tools).toHaveLength(15);
+    expect(tools).toHaveLength(13);
     const names = tools.map((t: any) => t.name);
     expect(names).toContain("cli_codex");
     expect(names).toContain("cli_claude");
     expect(names).toContain("cli_gemini");
-    expect(names).toContain("spawn_agent");
-    expect(names).toContain("ask_agent");
+    expect(names).not.toContain("spawn_agent");
+    expect(names).not.toContain("ask_agent");
     expect(names).toContain("steer_agent");
     expect(api.logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("linear_issues tool not available"),

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 // Mock dependencies so we can control runAgentOnce behavior
 const mockRunEmbedded = vi.fn();
@@ -376,7 +377,12 @@ describe("embedded tool activity projection", () => {
   it("emits one ephemeral start and one completed action paired by toolCallId", async () => {
     const api = createApi() as any;
     const emitActivity = vi.fn().mockResolvedValue(undefined);
+    const webhookRequestScope = new AsyncLocalStorage<string>();
     const runEmbeddedPiAgent = vi.fn().mockImplementation(async (opts: any) => {
+      // An embedded turn must not inherit the narrow client attached to the
+      // Linear webhook request. Native sessions_spawn should use OpenClaw's
+      // trusted internal operator client instead.
+      expect(webhookRequestScope.getStore()).toBeUndefined();
       expect(opts.shouldEmitToolResult()).toBe(false);
       expect(opts.shouldEmitToolOutput()).toBe(false);
       opts.onPartialReply({
@@ -404,18 +410,21 @@ describe("embedded tool activity projection", () => {
     });
     api.runtime.agent = {
       defaults: { provider: "openrouter", model: "test-model" },
+      session: { resolveStorePath: vi.fn().mockReturnValue("/tmp/apex/sessions/sessions.json") },
       runEmbeddedPiAgent,
     };
 
-    const result = await runAgent({
-      api,
-      agentId: "apex",
-      sessionId: "linear-apex-CORE-1-0",
-      issueIdentifier: "CORE-1",
-      message: "review",
-      readOnly: true,
-      streaming: { linearApi: { emitActivity } as any, agentSessionId: "linear-session" },
-    });
+    const result = await webhookRequestScope.run("narrow-linear-webhook-client", () =>
+      runAgent({
+        api,
+        agentId: "apex",
+        sessionId: "linear-apex-CORE-1-0",
+        issueIdentifier: "CORE-1",
+        message: "review",
+        readOnly: true,
+        streaming: { linearApi: { emitActivity } as any, agentSessionId: "linear-session" },
+      }),
+    );
 
     expect(result.success).toBe(true);
     expect(emitActivity).toHaveBeenCalledTimes(3);
@@ -457,6 +466,12 @@ describe("embedded tool activity projection", () => {
     );
     expect(runEmbeddedPiAgent.mock.calls[0][0].extraSystemPrompt).not.toContain("Do not run shell commands");
     expect(runEmbeddedPiAgent.mock.calls[0][0]).not.toHaveProperty("agentHarnessRuntimeOverride");
+    expect(runEmbeddedPiAgent.mock.calls[0][0].sessionTarget).toEqual({
+      agentId: "apex",
+      sessionId: "linear-apex-CORE-1-0",
+      sessionKey: "linear-apex-CORE-1-0",
+      storePath: "/tmp/apex/sessions/sessions.json",
+    });
     // Cross-agent (isolated) subagent spawns need the gateway subagent runtime
     // binding (supplies operator.write); every embedded run must request it.
     expect(runEmbeddedPiAgent.mock.calls[0][0].allowGatewaySubagentBinding).toBe(true);
@@ -482,7 +497,11 @@ describe("embedded tool activity projection", () => {
       });
       return { payloads: [{ text: "done" }], meta: { durationMs: 5 } };
     });
-    api.runtime.agent = { defaults: { provider: "openrouter", model: "test-model" }, runEmbeddedPiAgent };
+    api.runtime.agent = {
+      defaults: { provider: "openrouter", model: "test-model" },
+      session: { resolveStorePath: vi.fn().mockReturnValue("/tmp/apex/sessions/sessions.json") },
+      runEmbeddedPiAgent,
+    };
 
     await runAgent({
       api,
@@ -511,7 +530,11 @@ describe("embedded tool activity projection", () => {
       opts.onAgentEvent({ stream: "tool", data: { phase: "result", name: "container_exec", toolCallId: "c1", isError: false } });
       return { payloads: [{ text: "done" }], meta: { durationMs: 5 } };
     });
-    api.runtime.agent = { defaults: { provider: "openrouter", model: "test-model" }, runEmbeddedPiAgent };
+    api.runtime.agent = {
+      defaults: { provider: "openrouter", model: "test-model" },
+      session: { resolveStorePath: vi.fn().mockReturnValue("/tmp/main/sessions/sessions.json") },
+      runEmbeddedPiAgent,
+    };
 
     await runAgent({
       api,
@@ -583,7 +606,10 @@ describe("embedded tool activity projection", () => {
     });
     api.runtime.agent = {
       defaults: { provider: "openrouter", model: "test-model" },
-      session: { upsertSessionEntry },
+      session: {
+        resolveStorePath: vi.fn().mockReturnValue("/tmp/apex/sessions/sessions.json"),
+        upsertSessionEntry,
+      },
       runEmbeddedPiAgent,
     };
 
@@ -599,6 +625,12 @@ describe("embedded tool activity projection", () => {
     expect(result.success).toBe(true);
     expect(runEmbeddedPiAgent).toHaveBeenCalledWith(expect.objectContaining({
       sessionKey: "agent:apex:linear:direct:linear-session-1",
+      sessionTarget: {
+        agentId: "apex",
+        sessionId: "linear-apex-CORE-1-0",
+        sessionKey: "agent:apex:linear:direct:linear-session-1",
+        storePath: "/tmp/apex/sessions/sessions.json",
+      },
       agentHarnessRuntimeOverride: "codex",
       provider: "openai",
       model: "gpt-5.3-codex",
