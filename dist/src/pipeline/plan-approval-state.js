@@ -60,6 +60,24 @@ export function clearPlanApproval(issueId) {
         write(store);
     }
 }
+/**
+ * Retain an approved plan as a reusable candidate after implementation starts.
+ * A later Linear AgentSession can offer this exact plan instead of asking Apex
+ * to inspect the repository and formulate it again.
+ * @param issueId - the Linear issue id
+ */
+export function consumePlanApproval(issueId) {
+    const store = read();
+    const current = store[issueId];
+    if (!current)
+        return;
+    store[issueId] = {
+        ...current,
+        status: "consumed",
+        sourceAgentSessionId: current.sourceAgentSessionId ?? current.agentSessionId,
+    };
+    write(store);
+}
 /** Reply words that count as approval (case-insensitive, whole-ish message). */
 const APPROVE_PATTERNS = [
     /^\s*approve[d]?\s*$/i,
@@ -79,4 +97,19 @@ export function isApprovalReply(reply) {
     if (!text)
         return false;
     return APPROVE_PATTERNS.some((re) => re.test(text));
+}
+/**
+ * Decide whether a reply to the previous-plan gate means “reuse it”. The
+ * select option uses a stable machine value, while free-text affirmatives stay
+ * convenient for users typing into the session.
+ * @param reply - the user's reply text
+ * @returns true when the previous plan should be reused verbatim
+ */
+export function isReusePlanReply(reply) {
+    const text = (reply ?? "").trim();
+    if (!text)
+        return false;
+    return (/^reuse_previous_plan$/i.test(text) ||
+        /\b(reuse|use|keep|continue with|go with)\b.*\b(previous|existing|same|that|this)?\s*plan\b/i.test(text) ||
+        isApprovalReply(text));
 }

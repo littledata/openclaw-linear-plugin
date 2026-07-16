@@ -406,6 +406,38 @@ describe("plan-approval gate", () => {
     clearPlanApproval(ISSUE);
   });
 
+  it("offers a previous plan before asking Apex to inspect and plan again", async () => {
+    savePlanApproval({
+      issueId: ISSUE,
+      issueIdentifier: "CORE-GATE",
+      agentSessionId: "session-previous",
+      sourceAgentSessionId: "session-previous",
+      status: "consumed",
+      assignments: [{
+        role: "spine",
+        task: "Reuse the established authentication cleanup",
+        steps: ["remove legacy route", "run focused tests"],
+      }],
+      rounds: 1,
+      createdAt: "2026-07-15T09:00:00.000Z",
+    });
+    const emitActivity = vi.fn().mockResolvedValue(undefined);
+    await runStatePlan(ctxFor(emitActivity), dispatch(), {
+      stateLabel: "in-progress", phases: [{ type: "plan-implement" }], onSuccess: null,
+    });
+    expect(runAgentMock).not.toHaveBeenCalled();
+    expect(execCodexMock).not.toHaveBeenCalled();
+    const reuse = emitActivity.mock.calls.find((call: any[]) =>
+      call[1]?.type === "elicitation" && /previous Apex plan/i.test(call[1].body),
+    );
+    expect(reuse?.[2]?.signalMetadata?.options).toEqual([
+      { label: "Reuse previous plan", value: "reuse_previous_plan" },
+      { label: "Create new plan", value: "create_new_plan" },
+    ]);
+    expect(getPlanApproval(ISSUE)?.status).toBe("reuse_pending");
+    clearPlanApproval(ISSUE);
+  });
+
   it("implements the approved plan once the user signs off", async () => {
     savePlanApproval({
       issueId: ISSUE, issueIdentifier: "CORE-GATE", agentSessionId: "session-1",
@@ -416,9 +448,10 @@ describe("plan-approval gate", () => {
     await runStatePlan(ctxFor(emitActivity), dispatch(), {
       stateLabel: "in-progress", phases: [{ type: "plan-implement" }], onSuccess: null,
     });
-    // Approved plan → implementer ran (no re-plan needed), approval consumed.
+    // Approved plan → implementer ran (no re-plan needed), plan retained as a
+    // reusable candidate for a later AgentSession.
     expect(execCodexMock).toHaveBeenCalled();
-    expect(getPlanApproval(ISSUE)).toBeUndefined();
+    expect(getPlanApproval(ISSUE)?.status).toBe("consumed");
     clearPlanApproval(ISSUE);
   });
 });

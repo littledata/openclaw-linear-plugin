@@ -8,6 +8,7 @@ import {
   buildLinearCodexSessionKey,
   drainCodexControls,
 } from "../agent/codex-steering.js";
+import { createSpecialistAgentSession } from "./specialist-agent-session.js";
 
 // ── Hoisted mock values ──────────────────────────────────────────────
 const {
@@ -871,6 +872,36 @@ describe("AppUserNotification handling", () => {
 // ---------------------------------------------------------------------------
 
 describe("AgentSessionEvent.created full flow", () => {
+  it("claims a proactive specialist session without recursively starting Apex", async () => {
+    mockLinearApiInstance.createSessionOnIssue.mockResolvedValueOnce({ sessionId: "sess-child-created" });
+    await createSpecialistAgentSession(mockLinearApiInstance as any, {
+      issueId: "issue-child-created",
+      issueIdentifier: "ENG-CHILD",
+      parentAgentSessionId: "sess-parent-created",
+      agentId: "spine",
+      agentLabel: "Spine",
+      childSessionKey: "agent:spine:child-created",
+      task: "Implement the delegated backend slice",
+      steps: ["edit service", "run tests"],
+    });
+
+    const { api } = await postWebhook({
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: {
+        id: "sess-child-created",
+        issue: { id: "issue-child-created", identifier: "ENG-CHILD" },
+      },
+      previousComments: [],
+    });
+
+    expect(runAgentMock).not.toHaveBeenCalled();
+    expect(assessTierMock).not.toHaveBeenCalled();
+    expect((api.logger.info as any).mock.calls.some((call: any[]) =>
+      String(call[0]).includes("claimed as Spine child"),
+    )).toBe(true);
+  });
+
   it("conversational-only profile routes to the conversational agent, ignoring agent names in promptContext", async () => {
     runAgentMock.mockReset().mockResolvedValue({ success: true, output: "hi" });
     mockLinearApiInstance.getIssueDetails.mockResolvedValue({
@@ -1300,6 +1331,42 @@ describe("AgentSessionEvent.prompted full flow", () => {
     expect(result.status).toBe(200);
     const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
     expect(infoCalls.some((msg: string) => msg.includes("missing session or issue"))).toBe(true);
+  });
+
+  it("steers a prompted specialist AgentSession into its native child session", async () => {
+    mockLinearApiInstance.createSessionOnIssue.mockResolvedValueOnce({ sessionId: "sess-child-steer" });
+    await createSpecialistAgentSession(mockLinearApiInstance as any, {
+      issueId: "issue-child-steer",
+      issueIdentifier: "ENG-CHILD-STEER",
+      parentAgentSessionId: "sess-parent-steer",
+      agentId: "forge",
+      agentLabel: "Forge",
+      childSessionKey: "agent:forge:child-steer",
+      task: "Update deployment configuration",
+      steps: ["edit chart"],
+    });
+
+    const result = await postWebhook({
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "sess-child-steer",
+        issue: { id: "issue-child-steer", identifier: "ENG-CHILD-STEER" },
+      },
+      agentActivity: { content: { type: "prompt", body: "also validate production rendering" } },
+    });
+    await vi.waitFor(() => expect(
+      result.api.runtime.channel.inbound.buildContext as any,
+    ).toHaveBeenCalled());
+    expect(result.api.runtime.channel.inbound.buildContext as any).toHaveBeenCalledWith(
+      expect.objectContaining({
+        route: expect.objectContaining({ routeSessionKey: "agent:forge:child-steer" }),
+        message: expect.objectContaining({
+          commandBody: "/steer also validate production rendering",
+        }),
+      }),
+    );
+    expect(runAgentMock).not.toHaveBeenCalled();
   });
 
   it("ignores when activeRuns has the issue (feedback loop)", async () => {

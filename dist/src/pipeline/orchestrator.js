@@ -25,7 +25,7 @@ import { completeDispatch, updateDispatchProgress } from "./dispatch-state.js";
 import { ROLES, resolveRole, implementerRoles, buildRolePrompt, parseReviewVerdict, resolveRoleModel, resolveRoleBackend, loadSkillGuidance, roleToolsDeny, } from "./roles.js";
 import { resolveTargetState, phaseAgentId, phaseKind } from "./state-plan.js";
 import { buildWorkspacePrompt } from "./workspace-prompt.js";
-import { getPlanApproval, savePlanApproval, clearPlanApproval } from "./plan-approval-state.js";
+import { getPlanApproval, savePlanApproval, consumePlanApproval, } from "./plan-approval-state.js";
 import { optionsSignal } from "./select-signal.js";
 import { isCancelled, clearCancel } from "./cancellation.js";
 import { isCodexHarnessSteeringEnabled } from "../agent/codex-steering.js";
@@ -312,6 +312,70 @@ function renderPlanMarkdown(assignments) {
     })
         .join("\n");
 }
+/**
+ * Recover structured specialist assignments from a prior Linear session plan.
+ * Supports both the older nested `↳ Spine` format and the explicit Apex
+ * orchestration rows introduced by this plugin.
+ * @param planText - formatted Linear Agent Plan text
+ * @returns recovered assignments, or [] when the plan is not an Apex plan
+ */
+export function parsePriorSessionPlan(planText) {
+    const roles = implementerRoles();
+    const roleForLabel = (label) => roles.find((role) => role.label.toLowerCase() === label.trim().toLowerCase());
+    const assignments = [];
+    let current;
+    for (const rawLine of planText.split("\n")) {
+        const line = rawLine
+            .replace(/^\s*-\s*/, "")
+            .replace(/^\[[^\]]+\]\s*/, "")
+            .trim();
+        const explicit = line.match(/^Wait for\s+(.+?)\s+[—-]\s+(.+)$/i);
+        if (explicit) {
+            const role = roleForLabel(explicit[1]);
+            if (!role)
+                continue;
+            current = { role: role.id, task: explicit[2].trim(), steps: [] };
+            assignments.push(current);
+            continue;
+        }
+        const nested = line.match(/^↳\s*(.+)$/);
+        if (nested) {
+            const role = roleForLabel(nested[1]);
+            if (!role)
+                continue;
+            current = {
+                role: role.id,
+                task: `Continue the previous ${role.label} assignment.`,
+                steps: [],
+            };
+            assignments.push(current);
+            continue;
+        }
+        const step = line.replace(/^•\s*/, "").trim();
+        if (current && rawLine.includes("•") && step)
+            current.steps?.push(step);
+    }
+    for (const assignment of assignments) {
+        if (assignment.task.startsWith("Continue the previous") && assignment.steps?.[0]) {
+            assignment.task = assignment.steps[0];
+        }
+    }
+    return assignments;
+}
+/** Find the newest prior Apex session plan without invoking a model/code scan. */
+async function findPriorSessionAssignments(ctx, dispatch) {
+    if (typeof ctx.linearApi.listAgentSessions !== "function")
+        return null;
+    const sessions = await ctx.linearApi.listAgentSessions(dispatch.issueId).catch(() => []);
+    for (const session of sessions) {
+        if (session.id === dispatch.agentSessionId || !session.plan)
+            continue;
+        const assignments = parsePriorSessionPlan(session.plan);
+        if (assignments.length)
+            return { assignments, sessionId: session.id };
+    }
+    return null;
+}
 async function runApexPlan(ctx, dispatch, issue, feedback) {
     const roster = implementerRoles()
         .map((r) => `- ${r.id}: ${r.summary}`)
@@ -363,6 +427,24 @@ async function presentPlanForApproval(ctx, dispatch, assignments) {
     else {
         await comment(ctx, dispatch, body);
     }
+}
+/** Ask whether a new Apex run should reuse a plan recovered from earlier work. */
+async function presentPreviousPlanForReuse(ctx, dispatch, assignments) {
+    if (!dispatch.agentSessionId)
+        return;
+    const body = `## 🧭 A previous Apex plan is available\n\n${renderPlanMarkdown(assignments)}\n\n` +
+        "Reuse this plan to start immediately, or ask Apex to formulate a new one?";
+    await ctx.linearApi.emitActivity(dispatch.agentSessionId, { type: "elicitation", body }, {
+        signal: "select",
+        signalMetadata: {
+            options: [
+                { label: "Reuse previous plan", value: "reuse_previous_plan" },
+                { label: "Create new plan", value: "create_new_plan" },
+            ],
+        },
+    }).catch((err) => {
+        ctx.api.logger.warn(`[orchestrator] previous-plan elicitation failed for ${dispatch.issueIdentifier}: ${err}`);
+    });
 }
 // ---------------------------------------------------------------------------
 // Phase: plan-implement (Apex → implementers → Apex self-review → PR)
@@ -500,8 +582,31 @@ async function runContainerImplement(ctx, dispatch, issue, assignments, reworkNo
 async function runImplementPhase(ctx, dispatch, issue, resumeGuidance) {
     const limit = maxRework(ctx.pluginConfig);
     const gateOn = planApprovalEnabled(ctx.pluginConfig);
-    const approval = gateOn ? getPlanApproval(dispatch.issueId) : undefined;
-    const inApprovalLoop = gateOn && approval && approval.status !== "approved";
+    let approval = gateOn ? getPlanApproval(dispatch.issueId) : undefined;
+    // If the local gate predates this deployment (or was already cleaned up),
+    // recover the newest structured Apex plan directly from prior Linear
+    // AgentSessions. This is deterministic and does not ask Apex to reread code.
+    if (gateOn && !approval && !resumeGuidance) {
+        const prior = await findPriorSessionAssignments(ctx, dispatch);
+        if (prior) {
+            approval = {
+                issueId: dispatch.issueId,
+                issueIdentifier: dispatch.issueIdentifier,
+                agentSessionId: prior.sessionId,
+                sourceAgentSessionId: prior.sessionId,
+                status: "consumed",
+                assignments: prior.assignments,
+                rounds: 1,
+                createdAt: new Date().toISOString(),
+            };
+            savePlanApproval(approval);
+        }
+    }
+    const previousSessionPlan = Boolean(gateOn &&
+        approval?.assignments?.length &&
+        approval.agentSessionId !== dispatch.agentSessionId &&
+        (approval.status === "pending" || approval.status === "consumed"));
+    const inApprovalLoop = gateOn && approval?.status === "pending";
     const continuationAssignment = (guidance) => [{
             role: "spine",
             task: [
@@ -514,8 +619,17 @@ async function runImplementPhase(ctx, dispatch, issue, resumeGuidance) {
     // signed off on). In the approval loop a user reply is change-request feedback
     // → re-plan with it. Otherwise: a normal resume continues, a fresh turn plans.
     let assignments;
-    if (approval?.status === "approved") {
+    if (previousSessionPlan) {
+        assignments = approval?.assignments;
+    }
+    else if (approval?.status === "approved") {
         assignments = approval.assignments?.length ? approval.assignments : await runApexPlan(ctx, dispatch, issue);
+    }
+    else if (approval?.status === "replan") {
+        const feedback = /^create_new_plan$/i.test(resumeGuidance?.trim() ?? "")
+            ? undefined
+            : resumeGuidance;
+        assignments = await runApexPlan(ctx, dispatch, issue, feedback);
     }
     else if (inApprovalLoop) {
         assignments = await runApexPlan(ctx, dispatch, issue, resumeGuidance);
@@ -537,19 +651,33 @@ async function runImplementPhase(ctx, dispatch, issue, resumeGuidance) {
     const planAssignments = assignments.map((a) => ({
         key: a.role,
         label: ROLES[a.role]?.label ?? a.role,
+        task: clip(a.task.replace(/\s+/g, " "), 120),
         steps: (a.steps?.length ? a.steps : [a.task]).map((step) => clip(step, 90)),
     }));
     sessionPlan?.setAssignments(implementPhaseIndex, planAssignments);
     sessionPlan?.clearPreparing();
     await sessionPlan?.flush();
+    // A fresh AgentSession found an older Apex plan. Stop here and let the user
+    // decide; no code inspection or planning model run has happened.
+    if (previousSessionPlan) {
+        await presentPreviousPlanForReuse(ctx, dispatch, assignments);
+        savePlanApproval({
+            ...approval,
+            agentSessionId: dispatch.agentSessionId,
+            sourceAgentSessionId: approval?.sourceAgentSessionId ?? approval?.agentSessionId,
+            status: "reuse_pending",
+        });
+        return { success: false, reason: "halted" };
+    }
     // Plan-approval gate: pause for the user's sign-off BEFORE any implementer runs.
     // Fires on a fresh planning turn or while iterating the plan (pending approval);
     // a plain STOP→continue (resumeGuidance with no pending approval) is NOT gated.
     if (gateOn && approval?.status === "approved") {
-        clearPlanApproval(dispatch.issueId);
+        consumePlanApproval(dispatch.issueId);
         emit(ctx, dispatch, { type: "thought", body: "✅ Plan approved — implementing." });
     }
-    else if (gateOn && (approval?.status === "pending" || !resumeGuidance)) {
+    else if (gateOn &&
+        (approval?.status === "pending" || approval?.status === "replan" || !resumeGuidance)) {
         await presentPlanForApproval(ctx, dispatch, assignments);
         const rounds = (approval?.rounds ?? 0) + 1;
         savePlanApproval({
@@ -558,6 +686,7 @@ async function runImplementPhase(ctx, dispatch, issue, resumeGuidance) {
             agentSessionId: dispatch.agentSessionId,
             status: "pending",
             assignments,
+            sourceAgentSessionId: dispatch.agentSessionId,
             rounds,
             createdAt: new Date().toISOString(),
         });
@@ -1282,15 +1411,15 @@ export async function runStatePlan(ctx, dispatch, plan, options = {}) {
         logger: ctx.api.logger,
     });
     sessionPlan.initPhases(plan.phases.map(phaseLabel));
+    const apexPhaseIndex = plan.phases.findIndex((phase) => phase.type === "plan-implement");
+    if (apexPhaseIndex >= 0)
+        sessionPlan.configureApexOrchestration(apexPhaseIndex);
     // On resume, phases before the resume point already completed.
     for (let i = 0; i < startPhaseIndex; i++)
         sessionPlan.setPhaseStatus(i, "completed");
     // Fresh plan-implement start: Apex hasn't produced the breakdown yet, so show
     // a single placeholder ("preparing the plan…") instead of an empty tree until
     // runImplementPhase reveals the real per-specialist plan.
-    if (!options.resume && plan.phases[startPhaseIndex]?.type === "plan-implement") {
-        sessionPlan.setPreparing("🧭 Apex is preparing the plan…");
-    }
     await sessionPlan.flush();
     // A pause (STOP / plan-approval) keeps the plan for the resuming run; only a
     // terminal outcome disposes it.

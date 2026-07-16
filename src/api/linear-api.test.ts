@@ -778,7 +778,9 @@ describe("LinearAgentApi", () => {
 
       const api = new LinearAgentApi(TOKEN);
       const result = await api.createSessionOnIssue("iss-1");
-      expect(result).toEqual({ sessionId: "sess-new" });
+      expect(result).toEqual({ sessionId: "sess-new", url: null });
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.query).toContain("agentSession { id url }");
     });
 
     it("returns error on failure", async () => {

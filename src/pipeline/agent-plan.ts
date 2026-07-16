@@ -41,6 +41,7 @@ interface AssignmentNode {
   /** Match key for live status updates — the specialist agent/role id (e.g. "spine"). */
   key: string;
   label: string;
+  task: string;
   status: PlanStepStatus;
   steps: StepNode[];
 }
@@ -78,6 +79,8 @@ export interface AssignmentInput {
   key: string;
   /** Human label shown in the checklist (e.g. "Spine"). */
   label: string;
+  /** One-line goal shown on Apex's “wait for specialist” row. */
+  task?: string;
   /** The specialist's ordered step-by-step actions. */
   steps: string[];
 }
@@ -93,6 +96,11 @@ export class SessionPlan {
   /** When set, the plan shows only this single placeholder row (e.g. while Apex
    *  is still preparing the plan) and hides the phase/assignment tree. */
   private preparing: string | null = null;
+  /** Implement phase rendered as Apex orchestration stages instead of one
+   * opaque "Implement" row. */
+  private apexPhaseIndex: number | null = null;
+  private apexPlanningStatus: PlanStepStatus = "pending";
+  private apexReviewStatus: PlanStepStatus = "pending";
 
   /**
    * @param opts - Linear API handle, target session id, enable flag, logger
@@ -110,6 +118,17 @@ export class SessionPlan {
    */
   initPhases(labels: string[]): void {
     this.phases = labels.map((label) => ({ label, status: "pending", assignments: [] }));
+  }
+
+  /**
+   * Render one phase as Apex's explicit orchestration lifecycle: formulate the
+   * plan, wait for each specialist, then review their combined work.
+   * @param index - the plan-implement phase index
+   */
+  configureApexOrchestration(index: number): void {
+    this.apexPhaseIndex = index;
+    this.apexPlanningStatus = "inProgress";
+    this.apexReviewStatus = "pending";
   }
 
   /**
@@ -133,7 +152,16 @@ export class SessionPlan {
    */
   setPhaseStatus(index: number, status: PlanStepStatus): void {
     const node = this.phases[index];
-    if (node) node.status = status;
+    if (!node) return;
+    node.status = status;
+    if (index !== this.apexPhaseIndex) return;
+    if (status === "completed") {
+      this.apexPlanningStatus = "completed";
+      this.apexReviewStatus = "completed";
+    } else if (status === "canceled") {
+      if (this.apexPlanningStatus !== "completed") this.apexPlanningStatus = "canceled";
+      if (this.apexReviewStatus !== "completed") this.apexReviewStatus = "canceled";
+    }
   }
 
   /**
@@ -148,9 +176,11 @@ export class SessionPlan {
     node.assignments = assignments.map((a) => ({
       key: normalizeKey(a.key),
       label: a.label,
+      task: a.task || a.steps[0] || `${a.label} assignment`,
       status: "pending",
       steps: a.steps.map((content) => ({ content, status: "pending" as PlanStepStatus })),
     }));
+    if (index === this.apexPhaseIndex) this.apexPlanningStatus = "completed";
   }
 
   /**
@@ -176,6 +206,14 @@ export class SessionPlan {
           s.status === "completed" ? s : { ...s, status: "canceled" },
         );
       }
+      if (
+        this.phases[this.apexPhaseIndex ?? -1]?.assignments.length &&
+        this.phases[this.apexPhaseIndex ?? -1]?.assignments.every((a) =>
+          a.status === "completed" || a.status === "canceled"
+        )
+      ) {
+        this.apexReviewStatus = "inProgress";
+      }
       return true;
     }
     return false;
@@ -196,13 +234,36 @@ export class SessionPlan {
       status,
       steps: a.steps.map((s) => ({ ...s, status })),
     }));
+    if (index === this.apexPhaseIndex) {
+      if (status === "completed") this.apexReviewStatus = "completed";
+      else if (status === "canceled") this.apexReviewStatus = "canceled";
+    }
   }
 
   /** Flatten the three-level model into Linear's flat, prefixed step list. */
   toSteps(): PlanStep[] {
-    if (this.preparing) return [{ content: this.preparing, status: "inProgress" }];
+    if (this.preparing && this.apexPhaseIndex === null) {
+      return [{ content: this.preparing, status: "inProgress" }];
+    }
     const steps: PlanStep[] = [];
-    for (const phase of this.phases) {
+    for (const [phaseIndex, phase] of this.phases.entries()) {
+      if (phaseIndex === this.apexPhaseIndex) {
+        steps.push({ content: "Formulate plan", status: this.apexPlanningStatus });
+        for (const assignment of phase.assignments) {
+          steps.push({
+            content: `Wait for ${assignment.label} — ${assignment.task}`,
+            status: assignment.status,
+          });
+          for (const step of assignment.steps) {
+            steps.push({ content: `${STEP_PREFIX}${step.content}`, status: step.status });
+          }
+        }
+        steps.push({
+          content: "Apex reviews specialist work and validates the combined change",
+          status: this.apexReviewStatus,
+        });
+        continue;
+      }
       steps.push({ content: phase.label, status: phase.status });
       for (const assignment of phase.assignments) {
         steps.push({ content: `${ASSIGNMENT_PREFIX}${assignment.label}`, status: assignment.status });
@@ -212,6 +273,43 @@ export class SessionPlan {
       }
     }
     return steps;
+  }
+
+  /**
+   * Read one specialist assignment for child-session creation.
+   * @param key - specialist agent/role id
+   * @returns the assignment task and steps, or undefined when not planned
+   */
+  getAssignment(key: string): { label: string; task: string; steps: string[] } | undefined {
+    const target = normalizeKey(key);
+    for (const phase of this.phases) {
+      const assignment = phase.assignments.find((candidate) => candidate.key === target);
+      if (!assignment) continue;
+      return {
+        label: assignment.label,
+        task: assignment.task,
+        steps: assignment.steps.map((step) => step.content),
+      };
+    }
+    return undefined;
+  }
+
+  /**
+   * Add an unplanned specialist that Apex spawned dynamically.
+   * @param assignment - specialist identity and fallback task
+   */
+  addAssignment(assignment: AssignmentInput): void {
+    if (this.getAssignment(assignment.key)) return;
+    const index = this.apexPhaseIndex ?? 0;
+    const node = this.phases[index];
+    if (!node) return;
+    node.assignments.push({
+      key: normalizeKey(assignment.key),
+      label: assignment.label,
+      task: assignment.task || assignment.steps[0] || `${assignment.label} assignment`,
+      status: "pending",
+      steps: assignment.steps.map((content) => ({ content, status: "pending" })),
+    });
   }
 
   /** Push the current plan to Linear (full replacement). Best-effort. */
@@ -246,6 +344,35 @@ export function createSessionPlan(key: string, opts: SessionPlanOptions): Sessio
  */
 export function getSessionPlan(key: string): SessionPlan | undefined {
   return plansByIssue.get(key);
+}
+
+/**
+ * Read a specialist assignment from the active Apex plan.
+ * @param key - ticket identifier
+ * @param agentKey - specialist role id
+ * @returns the planned specialist task and ordered steps
+ */
+export function getAssignmentSnapshot(
+  key: string,
+  agentKey: string,
+): { label: string; task: string; steps: string[] } | undefined {
+  return plansByIssue.get(key)?.getAssignment(agentKey);
+}
+
+/**
+ * Ensure a dynamically spawned specialist appears in Apex's orchestration
+ * checklist even when it was not in the original structured plan.
+ * @param key - ticket identifier
+ * @param assignment - specialist identity and fallback task
+ */
+export async function ensureAssignmentInPlan(
+  key: string,
+  assignment: AssignmentInput,
+): Promise<void> {
+  const plan = plansByIssue.get(key);
+  if (!plan || plan.getAssignment(assignment.key)) return;
+  plan.addAssignment(assignment);
+  await plan.flush();
 }
 
 /**

@@ -3,7 +3,9 @@ import {
   getPlanApproval,
   savePlanApproval,
   clearPlanApproval,
+  consumePlanApproval,
   isApprovalReply,
+  isReusePlanReply,
   type PlanApprovalState,
 } from "./plan-approval-state.js";
 
@@ -35,6 +37,32 @@ describe("plan-approval state store", () => {
 
   it("does not throw clearing an absent entry", () => {
     expect(() => clearPlanApproval("nope")).not.toThrow();
+  });
+
+  it("retains an approved plan as a reusable consumed candidate", () => {
+    savePlanApproval(makeState({
+      status: "approved",
+      agentSessionId: "session-old",
+      assignments: [{ role: "spine", task: "build API", steps: ["add route"] }],
+    }));
+    consumePlanApproval("issue-approval-test");
+    expect(getPlanApproval("issue-approval-test")).toMatchObject({
+      status: "consumed",
+      sourceAgentSessionId: "session-old",
+    });
+  });
+});
+
+describe("isReusePlanReply", () => {
+  it("accepts the select value and natural-language reuse requests", () => {
+    for (const reply of ["reuse_previous_plan", "reuse that plan", "go with the existing plan", "yes"]) {
+      expect(isReusePlanReply(reply)).toBe(true);
+    }
+  });
+
+  it("declines explicit replanning requests", () => {
+    expect(isReusePlanReply("create_new_plan")).toBe(false);
+    expect(isReusePlanReply("make a new plan based on the latest review")).toBe(false);
   });
 });
 

@@ -157,6 +157,28 @@ export async function stopActiveCodexRun(params) {
     });
     return true;
 }
+/**
+ * Route a control command to a known OpenClaw session even when it is a native
+ * specialist child rather than the issue-level Codex binding. Used by child
+ * Linear AgentSessions so their prompts steer the specialist that owns them.
+ * @param params - runtime route and Linear projection metadata
+ */
+export async function controlOpenClawSession(params) {
+    await dispatchControlCommand({
+        api: params.api,
+        linearApi: params.linearApi,
+        binding: {
+            issueId: `specialist:${params.linearSessionId}`,
+            linearSessionId: params.linearSessionId,
+            agentId: params.agentId,
+            openClawSessionId: params.openClawSessionKey,
+            sessionKey: params.openClawSessionKey,
+            runId: params.openClawSessionKey,
+            pendingControls: new Set(),
+        },
+        command: params.command,
+    });
+}
 /** @internal Reset the process-local registry between tests. */
 export function _resetCodexSteeringForTesting() {
     activeByIssue.clear();

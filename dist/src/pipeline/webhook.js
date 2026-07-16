@@ -17,7 +17,7 @@ import { hydrateGitHubRepositoryCatalog } from "../infra/github-repository-catal
 import { repoSelectSignal, optionsSignal } from "./select-signal.js";
 import { savePendingRepoSelection, getPendingRepoSelection, clearPendingRepoSelection, parseRepoSelection, } from "./repo-selection-state.js";
 import { getGrill, saveGrill, clearGrill } from "./grill-state.js";
-import { getPlanApproval, savePlanApproval, isApprovalReply } from "./plan-approval-state.js";
+import { getPlanApproval, savePlanApproval, isApprovalReply, isReusePlanReply, } from "./plan-approval-state.js";
 import { runStatePlan } from "./orchestrator.js";
 import { resolveStatePlan, orchestrationMode, isReviewOnlyPlan } from "./state-plan.js";
 import { gatherPriorWork, synthesizePriorContext } from "./prior-work.js";
@@ -36,7 +36,8 @@ import { getActiveTmuxSession } from "../infra/tmux-runner.js";
 import { capturePane } from "../infra/tmux.js";
 import { loadCodingConfig, resolveToolName } from "../tools/code-tool.js";
 import { clearCancel } from "./cancellation.js";
-import { _resetCodexSteeringForTesting, isCodexHarnessSteeringEnabled, steerActiveCodexRun, stopActiveCodexRun, } from "../agent/codex-steering.js";
+import { _resetCodexSteeringForTesting, isCodexHarnessSteeringEnabled, steerActiveCodexRun, stopActiveCodexRun, controlOpenClawSession, } from "../agent/codex-steering.js";
+import { claimSpecialistAgentSession, getSpecialistByLinearSession, } from "./specialist-agent-session.js";
 // ── Prompt input sanitization ─────────────────────────────────────
 /**
  * Sanitize user-controlled text before embedding in agent prompts.
@@ -506,6 +507,18 @@ export async function handleLinearWebhook(api, req, res) {
             api.logger.error("No Linear access token configured");
             return true;
         }
+        // Proactive sessions created for native Apex specialists must not recurse
+        // into another issue-level dispatch. Their creator owns initialization and
+        // routes the child run's tools/messages into this exact session.
+        const specialistSession = claimSpecialistAgentSession(issue.id, session.id);
+        if (specialistSession) {
+            await linearApi.emitActivity(session.id, {
+                type: "thought",
+                body: `Preparing ${specialistSession.agentLabel}'s delegated workspace...`,
+            }, { ephemeral: true }).catch(() => { });
+            api.logger.info(`AgentSession ${session.id}: claimed as ${specialistSession.agentLabel} child for ${specialistSession.issueIdentifier}`);
+            return true;
+        }
         // Validate agent profiles before doing any work
         const profilesError = validateProfiles();
         if (profilesError) {
@@ -897,6 +910,45 @@ export async function handleLinearWebhook(api, req, res) {
         const activity = payload.agentActivity;
         if (!session?.id || !issue?.id) {
             api.logger.info(`AgentSession prompted: missing session or issue — ignoring`);
+            return true;
+        }
+        // A specialist AgentSession is a view/control surface for its native
+        // OpenClaw child, not a second Apex dispatch. Follow-ups steer that child;
+        // stop interrupts it. Completed children remain read-only history.
+        const specialistSession = getSpecialistByLinearSession(session.id);
+        if (specialistSession) {
+            const specialistApi = createLinearApi(api);
+            if (!specialistApi)
+                return true;
+            const specialistSignal = payload.agentActivity?.signal ?? payload.agentActivity?.content?.signal;
+            if (!specialistSession.active) {
+                await specialistApi.emitActivity(session.id, {
+                    type: "response",
+                    body: `${specialistSession.agentLabel} has already returned to Apex. Continue in the Apex AgentSession for further work.`,
+                }).catch(() => { });
+                return true;
+            }
+            const specialistMessage = typeof activity?.body === "string"
+                ? activity.body.trim()
+                : typeof activity?.content?.body === "string"
+                    ? activity.content.body.trim()
+                    : "";
+            await specialistApi.emitActivity(session.id, {
+                type: "thought",
+                body: specialistSignal === "stop"
+                    ? `Stopping ${specialistSession.agentLabel}...`
+                    : `Steering ${specialistSession.agentLabel} with your follow-up...`,
+            }, { ephemeral: true }).catch(() => { });
+            void controlOpenClawSession({
+                api,
+                linearApi: specialistApi,
+                agentId: specialistSession.agentId,
+                openClawSessionKey: specialistSession.childSessionKey,
+                linearSessionId: specialistSession.agentSessionId,
+                command: specialistSignal === "stop"
+                    ? "/codex stop"
+                    : `/steer ${sanitizePromptInput(specialistMessage)}`,
+            }).catch((err) => api.logger.warn(`Could not control specialist session ${session.id}: ${err}`));
             return true;
         }
         // ── Stop signal ──────────────────────────────────────────────────────
@@ -2910,7 +2962,17 @@ async function routePausedPrompt(api, session, issue, activityBody, pluginConfig
     // approved so the resume implements it) or a change request (stay pending; the
     // reply flows through as feedback and Apex revises + re-presents).
     const approval = getPlanApproval(issue.id);
-    if (approval?.status === "pending") {
+    if (approval?.status === "reuse_pending") {
+        if (isReusePlanReply(userMessage)) {
+            savePlanApproval({ ...approval, status: "approved" });
+            api.logger.info(`AgentSession prompted: ${identifier} — previous plan accepted, resuming to implement`);
+        }
+        else {
+            savePlanApproval({ ...approval, status: "replan" });
+            api.logger.info(`AgentSession prompted: ${identifier} — previous plan declined, Apex will formulate a new plan`);
+        }
+    }
+    else if (approval?.status === "pending") {
         if (isApprovalReply(userMessage)) {
             savePlanApproval({ ...approval, status: "approved" });
             api.logger.info(`AgentSession prompted: ${identifier} — plan approved, resuming to implement`);

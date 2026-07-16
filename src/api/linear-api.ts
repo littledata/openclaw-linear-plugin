@@ -395,22 +395,29 @@ export class LinearAgentApi {
     }
   }
 
-  async createSessionOnIssue(issueId: string): Promise<{ sessionId: string | null; error?: string }> {
+  async createSessionOnIssue(issueId: string): Promise<{
+    sessionId: string | null;
+    url?: string | null;
+    error?: string;
+  }> {
     try {
       const data = await this.gql<{
-        agentSessionCreateOnIssue: { success: boolean; agentSession?: { id: string } };
+        agentSessionCreateOnIssue: {
+          success: boolean;
+          agentSession?: { id: string; url?: string | null };
+        };
       }>(
         `mutation AgentSessionCreateOnIssue($input: AgentSessionCreateOnIssue!) {
           agentSessionCreateOnIssue(input: $input) {
             success
-            agentSession { id }
+            agentSession { id url }
           }
         }`,
         { input: { issueId } },
       );
       const id = data.agentSessionCreateOnIssue.agentSession?.id ?? null;
       if (!id) return { sessionId: null, error: `success=${data.agentSessionCreateOnIssue.success} but no session ID` };
-      return { sessionId: id };
+      return { sessionId: id, url: data.agentSessionCreateOnIssue.agentSession?.url ?? null };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return { sessionId: null, error: msg };

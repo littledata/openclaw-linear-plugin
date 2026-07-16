@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { implementerUsesContainerAgent, parseAssignments } from "./orchestrator.js";
+import {
+  implementerUsesContainerAgent,
+  parseAssignments,
+  parsePriorSessionPlan,
+} from "./orchestrator.js";
 
 const issue = { id: "1", identifier: "CORE-9", title: "t" };
 
@@ -40,6 +44,34 @@ describe("parseAssignments", () => {
   it("extracts JSON embedded in prose", () => {
     const out = 'Here is my plan:\n{"assignments":[{"role":"forge","task":"terraform"}]}\nDone.';
     expect(parseAssignments(out, issue)).toEqual([{ role: "forge", task: "terraform" }]);
+  });
+});
+
+describe("parsePriorSessionPlan", () => {
+  it("recovers the explicit Apex wait rows and specialist steps", () => {
+    expect(parsePriorSessionPlan([
+      "- [completed] Formulate plan",
+      "- [pending] Wait for Spine — Refactor authentication",
+      "- [pending]     • remove legacy route",
+      "- [pending]     • add regression tests",
+      "- [pending] Apex reviews specialist work and validates the combined change",
+    ].join("\n"))).toEqual([{
+      role: "spine",
+      task: "Refactor authentication",
+      steps: ["remove legacy route", "add regression tests"],
+    }]);
+  });
+
+  it("recovers the older nested specialist format", () => {
+    expect(parsePriorSessionPlan([
+      "- [pending] Implement",
+      "- [pending] ↳ Forge",
+      "- [pending]     • update the deployment chart",
+    ].join("\n"))).toEqual([{
+      role: "forge",
+      task: "update the deployment chart",
+      steps: ["update the deployment chart"],
+    }]);
   });
 });
 

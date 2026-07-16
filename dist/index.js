@@ -22,12 +22,13 @@ import { startTokenRefreshTimer, stopTokenRefreshTimer } from "./src/infra/token
 import { reapExpiredContainers, CONTAINER_TTL_MS, repoWorkdir } from "./src/infra/container-runner.js";
 import { codingEnabled } from "./src/pipeline/mode-config.js";
 import { bindAgentRunToIssue, getActiveSessionByIdentifier, unbindAgentRunSession, resolveRequesterIssueIdentifier, } from "./src/pipeline/active-session.js";
-import { updateAssignmentStatus } from "./src/pipeline/agent-plan.js";
+import { ensureAssignmentInPlan, getAssignmentSnapshot, updateAssignmentStatus, } from "./src/pipeline/agent-plan.js";
 import { SubagentActivityRelay, createSubagentActivityRelayState, } from "./src/pipeline/subagent-activity-relay.js";
 import { getContainerRecord } from "./src/infra/container-registry.js";
 import { resolveRole } from "./src/pipeline/roles.js";
 import { buildWorkspacePrompt } from "./src/pipeline/workspace-prompt.js";
 import { completeNativeSubagent, registerNativeSubagent, } from "./src/pipeline/native-subagent-batch.js";
+import { bindSpecialistRuntimeIdentity, completeSpecialistAgentSession, createSpecialistAgentSession, getSpecialistByRuntimeIdentity, } from "./src/pipeline/specialist-agent-session.js";
 let containerReaperTimer;
 // Embedded/native agents initialise separate plugin runtimes inside the same
 // gateway process. Keep child-to-parent routing and dedupe state process-wide so
@@ -111,12 +112,13 @@ export default function register(api) {
     const pluginConfig = api.pluginConfig;
     // Check token availability (config → env → auth profile store)
     const tokenInfo = resolveLinearToken(pluginConfig);
-    const subagentActivityRelay = new SubagentActivityRelay(tokenInfo.accessToken
+    const runtimeLinearApi = tokenInfo.accessToken
         ? new LinearAgentApi(tokenInfo.accessToken, {
             refreshToken: tokenInfo.refreshToken,
             expiresAt: tokenInfo.expiresAt,
         })
-        : null, api.logger, sharedSubagentActivityState);
+        : null;
+    const subagentActivityRelay = new SubagentActivityRelay(runtimeLinearApi, api.logger, sharedSubagentActivityState);
     api.agent.events.registerAgentEventSubscription({
         id: "linear-subagent-activity",
         description: "Relay native specialist progress into the parent Linear AgentSession",
@@ -313,25 +315,58 @@ export default function register(api) {
             if (event.runId)
                 spawnedSubagentIssue.set(event.runId, spawnInfo);
             registerNativeSubagent(identifier, childSessionKey);
-            // Child sessions do not inherit the parent's embedded-run streaming
-            // callbacks. Retain the parent Linear AgentSession so gateway-level tool
-            // and message hooks can relay the specialist's visible activity there.
-            let agentSessionId = getActiveSessionByIdentifier(identifier)?.agentSessionId;
-            if (!agentSessionId) {
+            // Resolve the parent issue/session, then proactively create a distinct
+            // Linear AgentSession for this specialist. The child session receives the
+            // detailed tools/messages; Apex keeps only orchestration status.
+            const activeSession = getActiveSessionByIdentifier(identifier);
+            let parentAgentSessionId = activeSession?.agentSessionId;
+            let issueId = activeSession?.issueId;
+            if (!parentAgentSessionId || !issueId) {
                 const state = await readDispatchState(pluginConfig?.dispatchStatePath);
                 const dispatch = Object.values(state.dispatches.active).find((candidate) => candidate.issueIdentifier === identifier);
-                agentSessionId = dispatch?.agentSessionId;
+                parentAgentSessionId = dispatch?.agentSessionId;
+                issueId = dispatch?.issueId;
             }
-            if (agentSessionId) {
+            if (parentAgentSessionId && issueId) {
+                const role = resolveRole(childAgentId);
+                const fallbackTask = `Complete the delegated ${role?.label ?? childAgentId} work for ${identifier}.`;
+                await ensureAssignmentInPlan(identifier, {
+                    key: childAgentId,
+                    label: role?.label ?? childAgentId,
+                    task: fallbackTask,
+                    steps: [fallbackTask],
+                });
+                const assignment = getAssignmentSnapshot(identifier, childAgentId);
+                const specialist = runtimeLinearApi
+                    ? await createSpecialistAgentSession(runtimeLinearApi, {
+                        issueId,
+                        issueIdentifier: identifier,
+                        parentAgentSessionId,
+                        agentId: childAgentId,
+                        agentLabel: role?.label ?? childAgentId,
+                        childSessionKey,
+                        task: assignment?.task ?? fallbackTask,
+                        steps: assignment?.steps ?? [],
+                    })
+                    : null;
+                if (specialist)
+                    bindSpecialistRuntimeIdentity(event.runId, specialist);
                 const activityBinding = {
                     issueIdentifier: identifier,
                     agentId: childAgentId,
-                    agentLabel: resolveRole(childAgentId)?.label ?? childAgentId,
-                    agentSessionId,
+                    agentLabel: role?.label ?? childAgentId,
+                    agentSessionId: specialist?.agentSessionId ?? parentAgentSessionId,
                 };
                 const childIdentities = [childSessionKey, event.runId];
                 subagentActivityRelay.bind(childIdentities, activityBinding);
                 await subagentActivityRelay.announceStarted(childIdentities);
+                if (specialist && runtimeLinearApi) {
+                    await runtimeLinearApi.emitActivity(parentAgentSessionId, {
+                        type: "thought",
+                        body: `Delegated to ${specialist.agentLabel}. Its detailed progress is running in a separate AgentSession; ` +
+                            `Apex is waiting for it to finish.${specialist.agentSessionUrl ? `\n\n${specialist.agentSessionUrl}` : ""}`,
+                    }).catch(() => { });
+                }
             }
             else {
                 api.logger.warn(`subagent_spawned: no parent Linear AgentSession found for ${childAgentId} on ${identifier}; ` +
@@ -353,9 +388,18 @@ export default function register(api) {
         // binding is released (the map holds the ticket identifier + specialist id).
         const spawnInfo = spawnedSubagentIssue.get(sessionKey) ?? (event.runId ? spawnedSubagentIssue.get(event.runId) : undefined);
         if (spawnInfo) {
+            const specialist = getSpecialistByRuntimeIdentity(sessionKey) ??
+                getSpecialistByRuntimeIdentity(event.runId);
             completeNativeSubagent(spawnInfo.identifier, spawnInfo.childSessionKey, event.outcome ?? "unknown", event.error ?? event.reason);
             await updateAssignmentStatus(spawnInfo.identifier, spawnInfo.agentId, event.outcome === "ok" ? "completed" : "canceled").catch((err) => api.logger.warn(`subagent_ended plan update error: ${err}`));
             await subagentActivityRelay.announceFinished([sessionKey, event.runId], event.outcome === "ok");
+            if (specialist && runtimeLinearApi) {
+                await completeSpecialistAgentSession(runtimeLinearApi, specialist, event.outcome === "ok");
+                await runtimeLinearApi.emitActivity(specialist.parentAgentSessionId, {
+                    type: "thought",
+                    body: `${specialist.agentLabel} ${event.outcome === "ok" ? "finished" : "stopped"}; Apex is incorporating the specialist result.`,
+                }).catch(() => { });
+            }
         }
         // Release any ticket-container binding created at spawn (cross-agent subagent).
         if (sessionKey) {

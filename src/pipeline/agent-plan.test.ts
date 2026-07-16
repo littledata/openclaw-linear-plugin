@@ -5,6 +5,7 @@ import {
   getSessionPlan,
   disposeSessionPlan,
   updateAssignmentStatus,
+  ensureAssignmentInPlan,
   type PlanStep,
 } from "./agent-plan.js";
 
@@ -30,6 +31,36 @@ describe("SessionPlan", () => {
       { content: "Code review", status: "pending" },
       { content: "QA", status: "pending" },
     ]);
+  });
+
+  it("renders Apex orchestration as formulate → wait → review", () => {
+    const plan = new SessionPlan({ linearApi: makeApi(), agentSessionId: "s1", enabled: true });
+    plan.initPhases(["Implement", "Code review"]);
+    plan.configureApexOrchestration(0);
+    expect(plan.toSteps()).toEqual([
+      { content: "Formulate plan", status: "inProgress" },
+      {
+        content: "Apex reviews specialist work and validates the combined change",
+        status: "pending",
+      },
+      { content: "Code review", status: "pending" },
+    ]);
+    plan.setAssignments(0, [{
+      key: "spine",
+      label: "Spine",
+      task: "Refactor authentication",
+      steps: ["remove legacy routes"],
+    }]);
+    expect(plan.toSteps()[0]).toEqual({ content: "Formulate plan", status: "completed" });
+    expect(plan.toSteps()[1]).toEqual({
+      content: "Wait for Spine — Refactor authentication",
+      status: "pending",
+    });
+    plan.setAssignmentStatus("spine", "completed");
+    expect(plan.toSteps()[3]).toEqual({
+      content: "Apex reviews specialist work and validates the combined change",
+      status: "inProgress",
+    });
   });
 
   it("flips one specialist (and its steps) live by match key, leaving siblings alone", () => {
@@ -151,5 +182,26 @@ describe("session plan registry", () => {
 
   it("updateAssignmentStatus no-ops for an unknown ticket", async () => {
     await expect(updateAssignmentStatus("NOPE-9", "spine", "completed")).resolves.toBeUndefined();
+  });
+
+  it("adds a dynamically spawned specialist to Apex's checklist", async () => {
+    const api = makeApi();
+    const plan = createSessionPlan("CORE-1", {
+      linearApi: api,
+      agentSessionId: "s1",
+      enabled: true,
+    });
+    plan.initPhases(["Implement"]);
+    plan.configureApexOrchestration(0);
+    await ensureAssignmentInPlan("CORE-1", {
+      key: "forge",
+      label: "Forge",
+      task: "Apply infrastructure changes",
+      steps: ["update chart"],
+    });
+    expect(plan.toSteps()).toContainEqual({
+      content: "Wait for Forge — Apply infrastructure changes",
+      status: "pending",
+    });
   });
 });
