@@ -11,6 +11,7 @@ const { runAgentMock, execCodexMock, containerGitStatusMock, openPrMock, updateD
 
 vi.mock("../agent/agent.js", () => ({
   READ_ONLY_DENY: [],
+  HOST_CODE_RUNNER_DENY: [],
   runAgent: runAgentMock,
 }));
 

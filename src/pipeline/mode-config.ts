@@ -13,7 +13,8 @@
  *
  * Each block carries `enabled` plus room to grow its own settings. Both default
  * ON so existing single-app installs keep working until an operator opts a
- * capability out.
+ * capability out. (Sub-settings choose their own defaults — e.g. conversational
+ * `commentReply` defaults OFF, since the session response already posts a comment.)
  */
 
 /** Coding pipeline settings (delegation/assignment → specialist agents). */
@@ -27,7 +28,12 @@ export interface ConversationalModeConfig {
   enabled?: boolean;
   /** Agent id that answers @mentions; falls back to the plugin default agent. */
   agentId?: string;
-  /** Also post the final answer as an issue comment, not only a session response. */
+  /**
+   * Opt back into DUAL output — post the final answer as a separate issue
+   * comment in addition to the session `response` activity. Default OFF: a
+   * `response` activity already auto-creates the threaded comment (per Linear's
+   * agent best practices), so mirroring it manually duplicates the message.
+   */
   commentReply?: boolean;
   [key: string]: unknown;
 }
@@ -48,12 +54,13 @@ export function conversationalConfig(cfg?: Record<string, unknown>): Conversatio
 }
 
 /**
- * Whether a conversational reply should also be posted as an issue comment in
- * addition to the AgentSession response. Default ON so the answer is visible
- * both in the session and inline on the issue.
+ * Whether to DUAL-post a conversational reply as a separate issue comment on top
+ * of the AgentSession `response` activity. Default OFF: the response activity
+ * already auto-creates the threaded comment, so a manual mirror duplicates it.
+ * Opt in only when a profile genuinely needs a second copy.
  * @param cfg - plugin config
- * @returns true when the answer should be mirrored to a comment
+ * @returns true when the answer should also be mirrored to a manual comment
  */
 export function conversationalCommentReply(cfg?: Record<string, unknown>): boolean {
-  return conversationalConfig(cfg).commentReply !== false;
+  return conversationalConfig(cfg).commentReply === true;
 }

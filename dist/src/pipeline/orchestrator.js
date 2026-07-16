@@ -18,7 +18,7 @@
  * This path is opt-in via config `orchestrationMode: "stateplan"`; the default
  * single-worker pipeline (spawnWorker) is untouched.
  */
-import { runAgent, READ_ONLY_DENY } from "../agent/agent.js";
+import { runAgent, READ_ONLY_DENY, HOST_CODE_RUNNER_DENY } from "../agent/agent.js";
 import { execCodexInContainer, containerGitStatus, checkoutPullRequestInContainer, openPrInContainer, publishPullRequestReviewInContainer, repoWorkdir, WORK_ROOT, } from "../infra/container-runner.js";
 import { readManifest, writeManifest, updateManifest, savePlan, saveWorkerOutput, appendLog } from "./artifacts.js";
 import { completeDispatch, updateDispatchProgress } from "./dispatch-state.js";
@@ -29,12 +29,16 @@ import { getPlanApproval, savePlanApproval, clearPlanApproval } from "./plan-app
 import { optionsSignal } from "./select-signal.js";
 import { isCancelled, clearCancel } from "./cancellation.js";
 import { isCodexHarnessSteeringEnabled } from "../agent/codex-steering.js";
+import { createSessionPlan, getSessionPlan, disposeSessionPlan } from "./agent-plan.js";
 /**
- * Deny list for the coding LEAD: host writes/exec are blocked (all mutation goes
- * through container_* tools), but sessions_spawn/sessions_send stay ALLOWED so
- * the lead can delegate to its implementer subagents in-session.
+ * Deny list for the coding LEAD: host writes/exec/code-runners are blocked (all
+ * mutation goes through container_* tools), but sessions_spawn/sessions_send
+ * stay ALLOWED so the lead can delegate to its implementer subagents in-session.
  */
-const CODING_LEAD_DENY = READ_ONLY_DENY.filter((tool) => tool !== "sessions_spawn" && tool !== "sessions_send");
+const CODING_LEAD_DENY = [
+    ...READ_ONLY_DENY.filter((tool) => tool !== "sessions_spawn" && tool !== "sessions_send"),
+    ...HOST_CODE_RUNNER_DENY,
+];
 /** The agent id that leads the coding phase (delegates to subagents). */
 function codingLeadAgentId(pluginConfig) {
     return pluginConfig?.codingLeadAgentId || pluginConfig?.implementerAgentId || "apex";
@@ -42,6 +46,44 @@ function codingLeadAgentId(pluginConfig) {
 /** Whether the Apex plan-approval gate is active (default on). */
 function planApprovalEnabled(pluginConfig) {
     return pluginConfig?.planApprovalGate !== false;
+}
+/** Whether to publish the native Linear agent-session plan checklist (default on). */
+function agentPlansEnabled(pluginConfig) {
+    return pluginConfig?.agentPlans !== false;
+}
+/**
+ * Whether a terminal outcome moves the ticket to the plan's next defined state
+ * (onSuccess / onFailure). Default on. Turn off to leave the ticket where it is
+ * (e.g. when a human drives the column changes).
+ */
+function moveTicketOnFinish(pluginConfig) {
+    return pluginConfig?.moveTicketOnFinish !== false;
+}
+/**
+ * Whether a terminal outcome releases (unassigns) the app from Issue.delegate.
+ * Default on. Set false to keep the agent delegated across the transition so the
+ * next state's own webhook re-triggers it — letting one agent carry a ticket
+ * end-to-end through every stage without a human re-delegating each step.
+ */
+function unassignSelfOnFinish(pluginConfig) {
+    return pluginConfig?.unassignSelfOnFinish !== false;
+}
+/**
+ * Human label for a phase's row in the agent-session plan checklist.
+ * @param phase - the plan phase
+ * @returns a short label, e.g. "Implement", "Code review (Warden)", "QA"
+ */
+function phaseLabel(phase) {
+    const kind = phaseKind(phase);
+    const agentLabel = (() => {
+        const id = phaseAgentId(phase);
+        return id ? (resolveRole(id)?.label ?? id) : undefined;
+    })();
+    if (kind === "plan-implement")
+        return "Implement";
+    if (kind === "qa")
+        return agentLabel ? `QA (${agentLabel})` : "QA";
+    return agentLabel ? `Code review (${agentLabel})` : "Code review";
 }
 /** Max bounded rework attempts (config `maxReworkAttempts`, default 2). */
 function maxRework(pluginConfig) {
@@ -216,7 +258,15 @@ async function runRole(ctx, dispatch, role, phase, extra, issue) {
 export function parseAssignments(output, issue) {
     const validIds = new Set(implementerRoles().map((r) => r.id));
     const fallback = [
-        { role: "spine", task: `Implement issue ${issue.identifier} end to end.` },
+        {
+            role: "spine",
+            task: `Implement issue ${issue.identifier} end to end.`,
+            steps: [
+                "Read the issue and locate the affected code in the ticket container.",
+                "Make the change, keeping it scoped to what the issue asks for.",
+                "Verify with the project's build/tests and commit on the ticket branch.",
+            ],
+        },
     ];
     const match = output.match(/\{[\s\S]*\}/);
     if (!match)
@@ -230,6 +280,9 @@ export function parseAssignments(output, issue) {
             .map((a) => ({
             role: String(a.role ?? "").toLowerCase(),
             task: String(a.task ?? "").trim(),
+            steps: Array.isArray(a.steps)
+                ? a.steps.map((s) => String(s).trim()).filter(Boolean)
+                : undefined,
         }))
             .filter((a) => validIds.has(a.role) && a.task);
         return parsed.length ? parsed : fallback;
@@ -237,6 +290,26 @@ export function parseAssignments(output, issue) {
     catch {
         return fallback;
     }
+}
+/**
+ * Render an assignment list as a Markdown plan — one section per specialist with
+ * its ordered, step-by-step breakdown nested beneath. Shared by the Apex plan
+ * comment, the persisted plan, and the plan-approval prompt so every surface
+ * shows the same step-by-step detail (never a bare "implement the issue" line).
+ * @param assignments - the plan assignments
+ * @returns Markdown suitable for a Linear comment body
+ */
+function renderPlanMarkdown(assignments) {
+    return assignments
+        .map((a) => {
+        const label = ROLES[a.role]?.label ?? a.role;
+        const header = `- **${label}** — ${a.task}`;
+        if (!a.steps?.length)
+            return header;
+        const steps = a.steps.map((s, i) => `    ${i + 1}. ${s}`).join("\n");
+        return `${header}\n${steps}`;
+    })
+        .join("\n");
 }
 async function runApexPlan(ctx, dispatch, issue, feedback) {
     const roster = implementerRoles()
@@ -249,16 +322,18 @@ async function runApexPlan(ctx, dispatch, issue, feedback) {
         "Decide which specialists are needed and exactly what each must build.",
         "Assign the MINIMUM set that covers the work — prefer a single specialist unless",
         "the issue clearly spans concerns (e.g. backend + frontend).",
+        "Lay the work out STEP BY STEP: every assignment MUST carry an ordered `steps` array of",
+        "concrete actions (files/areas to touch, what to build, how to verify) — enough that a",
+        "reviewer could follow along. Do NOT hand a specialist a single vague task like",
+        '"implement the issue"; decompose it into real steps.',
         feedback ? `\nThe user reviewed your previous plan and asked for changes:\n${feedback}\nRevise the plan accordingly.` : "",
         "",
         "Respond with ONLY this JSON object (no prose):",
-        '{"assignments":[{"role":"<id>","task":"<what this specialist must implement>"}],"notes":"<optional>"}',
+        '{"assignments":[{"role":"<id>","task":"<one-line goal for this specialist>","steps":["<ordered concrete action>","<next action>"]}],"notes":"<optional>"}',
     ].filter(Boolean).join("\n");
     const { output } = await runRole(ctx, dispatch, ROLES.apex, "plan", extra, issue);
     const assignments = parseAssignments(output, issue);
-    const planText = assignments
-        .map((a) => `- **${ROLES[a.role]?.label ?? a.role}** — ${a.task}`)
-        .join("\n");
+    const planText = renderPlanMarkdown(assignments);
     await comment(ctx, dispatch, `## 🧭 Apex plan\n\n${planText}`);
     // Persist the plan so a future session can read it back on resume.
     try {
@@ -276,9 +351,7 @@ async function runApexPlan(ctx, dispatch, issue, feedback) {
  * @param assignments - the plan to present
  */
 async function presentPlanForApproval(ctx, dispatch, assignments) {
-    const planText = assignments
-        .map((a) => `- **${ROLES[a.role]?.label ?? a.role}** — ${a.task}`)
-        .join("\n");
+    const planText = renderPlanMarkdown(assignments);
     const body = `## 🧭 Plan ready for your approval\n\n${planText}\n\n` +
         `Reply **approve** to proceed, or tell me what to change.`;
     if (dispatch.agentSessionId) {
@@ -336,6 +409,11 @@ async function runContainerImplement(ctx, dispatch, issue, assignments, reworkNo
         workspace,
         "",
         "## Leading this implementation",
+        "HARD RULES — everything runs INSIDE this ticket's container:",
+        "- Run EVERY shell command (including the first inspection like `git status`/`git log`) through `container_exec`.",
+        "  NEVER use the host `bash`/shell tool — the host is read-only and such calls are declined and waste the turn.",
+        "- NEVER use `cli_codex`, `cli_claude`, or `cli_gemini` — those spawn a code process on the HOST, outside the",
+        "  container. You do not have them. Delegate to specialists with `sessions_spawn`; do the rest with `container_*`.",
         "Scope the change, then DELEGATE each piece to the right specialist SUBAGENT via sessions_spawn — do not write",
         "the code yourself. Your subagents:",
         delegates ? `- ${delegates}` : "- (no subagents configured — implement directly via container_* tools)",
@@ -344,7 +422,11 @@ async function runContainerImplement(ctx, dispatch, issue, assignments, reworkNo
         `subagent is automatically bound to THIS ticket's container (Linear ${issue.identifier}), shares your exact`,
         "workspace, and — like you — may only mutate through the container_* tools (host is read-only), so every change",
         "lands in the same repos. When you spawn one, name the ticket and give it a precise task plus the repos/paths to",
-        "touch; it starts fresh, so include the context it needs. Wait for each subagent before reviewing its work.",
+        "touch; it starts fresh, so include the context it needs. Tell it explicitly: run ALL commands via container_exec",
+        "(never the host bash tool), and its FIRST action is to publish its OWN short, numbered plan for its slice (the",
+        "files it will touch and how it will verify) as a brief progress update BEFORE editing — so each specialist's",
+        "plan, not just yours, is visible — then post a one-line progress note every few tool batches so it never goes",
+        "silent. Wait for each subagent before reviewing its work.",
         "After they finish, VERIFY by running the project's build/tests via container_exec, and make sure every",
         `change is committed in each repo on branch \`${dispatch.branch}\` with this structured message:`,
         "",
@@ -421,6 +503,22 @@ async function runImplementPhase(ctx, dispatch, issue, resumeGuidance) {
     else {
         assignments = await runApexPlan(ctx, dispatch, issue);
     }
+    // Nest Apex's plan under the Implement row of the session plan as a per-
+    // specialist tree: one row per specialist (Spine, Forge, …), with that
+    // specialist's ordered steps beneath it. Statuses flip live as each spawned
+    // subagent starts/finishes (see the subagent lifecycle hooks). Shown at the
+    // approval gate too. A specialist with no steps falls back to its task line.
+    const sessionPlan = getSessionPlan(dispatch.issueIdentifier);
+    const implementPhaseIndex = dispatch.phaseIndex ?? 0;
+    const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+    const planAssignments = assignments.map((a) => ({
+        key: a.role,
+        label: ROLES[a.role]?.label ?? a.role,
+        steps: (a.steps?.length ? a.steps : [a.task]).map((step) => clip(step, 90)),
+    }));
+    sessionPlan?.setAssignments(implementPhaseIndex, planAssignments);
+    sessionPlan?.clearPreparing();
+    await sessionPlan?.flush();
     // Plan-approval gate: pause for the user's sign-off BEFORE any implementer runs.
     // Fires on a fresh planning turn or while iterating the plan (pending approval);
     // a plain STOP→continue (resumeGuidance with no pending approval) is NOT gated.
@@ -446,6 +544,13 @@ async function runImplementPhase(ctx, dispatch, issue, resumeGuidance) {
     let lastReason = "";
     let lastReviewFindings = "";
     const useContainerAgent = implementerUsesContainerAgent(ctx.pluginConfig);
+    // Container path: each specialist's row flips live via the subagent lifecycle
+    // hooks as Apex spawns/finishes it. The direct-codex path has no such signal,
+    // so mark the whole breakdown in-progress up front there.
+    if (!useContainerAgent) {
+        sessionPlan?.setPhaseAssignmentsStatus(implementPhaseIndex, "inProgress");
+        await sessionPlan?.flush();
+    }
     for (let attempt = 0; attempt <= limit; attempt++) {
         if (isCancelled(dispatch.issueId))
             return { success: false, reason: "halted" };
@@ -601,6 +706,8 @@ async function runImplementPhase(ctx, dispatch, issue, resumeGuidance) {
             reviewedCommits,
         ].join("\n"));
         if (verdict.pass) {
+            sessionPlan?.setPhaseAssignmentsStatus(implementPhaseIndex, "completed");
+            await sessionPlan?.flush();
             const publication = await openPr(ctx, dispatch, issue);
             if (publication.success)
                 return { success: true };
@@ -1018,6 +1125,10 @@ async function runReviewPhase(ctx, dispatch, issue, role, gate, resumeGuidance, 
 async function transitionToTarget(ctx, dispatch, issue, targetConfig, outcome) {
     if (!targetConfig)
         return { success: true };
+    if (!moveTicketOnFinish(ctx.pluginConfig)) {
+        ctx.api.logger.info(`[orchestrator] ${issue.identifier} moveTicketOnFinish=false — leaving ticket in place (${outcome} target ${JSON.stringify(targetConfig)})`);
+        return { success: true };
+    }
     if (!issue.teamId)
         return { success: false, reason: "the issue has no team id for state resolution" };
     try {
@@ -1041,6 +1152,10 @@ async function transitionToTarget(ctx, dispatch, issue, targetConfig, outcome) {
 }
 /** Release the app from Issue.delegate after a terminal workflow outcome. */
 async function releaseDelegate(ctx, dispatch, plan) {
+    if (!unassignSelfOnFinish(ctx.pluginConfig)) {
+        ctx.api.logger.info(`[orchestrator] ${dispatch.issueIdentifier} unassignSelfOnFinish=false — keeping delegate assigned for end-to-end continuation`);
+        return;
+    }
     if (plan.clearDelegate === false)
         return;
     if (typeof ctx.linearApi.updateIssue !== "function") {
@@ -1132,6 +1247,31 @@ export async function runStatePlan(ctx, dispatch, plan, options = {}) {
             : `Orchestrating "${plan.stateLabel}" — ${plan.phases.length} phase(s)`,
     });
     ctx.api.logger.info(`[orchestrator] ${issue.identifier} plan=${plan.stateLabel} phases=${plan.phases.map((p) => phaseAgentId(p) ?? p.type).join(",")}`);
+    // Native Linear agent-session plan checklist: phases as top-level rows, each
+    // specialist assignment nested under Implement with its own steps (populated
+    // in runImplementPhase). Rows flip to inProgress/completed/canceled as the
+    // pipeline runs — phases by the orchestrator, specialists by the subagent
+    // lifecycle hooks. Keyed by the ticket identifier so those hooks can reach it.
+    const sessionPlan = createSessionPlan(dispatch.issueIdentifier, {
+        linearApi: ctx.linearApi,
+        agentSessionId: dispatch.agentSessionId,
+        enabled: agentPlansEnabled(ctx.pluginConfig),
+        logger: ctx.api.logger,
+    });
+    sessionPlan.initPhases(plan.phases.map(phaseLabel));
+    // On resume, phases before the resume point already completed.
+    for (let i = 0; i < startPhaseIndex; i++)
+        sessionPlan.setPhaseStatus(i, "completed");
+    // Fresh plan-implement start: Apex hasn't produced the breakdown yet, so show
+    // a single placeholder ("preparing the plan…") instead of an empty tree until
+    // runImplementPhase reveals the real per-specialist plan.
+    if (!options.resume && plan.phases[startPhaseIndex]?.type === "plan-implement") {
+        sessionPlan.setPreparing("🧭 Apex is preparing the plan…");
+    }
+    await sessionPlan.flush();
+    // A pause (STOP / plan-approval) keeps the plan for the resuming run; only a
+    // terminal outcome disposes it.
+    let paused = false;
     try {
         const reviewFailures = [];
         const reviewRecords = [];
@@ -1145,17 +1285,24 @@ export async function runStatePlan(ctx, dispatch, plan, options = {}) {
             if (isCancelled(dispatch.issueId)) {
                 setStatus(dispatch, "cancelled");
                 await updateDispatchProgress(dispatch.issueIdentifier, { status: "paused", phaseIndex, pausedAt: new Date().toISOString() }, ctx.configPath).catch(() => { });
+                paused = true;
                 return;
             }
+            sessionPlan.setPhaseStatus(phaseIndex, "inProgress");
+            await sessionPlan.flush();
             const result = await runPhase(ctx, dispatch, issue, phase, phaseIndex === startPhaseIndex ? options.resumeGuidance : undefined);
             if (result.reason === "halted") {
                 setStatus(dispatch, "cancelled");
                 await updateDispatchProgress(dispatch.issueIdentifier, { status: "paused", phaseIndex, pausedAt: new Date().toISOString() }, ctx.configPath).catch(() => { });
+                paused = true;
                 return;
             }
             if (result.review)
                 reviewRecords.push(result.review);
             if (!result.success) {
+                sessionPlan.setPhaseStatus(phaseIndex, "canceled");
+                sessionPlan.setPhaseAssignmentsStatus(phaseIndex, "canceled");
+                await sessionPlan.flush();
                 const label = phaseAgentId(phase) ? `${phase.type}:${phaseAgentId(phase)}` : phase.type;
                 const nextPhase = plan.phases[phaseIndex + 1];
                 if (phase.type === "review") {
@@ -1180,6 +1327,12 @@ export async function runStatePlan(ctx, dispatch, plan, options = {}) {
                 await finishFailedPlan(ctx, dispatch, plan, issue, label, result);
                 return;
             }
+            sessionPlan.setPhaseStatus(phaseIndex, "completed");
+            // A passed phase means every specialist under it finished — mark them (and
+            // their steps) completed, covering any subagent whose lifecycle hook was
+            // missed and the direct-codex path (which has no per-specialist signal).
+            sessionPlan.setPhaseAssignmentsStatus(phaseIndex, "completed");
+            await sessionPlan.flush();
             const nextPhase = plan.phases[phaseIndex + 1];
             if (phase.type === "review" && nextPhase?.type !== "review") {
                 await publishReviewBundle(ctx, dispatch, reviewRecords, reviewFailures);
@@ -1229,6 +1382,12 @@ export async function runStatePlan(ctx, dispatch, plan, options = {}) {
         await endSession(ctx, dispatch, "error", `The pipeline hit an unexpected error: ${String(err).slice(0, 400)}`);
         await releaseDelegate(ctx, dispatch, plan);
         await archiveDispatch(ctx, dispatch, "failed");
+    }
+    finally {
+        // Keep the plan across a pause (the resuming run reuses it); drop it only
+        // once the run reaches a terminal outcome.
+        if (!paused)
+            disposeSessionPlan(dispatch.issueIdentifier);
     }
 }
 /**

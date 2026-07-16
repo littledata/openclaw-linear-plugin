@@ -359,6 +359,15 @@ async function runAgentOnce(params: {
 //   group:web (web_search, web_fetch) — external context
 //   group:memory (memory_search/get)  — knowledge retrieval
 //   sessions_list, sessions_history   — read-only introspection
+/**
+ * Host code-runner CLIs that execute `codex`/`claude`/`gemini` in a HOST tmux
+ * session (src/tools/code-tool.ts → codex-tool.ts), OUTSIDE any ticket
+ * container. Denied for the coding lead and every implementer so the only
+ * execution paths are sessions_spawn (container-bound subagents) and
+ * container_* — code must never run on the host.
+ */
+export const HOST_CODE_RUNNER_DENY = ["cli_codex", "cli_claude", "cli_gemini"];
+
 export const READ_ONLY_DENY: string[] = [
   // group:fs = read + write + edit + apply_patch — but we need read,
   // so deny the write-capable members individually.

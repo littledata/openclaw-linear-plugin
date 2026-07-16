@@ -357,9 +357,10 @@ describe("webhook scenario tests — full handler flows", () => {
       expect(activityCallsOfType("thought").length).toBeGreaterThan(0);
       expect(activityCallsOfType("response").length).toBeGreaterThan(0);
 
-      // Dual output: the answer is delivered via emitActivity (session) AND
-      // mirrored to an issue comment on success.
-      expect(mockCreateComment).toHaveBeenCalled();
+      // The answer is delivered via the `response` activity only — Linear
+      // auto-creates the threaded comment from it. Dual output is OFF by
+      // default, so no manual comment is posted (would duplicate the message).
+      expect(mockCreateComment).not.toHaveBeenCalled();
 
       // Session lifecycle
       expect(mockSetActiveSession).toHaveBeenCalledWith(
@@ -388,7 +389,8 @@ describe("webhook scenario tests — full handler flows", () => {
       // runAgent was called
       expect(mockRunAgent).toHaveBeenCalledOnce();
 
-      // Dual output on success: the comment lands even though the session emit failed.
+      // Fallback: when the `response` activity fails to emit, the answer is
+      // still delivered as a manual comment so the reply isn't lost.
       expect(mockCreateComment).toHaveBeenCalled();
     });
 
@@ -404,9 +406,10 @@ describe("webhook scenario tests — full handler flows", () => {
       const msg = mockRunAgent.mock.calls[0][0].message;
       expect(msg).toContain("Follow-up question here");
 
-      // Dual output: response via emitActivity (session) AND mirrored to a comment.
+      // Delivered via the `response` activity only (auto-creates the threaded
+      // comment); dual output is OFF by default, so no manual comment.
       expect(activityCallsOfType("response").length).toBeGreaterThan(0);
-      expect(mockCreateComment).toHaveBeenCalled();
+      expect(mockCreateComment).not.toHaveBeenCalled();
       expect(mockClearActiveSession).toHaveBeenCalledWith("issue-1");
     });
 

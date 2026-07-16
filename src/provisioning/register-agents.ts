@@ -11,7 +11,7 @@
  */
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { READ_ONLY_DENY } from "../agent/agent.js";
+import { READ_ONLY_DENY, HOST_CODE_RUNNER_DENY } from "../agent/agent.js";
 import type { RosterAgent } from "./agent-roster.js";
 
 /**
@@ -20,11 +20,14 @@ import type { RosterAgent } from "./agent-roster.js";
  * `agents.list` entry, not the parent's runtime deny), it still cannot touch the
  * host — its only mutation path is the container_* tools. sessions_spawn/send are
  * kept OUT of the deny so leads (apex / apex-reviewer) can delegate; non-lead
- * agents simply have no `allowAgents` target.
+ * agents simply have no `allowAgents` target. The host code-runner CLIs
+ * (cli_codex/claude/gemini) are denied too — a spawned specialist must run its
+ * code INSIDE the container via container_*, never as a host codex/claude process.
  */
-const HOST_WRITE_DENY: string[] = READ_ONLY_DENY.filter(
-  (tool) => tool !== "sessions_spawn" && tool !== "sessions_send",
-);
+const HOST_WRITE_DENY: string[] = [
+  ...READ_ONLY_DENY.filter((tool) => tool !== "sessions_spawn" && tool !== "sessions_send"),
+  ...HOST_CODE_RUNNER_DENY,
+];
 
 /** Minimal shape of an `agents.list[]` entry we read/write. */
 interface AgentEntryDraft {

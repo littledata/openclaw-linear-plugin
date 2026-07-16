@@ -13,7 +13,8 @@
  *
  * Each block carries `enabled` plus room to grow its own settings. Both default
  * ON so existing single-app installs keep working until an operator opts a
- * capability out.
+ * capability out. (Sub-settings choose their own defaults — e.g. conversational
+ * `commentReply` defaults OFF, since the session response already posts a comment.)
  */
 /** Whether the coding pipeline is active on this profile. Default ON. */
 export function codingEnabled(cfg) {
@@ -28,12 +29,13 @@ export function conversationalConfig(cfg) {
     return cfg?.conversational ?? {};
 }
 /**
- * Whether a conversational reply should also be posted as an issue comment in
- * addition to the AgentSession response. Default ON so the answer is visible
- * both in the session and inline on the issue.
+ * Whether to DUAL-post a conversational reply as a separate issue comment on top
+ * of the AgentSession `response` activity. Default OFF: the response activity
+ * already auto-creates the threaded comment, so a manual mirror duplicates it.
+ * Opt in only when a profile genuinely needs a second copy.
  * @param cfg - plugin config
- * @returns true when the answer should be mirrored to a comment
+ * @returns true when the answer should also be mirrored to a manual comment
  */
 export function conversationalCommentReply(cfg) {
-    return conversationalConfig(cfg).commentReply !== false;
+    return conversationalConfig(cfg).commentReply === true;
 }

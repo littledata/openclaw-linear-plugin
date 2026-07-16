@@ -32,9 +32,11 @@ describe("mode-config", () => {
     expect(codingEnabled({ coding: { enabled: false } })).toBe(false);
   });
 
-  it("exposes conversational settings and comment-reply default (on)", () => {
+  it("exposes conversational settings and dual comment-reply default (off)", () => {
     expect(conversationalConfig({ conversational: { agentId: "main" } }).agentId).toBe("main");
-    expect(conversationalCommentReply(undefined)).toBe(true);
+    // Default OFF: the session `response` activity already posts the threaded
+    // comment, so dual output must be explicitly opted into.
+    expect(conversationalCommentReply(undefined)).toBe(false);
     expect(conversationalCommentReply({ conversational: { commentReply: false } })).toBe(false);
     expect(conversationalCommentReply({ conversational: { commentReply: true } })).toBe(true);
   });

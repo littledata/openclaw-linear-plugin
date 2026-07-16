@@ -880,10 +880,15 @@ describe("AgentSessionEvent.created full flow", () => {
     const { api } = await postWebhook({
       type: "AgentSessionEvent",
       action: "created",
-      agentSession: { id: "sess-conv-1", issue: { id: "issue-conv-1", identifier: "ENG-CONV" } },
+      // A real mention carries the triggering user comment.
+      agentSession: {
+        id: "sess-conv-1",
+        issue: { id: "issue-conv-1", identifier: "ENG-CONV" },
+        comment: { id: "c-mention", body: "@mal can you help?" },
+      },
       // promptContext (issue history) names another agent by bare name — must NOT misroute.
       promptContext: "kaylee has been working on this; can you help?",
-      previousComments: [],
+      previousComments: [{ body: "@mal can you help?", user: { name: "Human" } }],
     }, "/linear/webhook", {
       coding: { enabled: false },
       conversational: { enabled: true, agentId: "mal" },
@@ -894,6 +899,32 @@ describe("AgentSessionEvent.created full flow", () => {
     const infos = (api.logger.info as any).mock.calls.map((c: any[]) => String(c[0]));
     expect(infos.some((l: string) => l.includes("conversational-only profile"))).toBe(true);
     expect(infos.some((l: string) => l.includes("via bare name"))).toBe(false);
+  });
+
+  it("conversational-only profile IGNORES a non-mention session (delegation/triage automation, no user comment)", async () => {
+    runAgentMock.mockReset().mockResolvedValue({ success: true, output: "hi" });
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: "issue-stray-1", identifier: "ENG-STRAY", title: "New triage issue",
+      description: "Some work landed in triage", state: { name: "Triage", type: "triage" },
+      team: { id: "team-1", key: "ENG" },
+    });
+    const { api } = await postWebhook({
+      type: "AgentSessionEvent",
+      action: "created",
+      // No user comment — Linear created this from a triage automation / delegation.
+      agentSession: { id: "sess-stray-1", issue: { id: "issue-stray-1", identifier: "ENG-STRAY" } },
+      promptContext: "New triage issue\nSome work landed in triage",
+      previousComments: [],
+    }, "/linear/webhook", {
+      coding: { enabled: false },
+      conversational: { enabled: true, agentId: "mal" },
+    });
+
+    // The stray session must NOT run an agent, must NOT post a response/comment.
+    expect(runAgentMock).not.toHaveBeenCalled();
+    expect(mockLinearApiInstance.createComment).not.toHaveBeenCalled();
+    const infos = (api.logger.info as any).mock.calls.map((c: any[]) => String(c[0]));
+    expect(infos.some((l: string) => l.includes("non-mention trigger"))).toBe(true);
   });
 
   it("keeps a comment-backed mention conversational even when the issue is delegated", async () => {
@@ -925,9 +956,14 @@ describe("AgentSessionEvent.created full flow", () => {
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(runAgentMock).toHaveBeenCalled();
     expect(assessTierMock).not.toHaveBeenCalled();
-    // Conversational replies are now mirrored to an issue comment (dual output),
-    // in addition to the session response.
-    expect(mockLinearApiInstance.createComment).toHaveBeenCalled();
+    // The reply is delivered via the session `response` activity, which Linear
+    // auto-renders as the threaded comment. Dual output is OFF by default, so we
+    // must NOT also post a manual comment (that would duplicate the message).
+    expect(mockLinearApiInstance.emitActivity).toHaveBeenCalledWith(
+      "session-mentioned-while-delegated",
+      expect.objectContaining({ type: "response" }),
+    );
+    expect(mockLinearApiInstance.createComment).not.toHaveBeenCalled();
   });
 
   it("resolves agent, fetches issue details, and runs agent for valid session", async () => {

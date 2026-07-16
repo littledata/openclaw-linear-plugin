@@ -18,9 +18,17 @@ describe("parseAssignments", () => {
     expect(parseAssignments(out, issue)).toEqual([{ role: "spine", task: "x" }]);
   });
 
-  it("falls back to a single spine assignment when unparseable", () => {
-    expect(parseAssignments("no json here", issue)).toEqual([
-      { role: "spine", task: "Implement issue CORE-9 end to end." },
+  it("falls back to a single spine assignment (with steps) when unparseable", () => {
+    const [fallback] = parseAssignments("no json here", issue);
+    expect(fallback.role).toBe("spine");
+    expect(fallback.task).toBe("Implement issue CORE-9 end to end.");
+    expect(fallback.steps?.length).toBeGreaterThan(0);
+  });
+
+  it("parses the step-by-step breakdown for an assignment", () => {
+    const out = '{"assignments":[{"role":"spine","task":"build API","steps":["add route"," wire service ","",42]}]}';
+    expect(parseAssignments(out, issue)).toEqual([
+      { role: "spine", task: "build API", steps: ["add route", "wire service", "42"] },
     ]);
   });
 

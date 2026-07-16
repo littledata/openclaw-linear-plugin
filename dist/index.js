@@ -22,6 +22,7 @@ import { startTokenRefreshTimer, stopTokenRefreshTimer } from "./src/infra/token
 import { reapExpiredContainers, CONTAINER_TTL_MS, repoWorkdir } from "./src/infra/container-runner.js";
 import { codingEnabled } from "./src/pipeline/mode-config.js";
 import { bindAgentRunToIssue, unbindAgentRunSession, resolveRequesterIssueIdentifier } from "./src/pipeline/active-session.js";
+import { updateAssignmentStatus } from "./src/pipeline/agent-plan.js";
 import { getContainerRecord } from "./src/infra/container-registry.js";
 import { resolveRole } from "./src/pipeline/roles.js";
 import { buildWorkspacePrompt } from "./src/pipeline/workspace-prompt.js";
@@ -290,6 +291,8 @@ export default function register(api) {
             if (event.runId)
                 spawnedSubagentIssue.set(event.runId, { identifier, agentId: childAgentId });
             api.logger.info(`subagent_spawned: bound ${childAgentId} (${childSessionKey}) to ${identifier}`);
+            // Flip this specialist's row on the ticket's session plan to in-progress.
+            await updateAssignmentStatus(identifier, childAgentId, "inProgress");
         }
         catch (err) {
             api.logger.warn(`subagent_spawned hook error: ${err}`);
@@ -299,6 +302,12 @@ export default function register(api) {
     // This catches sessions_spawn sub-agents with structured outcome data.
     api.on("subagent_ended", async (event, ctx) => {
         const sessionKey = event.targetSessionKey ?? ctx?.childSessionKey ?? "";
+        // Flip this specialist's session-plan row to completed/canceled before the
+        // binding is released (the map holds the ticket identifier + specialist id).
+        const spawnInfo = spawnedSubagentIssue.get(sessionKey) ?? (event.runId ? spawnedSubagentIssue.get(event.runId) : undefined);
+        if (spawnInfo) {
+            await updateAssignmentStatus(spawnInfo.identifier, spawnInfo.agentId, event.outcome === "ok" ? "completed" : "canceled").catch((err) => api.logger.warn(`subagent_ended plan update error: ${err}`));
+        }
         // Release any ticket-container binding created at spawn (cross-agent subagent).
         if (sessionKey) {
             unbindAgentRunSession(sessionKey);

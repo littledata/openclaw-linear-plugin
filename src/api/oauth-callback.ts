@@ -5,11 +5,12 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 
 const LINEAR_OAUTH_TOKEN_URL = "https://api.linear.app/oauth/token";
-const AUTH_PROFILES_PATH = join(
-  homedir(),
-  ".openclaw",
-  "auth-profiles.json",
-);
+// Write the OAuth token to the profile-specific store when
+// LINEAR_AUTH_PROFILES_PATH is set (so the coding gateway persists ITS app's
+// token instead of clobbering the default profile's). Falls back to ~/.openclaw.
+const AUTH_PROFILES_PATH =
+  process.env.LINEAR_AUTH_PROFILES_PATH ??
+  join(homedir(), ".openclaw", "auth-profiles.json");
 
 export async function handleOAuthCallback(
   api: OpenClawPluginApi,

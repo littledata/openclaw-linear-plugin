@@ -735,7 +735,28 @@ export async function handleLinearWebhook(
       !hasUserAuthoredSessionComment &&
       typeof webhookAppUserId === "string" &&
       enrichedIssue?.delegate?.id === webhookAppUserId;
-    if (isDelegationSession) {
+
+    // Conversational-only profile: only respond to a genuine conversation
+    // trigger — a user comment that @mentioned this app. Linear ALSO creates
+    // sessions from delegation, assignment, and triage automations, which carry
+    // NO user-authored comment. Running those makes the conversational agent
+    // behave like a task worker (it ran the orchestrator prompt, posted a
+    // "[label]" task analysis, and looked like a stray duplicate session). This
+    // profile has no coding pipeline to hand such work to, so ignore them.
+    if (
+      conversationalEnabled(pluginConfig) &&
+      !codingEnabled(pluginConfig) &&
+      !hasUserAuthoredSessionComment
+    ) {
+      api.logger.info(
+        `AgentSession ${session.id}: conversational-only profile, non-mention trigger (delegation/assignment/automation, no user comment) — ignoring ${issue.identifier ?? issue.id}`,
+      );
+      return true;
+    }
+
+    // A delegation starts the coding pipeline — but only on a coding-enabled
+    // profile. (Conversational-only delegations were already ignored above.)
+    if (isDelegationSession && codingEnabled(pluginConfig)) {
       // A fresh delegation owns a fresh Linear session. Clear any interaction
       // parked by an older session, but do not cancel a real implementation.
       const supersedesParkedInteraction = Boolean(getGrill(issue.id));
@@ -966,20 +987,21 @@ export async function handleLinearWebhook(
           ? result.output
           : `Something went wrong while processing this. The system will retry automatically if possible. If this keeps happening, run \`openclaw openclaw-linear doctor\` to check for issues.`;
 
-        // Deliver the answer to BOTH surfaces: the AgentSession response (persistent
-        // — the ephemeral thinking above collapses into it) AND an inline issue
-        // comment. No agent-name prefix: the session/comment is already authored
-        // by this app.
-        await linearApi.emitActivity(session.id, {
+        // A `response` activity is Linear's terminal output: it collapses the
+        // ephemeral thinking above it AND auto-creates the threaded comment reply.
+        // Per Linear's best practices we must NOT also post a separate comment —
+        // that duplicates the message. The manual comment is a FALLBACK only, for
+        // when the emit fails (or the caller opts back into dual output).
+        const emitted = await linearApi.emitActivity(session.id, {
           type: "response",
           body: responseBody,
-        }).catch((err) => {
+        }).then(() => true).catch((err) => {
           api.logger.warn(`Could not emit response in AgentSession ${session.id}: ${err}`);
+          return false;
         });
-        // Mirror only real answers (success) — never spam a generic failure
-        // message. Plain comment authored by THIS app (the token identity), with
-        // no createAsUser override or agent-name prefix.
-        if (result.success && conversationalCommentReply(pluginConfig as Record<string, unknown> | undefined)) {
+        // Post a plain comment only when the response didn't land (fallback), or
+        // when dual output is explicitly re-enabled. Never mirror a generic failure.
+        if ((result.success && conversationalCommentReply(pluginConfig as Record<string, unknown> | undefined)) || !emitted) {
           await createCommentWithDedup(linearApi, issue.id, responseBody)
             .catch((err) => api.logger.warn(`Could not post comment reply for ${session.id}: ${err}`));
         }
@@ -1462,17 +1484,16 @@ export async function handleLinearWebhook(
           ? result.output
           : `Something went wrong while processing this. The system will retry automatically if possible. If this keeps happening, run \`openclaw openclaw-linear doctor\` to check for issues.`;
 
-        // Deliver to BOTH the session response and an inline comment (no agent-name
-        // prefix — the session/comment is already authored by this app). If the
-        // session emit fails, the comment still lands.
+        // The `response` activity is terminal: it auto-creates the threaded
+        // comment reply, so we don't post one ourselves (no duplicate). If the
+        // emit fails, the comment fallback below still lands the reply.
         const emitted = await linearApi.emitActivity(session.id, {
           type: "response",
           body: responseBody,
         }).then(() => true).catch(() => false);
 
-        // Mirror successful answers to a comment (dual output). Also fall back to
-        // a comment if the session emit failed, so the reply isn't lost. Never
-        // mirror a generic failure message on a clean session.
+        // Post a plain comment only as a FALLBACK (emit failed), or when dual
+        // output is explicitly re-enabled. Never mirror a generic failure.
         if ((result.success && conversationalCommentReply(pluginConfig as Record<string, unknown> | undefined)) || !emitted) {
           await createCommentWithDedup(linearApi, issue.id, responseBody)
             .catch((err) => api.logger.warn(`Could not post comment reply for ${session.id}: ${err}`));

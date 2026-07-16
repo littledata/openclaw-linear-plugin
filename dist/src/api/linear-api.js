@@ -5,7 +5,17 @@ import { refreshLinearToken } from "./auth.js";
 import { withResilience } from "../infra/resilience.js";
 import { enqueueAgentSessionActivity, markAgentSessionComplete, resumeAgentSession, } from "./agent-session-lifecycle.js";
 export const LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql";
-export const AUTH_PROFILES_PATH = join(homedir(), ".openclaw", "auth-profiles.json");
+/**
+ * Path to the OpenClaw auth-profile store holding the Linear OAuth token.
+ *
+ * `homedir()` resolves to `$HOME` (`/root`), which is shared across gateway
+ * profiles — so a non-default profile (e.g. the coding gateway running as a
+ * distinct Linear app) would otherwise read the DEFAULT profile's token and
+ * mis-identify itself. Honor an explicit `LINEAR_AUTH_PROFILES_PATH` override
+ * so each profile can point at its own store; fall back to `~/.openclaw`.
+ */
+export const AUTH_PROFILES_PATH = process.env.LINEAR_AUTH_PROFILES_PATH ??
+    join(homedir(), ".openclaw", "auth-profiles.json");
 /** Convert Linear's JSON Agent Plan payload into readable context text. */
 export function formatAgentPlan(plan) {
     if (typeof plan === "string")
