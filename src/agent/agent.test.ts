@@ -521,6 +521,90 @@ describe("embedded tool activity projection", () => {
     );
   });
 
+  it("forwards codex item/preamble narration to the Apex Linear session", async () => {
+    const api = createApi() as any;
+    const emitActivity = vi.fn().mockResolvedValue(undefined);
+    const runEmbeddedPiAgent = vi.fn().mockImplementation(async (opts: any) => {
+      opts.onAgentEvent({
+        stream: "item",
+        data: {
+          kind: "preamble",
+          itemId: "apex-commentary",
+          progressText: "The ticket context is loaded; I’m checking the active branch next.",
+        },
+      });
+      opts.onAgentEvent({
+        stream: "tool",
+        data: {
+          phase: "start",
+          name: "openclawcontainer_exec",
+          toolCallId: "c1",
+          args: { command: "git status --short" },
+        },
+      });
+      opts.onAgentToolResult({
+        toolName: "openclawcontainer_exec",
+        result: { stdout: "clean", exitCode: 0 },
+        isError: false,
+      });
+      opts.onAgentEvent({
+        stream: "tool",
+        data: {
+          phase: "result",
+          name: "openclawcontainer_exec",
+          toolCallId: "c1",
+          isError: false,
+        },
+      });
+      return { payloads: [{ text: "done" }], meta: { durationMs: 5 } };
+    });
+    api.runtime.agent = {
+      defaults: { provider: "openrouter", model: "test-model" },
+      session: { resolveStorePath: vi.fn().mockReturnValue("/tmp/apex/sessions/sessions.json") },
+      runEmbeddedPiAgent,
+    };
+
+    await runAgent({
+      api,
+      agentId: "apex",
+      sessionId: "linear-impl-CORE-10",
+      issueIdentifier: "CORE-10",
+      message: "implement",
+      streaming: { linearApi: { emitActivity } as any, agentSessionId: "linear-session" },
+    });
+
+    expect(emitActivity).toHaveBeenNthCalledWith(
+      1,
+      "linear-session",
+      {
+        type: "thought",
+        body: "The ticket context is loaded; I’m checking the active branch next.",
+      },
+      undefined,
+    );
+    expect(emitActivity).toHaveBeenNthCalledWith(
+      2,
+      "linear-session",
+      {
+        type: "action",
+        action: "Shell",
+        parameter: "git status --short",
+      },
+      { ephemeral: true },
+    );
+    expect(emitActivity).toHaveBeenNthCalledWith(
+      3,
+      "linear-session",
+      expect.objectContaining({
+        type: "action",
+        action: "Shell",
+        parameter: "git status --short",
+        result: "clean",
+      }),
+      undefined,
+    );
+  });
+
   it("emits thinking + tool cards EPHEMERALLY when streaming.ephemeralActivity is set (conversational)", async () => {
     const api = createApi() as any;
     const emitActivity = vi.fn().mockResolvedValue(undefined);
@@ -567,6 +651,16 @@ describe("embedded tool activity projection", () => {
       repo: "openclaw-linear-plugin",
       limit: 5,
     })).toBe("where are webhook events routed?");
+
+    expect(formatToolActivityTitle("openclawcontainer_exec")).toBe("Shell");
+    expect(formatToolActivityParameter("openclawcontainer_exec", {
+      command: "npm test",
+      workdir: "/work/repo",
+    })).toBe("npm test");
+    expect(formatToolActivityResult("openclawcontainer_exec", {
+      stdout: "all tests passed",
+      exitCode: 0,
+    }, false)).toBe("all tests passed");
 
     expect(formatToolActivityTitle("container_read_file")).toBe("Container Read File");
     expect(formatToolActivityTitle("fetch_pr-details-v2")).toBe("Fetch Pr Details V2");

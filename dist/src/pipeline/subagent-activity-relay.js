@@ -205,7 +205,7 @@ export class SubagentActivityRelay {
             result: formatToolActivityResult(pending?.toolName ?? event.toolName, event.result ?? event.error ?? (isError ? "failed" : "completed"), isError),
         });
     }
-    /** Relay visible child assistant prose as a specialist-labelled thought. */
+    /** Relay visible child assistant prose as a thought. */
     async assistantText(text, identities) {
         const binding = this.resolveBindingFromKeys(identities);
         if (!binding)
@@ -225,7 +225,7 @@ export class SubagentActivityRelay {
         this.trimMessageFingerprints(now);
         await this.emit(binding.agentSessionId, {
             type: "thought",
-            body: `${binding.agentLabel} — ${body}`,
+            body: binding.dedicatedSession ? body : `${binding.agentLabel} — ${body}`,
         });
     }
     /** Relay visible text blocks from a persisted child assistant message. */
@@ -286,6 +286,8 @@ export class SubagentActivityRelay {
         return "failed";
     }
     withSpecialist(binding, parameter) {
+        if (binding.dedicatedSession)
+            return parameter ?? "";
         return parameter
             ? `Specialist: ${binding.agentLabel}\n\n${parameter}`
             : `Specialist: ${binding.agentLabel}`;

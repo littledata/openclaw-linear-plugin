@@ -97,13 +97,20 @@ function parseToolActivityObject(value) {
     }
     return null;
 }
+/** Collapse runtime-qualified container tool names to their public identifier. */
+function canonicalToolActivityName(toolName) {
+    return toolName.startsWith("openclawcontainer_")
+        ? `container_${toolName.slice("openclawcontainer_".length)}`
+        : toolName;
+}
 /** Convert an internal tool identifier into its Linear activity title. */
 export function formatToolActivityTitle(toolName) {
-    if (toolName === "container_exec")
+    const canonicalName = canonicalToolActivityName(toolName);
+    if (canonicalName === "container_exec")
         return "Shell";
-    if (toolName === "container_search_code")
+    if (canonicalName === "container_search_code")
         return "Search Code";
-    return toolName
+    return canonicalName
         .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
         .replace(/[_-]+/g, " ")
         .trim()
@@ -114,13 +121,14 @@ export function formatToolActivityTitle(toolName) {
 }
 /** Format tool arguments for the expandable Linear action parameter area. */
 export function formatToolActivityParameter(toolName, rawArgs, meta = "") {
+    const canonicalName = canonicalToolActivityName(toolName);
     const args = parseToolActivityObject(rawArgs);
-    if (toolName === "container_exec") {
+    if (canonicalName === "container_exec") {
         const command = args?.command;
         if (typeof command === "string")
             return formatToolActivityValue(command, 4_000) || undefined;
     }
-    if (toolName === "container_search_code") {
+    if (canonicalName === "container_search_code") {
         const query = args?.query;
         if (typeof query === "string")
             return formatToolActivityValue(query, 4_000) || undefined;
@@ -129,7 +137,8 @@ export function formatToolActivityParameter(toolName, rawArgs, meta = "") {
 }
 /** Format a completed tool result for the Linear action output area. */
 export function formatToolActivityResult(toolName, rawResult, isError) {
-    if (toolName === "container_exec") {
+    const canonicalName = canonicalToolActivityName(toolName);
+    if (canonicalName === "container_exec") {
         const result = parseToolActivityObject(rawResult);
         if (result) {
             const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
@@ -561,6 +570,12 @@ async function runEmbedded(api, agentId, sessionId, message, timeoutMs, streamin
                 // buffer that text here. flushAssistantCommentary() emits it as a Linear
                 // `thought` when the next tool starts; the final answer has no tool after
                 // it, so it stays unflushed and is never duplicated.
+                if (stream === "item" &&
+                    data.kind === "preamble" &&
+                    typeof data.progressText === "string") {
+                    pendingAssistantCommentary = data.progressText;
+                    return;
+                }
                 if (stream === "assistant") {
                     const delta = typeof data.delta === "string" ? data.delta : "";
                     const full = typeof data.text === "string" ? data.text

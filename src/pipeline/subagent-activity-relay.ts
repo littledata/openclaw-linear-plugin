@@ -32,6 +32,8 @@ export interface SubagentActivityBinding {
   agentId: string;
   agentLabel: string;
   agentSessionId: string;
+  /** Whether activity is routed to the specialist's own Linear AgentSession. */
+  dedicatedSession?: boolean;
 }
 
 interface ToolHookContext {
@@ -330,7 +332,7 @@ export class SubagentActivityRelay {
     });
   }
 
-  /** Relay visible child assistant prose as a specialist-labelled thought. */
+  /** Relay visible child assistant prose as a thought. */
   async assistantText(text: string, identities: Array<string | undefined>): Promise<void> {
     const binding = this.resolveBindingFromKeys(identities);
     if (!binding) return;
@@ -351,7 +353,7 @@ export class SubagentActivityRelay {
     this.trimMessageFingerprints(now);
     await this.emit(binding.agentSessionId, {
       type: "thought",
-      body: `${binding.agentLabel} — ${body}`,
+      body: binding.dedicatedSession ? body : `${binding.agentLabel} — ${body}`,
     });
   }
 
@@ -424,6 +426,7 @@ export class SubagentActivityRelay {
   }
 
   private withSpecialist(binding: SubagentActivityBinding, parameter?: string): string {
+    if (binding.dedicatedSession) return parameter ?? "";
     return parameter
       ? `Specialist: ${binding.agentLabel}\n\n${parameter}`
       : `Specialist: ${binding.agentLabel}`;

@@ -356,6 +356,7 @@ export default function register(api) {
                     agentId: childAgentId,
                     agentLabel: role?.label ?? childAgentId,
                     agentSessionId: specialist?.agentSessionId ?? parentAgentSessionId,
+                    dedicatedSession: Boolean(specialist),
                 };
                 const childIdentities = [childSessionKey, event.runId];
                 subagentActivityRelay.bind(childIdentities, activityBinding);

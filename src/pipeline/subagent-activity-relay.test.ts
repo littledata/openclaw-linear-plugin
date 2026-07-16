@@ -13,18 +13,20 @@ function createRelay() {
     agentId: "spine",
     agentLabel: "Spine",
     agentSessionId: "linear-session",
+    dedicatedSession: true,
   });
   return { relay, emitActivity };
 }
 
 describe("SubagentActivityRelay", () => {
-  it("announces specialist start and finish as labelled thoughts", async () => {
+  it("announces specialist start and finish without redundant labels", async () => {
     const { relay, emitActivity } = createRelay();
     relay.bind(["announcement-child"], {
       issueIdentifier: "CORE-1747",
       agentId: "spine",
       agentLabel: "Spine",
       agentSessionId: "linear-session",
+      dedicatedSession: true,
     });
 
     await relay.announceStarted(["announcement-child"]);
@@ -36,14 +38,14 @@ describe("SubagentActivityRelay", () => {
       {
         type: "thought",
         body:
-          "Spine — Started work in the CORE-1747 ticket workspace. Live progress and tool calls will appear here.",
+          "Started work in the CORE-1747 ticket workspace. Live progress and tool calls will appear here.",
       },
       undefined,
     );
     expect(emitActivity).toHaveBeenNthCalledWith(
       2,
       "linear-session",
-      { type: "thought", body: "Spine — Finished the delegated work." },
+      { type: "thought", body: "Finished the delegated work." },
       undefined,
     );
   });
@@ -68,6 +70,7 @@ describe("SubagentActivityRelay", () => {
       agentId: "spine",
       agentLabel: "Spine",
       agentSessionId: "linear-session",
+      dedicatedSession: true,
     });
     await childRelay.agentEvent({
       runId: "child-run",
@@ -86,7 +89,7 @@ describe("SubagentActivityRelay", () => {
       "linear-session",
       {
         type: "thought",
-        body: "Spine — The repository audit is complete; running tests next.",
+        body: "The repository audit is complete; running tests next.",
       },
       undefined,
     );
@@ -124,7 +127,7 @@ describe("SubagentActivityRelay", () => {
       {
         type: "action",
         action: "Search Code",
-        parameter: "Specialist: Spine\n\nMetricEmitter",
+        parameter: "MetricEmitter",
       },
       { ephemeral: true },
     );
@@ -134,7 +137,7 @@ describe("SubagentActivityRelay", () => {
       expect.objectContaining({
         type: "action",
         action: "Search Code",
-        parameter: "Specialist: Spine\n\nMetricEmitter",
+        parameter: "MetricEmitter",
       }),
       undefined,
     );
@@ -204,7 +207,7 @@ describe("SubagentActivityRelay", () => {
     expect(emitActivity).toHaveBeenCalledTimes(1);
     expect(emitActivity).toHaveBeenCalledWith(
       "linear-session",
-      { type: "thought", body: "Spine — Inspecting the deployment files." },
+      { type: "thought", body: "Inspecting the deployment files." },
       undefined,
     );
     vi.useRealTimers();
@@ -226,7 +229,7 @@ describe("SubagentActivityRelay", () => {
     expect(emitActivity).toHaveBeenCalledTimes(1);
     expect(emitActivity).toHaveBeenCalledWith(
       "linear-session",
-      { type: "thought", body: "Spine — Completed the infrastructure cleanup." },
+      { type: "thought", body: "Completed the infrastructure cleanup." },
       undefined,
     );
   });
@@ -257,7 +260,7 @@ describe("SubagentActivityRelay", () => {
       {
         type: "action",
         action: "Shell",
-        parameter: "Specialist: Spine\n\ngit status --short",
+        parameter: "git status --short",
       },
       { ephemeral: true },
     );
@@ -267,7 +270,7 @@ describe("SubagentActivityRelay", () => {
       {
         type: "action",
         action: "Shell",
-        parameter: "Specialist: Spine\n\ngit status --short",
+        parameter: "git status --short",
         result: "M src/file.ts",
       },
       undefined,
@@ -290,7 +293,7 @@ describe("SubagentActivityRelay", () => {
       {
         type: "action",
         action: "Memory Search",
-        parameter: 'Specialist: Spine\n\n{\n  "query": "prior work"\n}',
+        parameter: '{\n  "query": "prior work"\n}',
         result: "Failed\n\nunavailable",
       },
       undefined,
@@ -304,8 +307,46 @@ describe("SubagentActivityRelay", () => {
     expect(emitActivity).toHaveBeenCalledTimes(1);
     expect(emitActivity).toHaveBeenCalledWith(
       "linear-session",
-      { type: "thought", body: "Spine — I found the failing path." },
+      { type: "thought", body: "I found the failing path." },
       undefined,
+    );
+  });
+
+  it("retains specialist labels when child activity falls back to the Apex session", async () => {
+    const emitActivity = vi.fn().mockResolvedValue(undefined);
+    const relay = new SubagentActivityRelay({ emitActivity });
+    relay.bind(["fallback-child"], {
+      issueIdentifier: "CORE-1",
+      agentId: "spine",
+      agentLabel: "Spine",
+      agentSessionId: "apex-linear-session",
+    });
+
+    await relay.assistantText("Checking the fallback path.", ["fallback-child"]);
+    await relay.toolStarted(
+      {
+        toolName: "container_exec",
+        toolCallId: "fallback-call",
+        params: { command: "git status --short" },
+      },
+      { sessionKey: "fallback-child" },
+    );
+
+    expect(emitActivity).toHaveBeenNthCalledWith(
+      1,
+      "apex-linear-session",
+      { type: "thought", body: "Spine — Checking the fallback path." },
+      undefined,
+    );
+    expect(emitActivity).toHaveBeenNthCalledWith(
+      2,
+      "apex-linear-session",
+      {
+        type: "action",
+        action: "Shell",
+        parameter: "Specialist: Spine\n\ngit status --short",
+      },
+      { ephemeral: true },
     );
   });
 
