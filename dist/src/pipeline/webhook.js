@@ -1487,9 +1487,10 @@ export async function handleLinearWebhook(api, req, res) {
             catch { }
             return true;
         }
-        const configuredTriage = triageEnabled(pluginConfig);
+        const triage = pluginConfig?.triage;
+        const configuredTriage = triage?.enabled === true;
         const agentId = configuredTriage
-            ? triageConfig(pluginConfig).agentId || "sift"
+            ? triage.agentId || "sift"
             : resolveAgentId(api);
         // Guard: prevent duplicate runs on same issue (also blocks AgentSessionEvent
         // webhooks that arrive from sessions we create during triage)
