@@ -2442,6 +2442,50 @@ describe("Issue.create auto-triage", () => {
     expect(clearActiveSessionMock).toHaveBeenCalledWith("issue-triage");
   });
 
+  it("routes configured issue-create triage through Sift's investigation path", async () => {
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: "issue-sift-triage",
+      identifier: "EXP-2028",
+      title: "Microsoft connection setup not working",
+      description: "Customer cannot complete Microsoft setup",
+      state: { name: "Triage", type: "triage" },
+      team: { id: "team-exp", issueEstimationType: "fibonacci" },
+      labels: { nodes: [{ id: "label-bug", name: "Bug" }] },
+      creator: { name: "Support" },
+      creatorId: "creator-1",
+    });
+    mockLinearApiInstance.getViewerId.mockResolvedValue("viewer-1");
+    mockLinearApiInstance.getTeamLabels.mockResolvedValue([
+      { id: "label-bug", name: "Bug" },
+    ]);
+    runAgentMock.mockResolvedValue({
+      success: true,
+      output: '```json\n{"estimate": 3, "labelIds": ["label-bug"], "priority": 2, "assessment": "Investigated"}\n```\n\nEvidence-backed result.',
+    });
+
+    const result = await postWebhook({
+      type: "Issue",
+      action: "create",
+      data: {
+        id: "issue-sift-triage",
+        identifier: "EXP-2028",
+        title: "Microsoft connection setup not working",
+        creatorId: "creator-1",
+      },
+    }, "/linear/webhook", {
+      defaultAgentId: "main",
+      triage: { enabled: true, agentId: "sift" },
+    });
+
+    expect(result.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 200));
+    const call = runAgentMock.mock.calls[0]?.[0];
+    expect(call.agentId).toBe("sift");
+    expect(call.message).toContain("Use $sift-triage");
+    expect(call.message).toContain("$bug-report-investigation");
+    expect(call.timeoutMs).toBe(30 * 60_000);
+  });
+
   it("skips triage when issue is created by our bot", async () => {
     mockLinearApiInstance.getIssueDetails.mockResolvedValue({
       id: "issue-bot-created",

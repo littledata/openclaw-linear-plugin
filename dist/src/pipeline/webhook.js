@@ -1487,7 +1487,10 @@ export async function handleLinearWebhook(api, req, res) {
             catch { }
             return true;
         }
-        const agentId = resolveAgentId(api);
+        const configuredTriage = triageEnabled(pluginConfig);
+        const agentId = configuredTriage
+            ? triageConfig(pluginConfig).agentId || "sift"
+            : resolveAgentId(api);
         // Guard: prevent duplicate runs on same issue (also blocks AgentSessionEvent
         // webhooks that arrive from sessions we create during triage)
         if (activeRuns.has(issue.id)) {
@@ -1579,7 +1582,9 @@ export async function handleLinearWebhook(api, req, res) {
                     : "";
                 const projectCtx = buildProjectContext(pluginConfig);
                 const message = [
-                    `IMPORTANT: You are triaging a new Linear issue. You MUST respond with a JSON block containing your triage decisions, followed by your assessment as plain text.`,
+                    configuredTriage
+                        ? `Use $sift-triage to investigate and classify this Littledata ticket. For a CORE/EXP bug report, invoke $bug-report-investigation and run its complete read-only evidence sequence. You MUST respond with a JSON block containing your triage decisions, followed by your assessment as plain text.`
+                        : `IMPORTANT: You are triaging a new Linear issue. You MUST respond with a JSON block containing your triage decisions, followed by your assessment as plain text.`,
                     ``,
                     `## Issue: ${enrichedIssue?.identifier ?? issue.identifier ?? issue.id} — ${enrichedIssue?.title ?? issue.title ?? "(untitled)"}`,
                     `**Status:** ${enrichedIssue?.state?.name ?? "Unknown"} | **Current Estimate:** ${enrichedIssue?.estimate ?? "None"} | **Current Labels:** ${currentLabelNames}`,
@@ -1624,7 +1629,7 @@ export async function handleLinearWebhook(api, req, res) {
                     agentId,
                     sessionId,
                     message,
-                    timeoutMs: 3 * 60_000,
+                    timeoutMs: configuredTriage ? 30 * 60_000 : 3 * 60_000,
                     streaming: agentSessionId ? { linearApi, agentSessionId } : undefined,
                     // Triage is strictly read-only: the agent can read/search the
                     // codebase but all write-capable tools are denied via config
